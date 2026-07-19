@@ -1,0 +1,8 @@
+**
+!packages/sdk-node/package.json
+!packages/sdk-node/dist/**
+!demo/payment-service/package.json
+!demo/payment-service/package-lock.json
+!demo/payment-service/tsconfig.json
+!demo/payment-service/src/**
+!demo/payment-service/test/**

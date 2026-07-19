@@ -1,0 +1,45 @@
+{
+  "input": {
+    "samples": [
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "empty": []
+  },
+  "config": {
+    "maxArray": 3
+  },
+  "expected": {
+    "t": "obj",
+    "c": {
+      "samples": {
+        "t": "arr",
+        "c": [
+          {
+            "t": "num",
+            "v": 10
+          },
+          {
+            "t": "num",
+            "v": 20
+          },
+          {
+            "t": "num",
+            "v": 30
+          }
+        ],
+        "m": {
+          "t": "truncated",
+          "v": "array"
+        }
+      },
+      "empty": {
+        "t": "arr",
+        "c": []
+      }
+    }
+  }
+}

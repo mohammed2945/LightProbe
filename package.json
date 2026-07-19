@@ -1,0 +1,28 @@
+{
+  "name": "liveprobe",
+  "version": "0.0.0",
+  "private": true,
+  "description": "AI-native live production debugger",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "audit:readonly": "node scripts/readonly-audit.mjs",
+    "audit:redaction": "sh scripts/redaction-audit.sh",
+    "bench": "pnpm --filter @liveprobe/sdk-node run bench && sh scripts/python312.sh python/sdk/benchmarks/monitoring_overhead.py",
+    "build": "pnpm --recursive run build",
+    "demo": "make demo",
+    "demo:down": "make demo-down",
+    "e2e:jvm": "make e2e-jvm",
+    "e2e:node": "make e2e-node",
+    "e2e:python": "make e2e-python",
+    "fixtures:validate": "node scripts/validate-fixtures.mjs",
+    "test": "pnpm run fixtures:validate && pnpm run typecheck && pnpm run test:packages",
+    "test:packages": "pnpm --recursive run test",
+    "typecheck": "pnpm --recursive run typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

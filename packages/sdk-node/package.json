@@ -1,0 +1,17 @@
+{
+  "name": "@liveprobe/sdk-node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "bench": "node bench/benchmark.mjs",
+    "build": "tsc --project tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}

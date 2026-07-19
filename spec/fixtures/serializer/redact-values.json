@@ -1,0 +1,52 @@
+{
+  "input": {
+    "primary": "sk_live_123",
+    "partial": "prefix-sk_live_123",
+    "caseVariant": "SK_LIVE_123",
+    "nested": {
+      "items": [
+        "visible",
+        "needle"
+      ]
+    }
+  },
+  "config": {
+    "redactValues": [
+      "sk_live_123",
+      "needle"
+    ]
+  },
+  "expected": {
+    "t": "obj",
+    "c": {
+      "primary": {
+        "t": "redacted"
+      },
+      "partial": {
+        "t": "str",
+        "v": "prefix-sk_live_123"
+      },
+      "caseVariant": {
+        "t": "str",
+        "v": "SK_LIVE_123"
+      },
+      "nested": {
+        "t": "obj",
+        "c": {
+          "items": {
+            "t": "arr",
+            "c": [
+              {
+                "t": "str",
+                "v": "visible"
+              },
+              {
+                "t": "redacted"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

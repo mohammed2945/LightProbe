@@ -1,0 +1,22 @@
+{
+  "name": "@liveprobe/broker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "fake-agent": "pnpm run build && node dist/scripts/fake-agent.js",
+    "start": "node dist/src/index.js",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --project tsconfig.json --noEmit && tsc --project tsconfig.test.json"
+  },
+  "dependencies": {
+    "fastify": "^5.10.0",
+    "zod": "^4.4.3"
+  }
+}

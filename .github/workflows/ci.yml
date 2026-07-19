@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm from packageManager
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            python/sdk/pyproject.toml
+            demo/billing-worker/requirements.txt
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Install Node dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          npm --prefix demo/payment-service ci
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv python/sdk/.venv
+          python/sdk/.venv/bin/python -m pip install --upgrade pip
+          python/sdk/.venv/bin/python -m pip install \
+            -e "python/sdk[test]" \
+            -r demo/billing-worker/requirements.txt
+
+      - name: Run tests
+        run: make test
+
+      - name: Run security audits
+        run: |
+          make redaction-audit
+          make readonly-audit
+
+      - name: Build all components
+        run: make build

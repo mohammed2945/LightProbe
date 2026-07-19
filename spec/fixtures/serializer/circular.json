@@ -1,0 +1,49 @@
+{
+  "input": {
+    "$fixture": "object",
+    "id": "root",
+    "value": {
+      "name": "root",
+      "self": {
+        "$fixture": "ref",
+        "id": "root"
+      },
+      "child": {
+        "label": "child",
+        "parent": {
+          "$fixture": "ref",
+          "id": "root"
+        }
+      }
+    }
+  },
+  "config": {
+    "maxDepth": 5
+  },
+  "expected": {
+    "t": "obj",
+    "c": {
+      "name": {
+        "t": "str",
+        "v": "root"
+      },
+      "self": {
+        "t": "truncated",
+        "v": "circular"
+      },
+      "child": {
+        "t": "obj",
+        "c": {
+          "label": {
+            "t": "str",
+            "v": "child"
+          },
+          "parent": {
+            "t": "truncated",
+            "v": "circular"
+          }
+        }
+      }
+    }
+  }
+}

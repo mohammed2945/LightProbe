@@ -1,0 +1,16 @@
+.git
+.github
+.DS_Store
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.pyc
+**/coverage
+**/target
+**/build
+**/dist
+!packages/sdk-node/dist
+!packages/sdk-node/dist/**
+*.log

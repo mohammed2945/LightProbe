@@ -1,0 +1,28 @@
+{
+  "name": "@liveprobe/demo-payment-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic Node.js payment service for the LiveProbe snapshot demo",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "start": "node --enable-source-maps dist/src/server.js",
+    "traffic": "node --enable-source-maps dist/src/traffic.js",
+    "test": "npm run build && node --test dist/test/payment.test.js",
+    "e2e": "npm run build && node --test dist/test/e2e.test.js",
+    "check": "npm run typecheck && npm test && npm run e2e"
+  },
+  "dependencies": {
+    "@liveprobe/sdk-node": "file:../../packages/sdk-node",
+    "express": "5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2"
+  }
+}

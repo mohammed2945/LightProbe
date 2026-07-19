@@ -1,15 +1,31 @@
 # Added by code-review-graph
 .code-review-graph/
 
-# Local secrets
-.env
-.env.*
-!.env.example
+# JavaScript / TypeScript
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.pnpm-store/
 
 # Python
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
-*.pyc
+*.egg-info/
 
-# macOS
+# Java
+java/bridge/build/
+java/bridge/*.jar
+target/
+
+# Local configuration and operating-system files
+.env
+.env.*
+!.env.example
 .DS_Store
+*.log

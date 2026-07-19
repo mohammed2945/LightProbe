@@ -1,0 +1,43 @@
+{
+  "input": {
+    "levelOne": {
+      "levelTwo": {
+        "levelThree": {
+          "levelFour": "not visible"
+        },
+        "peer": 2
+      }
+    },
+    "rootValue": true
+  },
+  "config": {
+    "maxDepth": 2
+  },
+  "expected": {
+    "t": "obj",
+    "c": {
+      "levelOne": {
+        "t": "obj",
+        "c": {
+          "levelTwo": {
+            "t": "obj",
+            "c": {
+              "levelThree": {
+                "t": "truncated",
+                "v": "depth"
+              },
+              "peer": {
+                "t": "truncated",
+                "v": "depth"
+              }
+            }
+          }
+        }
+      },
+      "rootValue": {
+        "t": "bool",
+        "v": true
+      }
+    }
+  }
+}

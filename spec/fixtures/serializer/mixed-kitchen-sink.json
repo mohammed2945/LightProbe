@@ -1,0 +1,131 @@
+{
+  "input": [
+    {
+      "title": "abcdefgh",
+      "active": true,
+      "count": 7,
+      "missing": null
+    },
+    {
+      "handler": {
+        "$fixture": "function",
+        "name": "handler"
+      },
+      "secretNote": "must not escape",
+      "exact": "hide-me",
+      "items": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "one": 1,
+      "two": 2,
+      "three": 3,
+      "four": 4,
+      "five": 5
+    },
+    {
+      "omittedByArrayLimit": true
+    }
+  ],
+  "config": {
+    "maxDepth": 3,
+    "maxArray": 3,
+    "maxProps": 4,
+    "maxString": 5,
+    "redactKeys": [
+      "private"
+    ],
+    "redactValues": [
+      "hide-me"
+    ]
+  },
+  "expected": {
+    "t": "arr",
+    "c": [
+      {
+        "t": "obj",
+        "c": {
+          "title": {
+            "t": "truncated",
+            "v": "string"
+          },
+          "active": {
+            "t": "bool",
+            "v": true
+          },
+          "count": {
+            "t": "num",
+            "v": 7
+          },
+          "missing": {
+            "t": "null",
+            "v": null
+          }
+        }
+      },
+      {
+        "t": "obj",
+        "c": {
+          "handler": {
+            "t": "fn"
+          },
+          "secretNote": {
+            "t": "redacted"
+          },
+          "exact": {
+            "t": "redacted"
+          },
+          "items": {
+            "t": "arr",
+            "c": [
+              {
+                "t": "num",
+                "v": 1
+              },
+              {
+                "t": "num",
+                "v": 2
+              },
+              {
+                "t": "num",
+                "v": 3
+              }
+            ]
+          }
+        }
+      },
+      {
+        "t": "obj",
+        "c": {
+          "one": {
+            "t": "num",
+            "v": 1
+          },
+          "two": {
+            "t": "num",
+            "v": 2
+          },
+          "three": {
+            "t": "num",
+            "v": 3
+          },
+          "four": {
+            "t": "num",
+            "v": 4
+          }
+        },
+        "m": {
+          "t": "truncated",
+          "v": "props"
+        }
+      }
+    ],
+    "m": {
+      "t": "truncated",
+      "v": "array"
+    }
+  }
+}

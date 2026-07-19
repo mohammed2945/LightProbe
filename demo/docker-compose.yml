@@ -1,0 +1,203 @@
+name: liveprobe-demo
+
+services:
+  broker:
+    image: liveprobe-demo-broker:local
+    build:
+      context: ..
+      dockerfile: packages/broker/Dockerfile
+    environment:
+      LIVEPROBE_STATE_FILE: /var/lib/liveprobe/broker-state.json
+      LIVEPROBE_SNAPSHOT_INTERVAL_MS: "1000"
+    ports:
+      - "${BROKER_PORT:-7070}:7070"
+    volumes:
+      - broker-state:/var/lib/liveprobe
+    networks:
+      - app
+      - jvm-diagnostics
+    restart: unless-stopped
+
+  payment-service:
+    image: liveprobe-demo-payment:local
+    build:
+      context: ..
+      dockerfile: demo/payment-service/Dockerfile
+    environment:
+      BROKER_URL: http://broker:7070
+      BUG: "on"
+      SERVICE_ID: payment-service
+    depends_on:
+      broker:
+        condition: service_healthy
+    ports:
+      - "${PAYMENT_PORT:-8080}:8080"
+    networks:
+      - app
+    restart: unless-stopped
+
+  payment-traffic:
+    image: liveprobe-demo-payment:local
+    command: ["node", "--enable-source-maps", "dist/src/traffic.js"]
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 5s
+      timeout: 2s
+      start_period: 2s
+      retries: 3
+    environment:
+      TARGET_URL: http://payment-service:8080
+      TRAFFIC_INTERVAL_MS: "250"
+      TRAFFIC_REQUESTS: "0"
+    depends_on:
+      payment-service:
+        condition: service_healthy
+    networks:
+      - app
+    restart: unless-stopped
+
+  billing-worker:
+    image: liveprobe-demo-billing:local
+    build:
+      context: ..
+      dockerfile: demo/billing-worker/Dockerfile
+    environment:
+      BROKER_URL: http://broker:7070
+      BUG: "on"
+      SERVICE_ID: billing-worker
+      LIVEPROBE_ENABLED: "on"
+    depends_on:
+      broker:
+        condition: service_healthy
+    ports:
+      - "${BILLING_PORT:-8081}:8081"
+    networks:
+      - app
+    restart: unless-stopped
+
+  billing-traffic:
+    image: liveprobe-demo-billing:local
+    command:
+      - python
+      - traffic.py
+      - --base-url
+      - http://billing-worker:8081
+      - --interval
+      - "0.25"
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 5s
+      timeout: 2s
+      start_period: 2s
+      retries: 3
+    depends_on:
+      billing-worker:
+        condition: service_healthy
+    networks:
+      - app
+    restart: unless-stopped
+
+  inventory-service:
+    image: liveprobe-demo-inventory:local
+    build:
+      context: inventory-service
+      dockerfile: Dockerfile
+    environment:
+      BUG: "on"
+      ENABLE_INTERNAL_JDWP: "true"
+      INTERNAL_JDWP_PORT: "5005"
+      PORT: "8080"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080;
+          printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3;
+          read -r status <&3;
+          [[ "$$status" == *" 200 "* ]]'
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 12
+    ports:
+      - "${INVENTORY_PORT:-8082}:8080"
+    networks:
+      - app
+      - jvm-diagnostics
+    restart: unless-stopped
+
+  java-bridge:
+    image: liveprobe-demo-java-bridge:local
+    build:
+      context: ..
+      dockerfile: java/bridge/Dockerfile
+    command:
+      - --service
+      - inventory-service
+      - --attach
+      - inventory-service:5005
+      - --broker
+      - http://broker:7070
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 5s
+      timeout: 2s
+      start_period: 5s
+      retries: 5
+    depends_on:
+      broker:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+    networks:
+      - jvm-diagnostics
+    restart: unless-stopped
+
+  inventory-traffic:
+    image: liveprobe-demo-inventory:local
+    entrypoint: ["java"]
+    command:
+      - -cp
+      - /app/inventory-service.jar
+      - io.liveprobe.demo.inventory.TrafficGenerator
+    environment:
+      INTERVAL_MS: "100"
+      TARGET_URL: http://inventory-service:8080
+      WAVES: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 5s
+      timeout: 2s
+      start_period: 2s
+      retries: 3
+    depends_on:
+      inventory-service:
+        condition: service_healthy
+      java-bridge:
+        condition: service_healthy
+    networks:
+      - app
+    restart: unless-stopped
+
+  mcp-server:
+    profiles: ["mcp"]
+    image: liveprobe-demo-mcp:local
+    build:
+      context: ..
+      dockerfile: packages/mcp-server/Dockerfile
+    environment:
+      BROKER_URL: http://broker:7070
+    depends_on:
+      broker:
+        condition: service_healthy
+    networks:
+      - app
+    stdin_open: true
+
+volumes:
+  broker-state:
+
+networks:
+  app:
+  jvm-diagnostics:
+    internal: true
