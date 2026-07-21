@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: liveprobe
       POSTGRES_USER: liveprobe
-      POSTGRES_PASSWORD: liveprobe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-liveprobe}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U liveprobe -d liveprobe"]
       interval: 5s
@@ -25,7 +25,7 @@ services:
       dockerfile: packages/broker/Dockerfile
     environment:
       LIVEPROBE_API_KEY: ${LIVEPROBE_API_KEY:-dev-liveprobe-key}
-      DATABASE_URL: postgres://liveprobe:liveprobe@postgres:5432/liveprobe
+      DATABASE_URL: postgres://liveprobe:${POSTGRES_PASSWORD:-liveprobe}@postgres:5432/liveprobe
       LIVEPROBE_STATE_FILE: /var/lib/liveprobe/broker-state.json
       LIVEPROBE_SNAPSHOT_INTERVAL_MS: "1000"
     depends_on:

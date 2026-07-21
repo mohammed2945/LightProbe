@@ -29,3 +29,4 @@ target/
 !.env.example
 .DS_Store
 *.log
+backups/

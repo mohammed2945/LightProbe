@@ -91,13 +91,17 @@ describe("broker validation and storage", () => {
     expect(broker.liveprobeState.listProbes()).toEqual([]);
   });
 
-  it("requires bearer auth on v1 routes when configured and leaves healthz open", async () => {
+  it("requires bearer auth on v1 routes and leaves health endpoints open", async () => {
     const broker = await buildBroker({ apiKey: "fixture-key" });
     openBrokers.push(broker);
 
     const health = await broker.inject({ method: "GET", url: "/healthz" });
     expect(health.statusCode).toBe(200);
     expect(health.json()).toEqual({ ok: true });
+
+    const readiness = await broker.inject({ method: "GET", url: "/readyz" });
+    expect(readiness.statusCode).toBe(200);
+    expect(readiness.json()).toEqual({ ok: true });
 
     const unauthorized = await broker.inject({
       method: "GET",
@@ -115,6 +119,23 @@ describe("broker validation and storage", () => {
     });
     expect(authorized.statusCode).toBe(200);
     expect(authorized.json()).toEqual({ ok: true });
+  });
+
+  it("reports unavailable when the durable store fails its readiness check", async () => {
+    const broker = await buildBroker({
+      store: {
+        async healthCheck() {
+          throw new Error("database unavailable");
+        },
+        async restore() {},
+        async persist() {},
+      },
+    });
+    openBrokers.push(broker);
+
+    const readiness = await broker.inject({ method: "GET", url: "/readyz" });
+    expect(readiness.statusCode).toBe(503);
+    expect(readiness.json()).toEqual({ ok: false });
   });
 
   it("strictly rejects malformed requests and mismatched events", async () => {

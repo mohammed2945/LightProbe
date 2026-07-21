@@ -321,8 +321,9 @@ defense-in-depth filter, not a DLP guarantee: an unrecognized secret can still
 be captured. Keep probe scope narrow, use one-hit/short-TTL probes, review
 custom watch paths, and remove probes promptly.
 
-All `/v1/*` broker routes require the shared `LIVEPROBE_API_KEY`; `/healthz` is
-the only unauthenticated route. This is authentication without user-level
+All `/v1/*` broker routes require the shared `LIVEPROBE_API_KEY`; `/healthz`
+and `/readyz` are unauthenticated liveness and database-readiness routes. This
+is authentication without user-level
 authorization, key rotation, tenant isolation, or TLS. Restrict network access
 and terminate TLS before any use beyond a controlled demo. The internal
 Compose network reduces JVM diagnostic exposure but is not a substitute for

@@ -62,6 +62,15 @@ export class PostgresStore {
     }
   }
 
+  public async healthCheck(): Promise<void> {
+    const client = await this.connect();
+    try {
+      await client.query("select 1");
+    } finally {
+      await client.end();
+    }
+  }
+
   public async restore(state: BrokerState): Promise<void> {
     const client = await this.connect();
     let restoredLegacySnapshot = false;

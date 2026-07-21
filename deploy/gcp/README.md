@@ -36,6 +36,7 @@ published.
 - A clean Git working tree containing the revision to deploy
 - Published `@doomslayer2945/liveprobe-mcp@0.1.1`
 - A strong `LIVEPROBE_API_KEY` retained by the operator
+- A separate 64-character hex `POSTGRES_PASSWORD` retained by the operator
 
 ```sh
 gcloud auth login
@@ -50,11 +51,12 @@ start without it.
 
 ## Deploy
 
-Generate the key once and store it in your password manager. Reuse the same
-key for redeployments unless you intend to rotate every component together.
+Generate both credentials once and store them in your password manager. Reuse
+them for redeployments unless you intend to rotate every component together.
 
 ```sh
 export LIVEPROBE_API_KEY="$(openssl rand -hex 32)"
+export POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/deploy.sh
 ```
 
@@ -75,6 +77,7 @@ defined in `deploy/gcp/lib/common.sh`.
 
 ```sh
 LIVEPROBE_API_KEY="<existing-shared-key>" \
+  POSTGRES_PASSWORD="<existing-database-password>" \
   PROJECT_ID="<PROJECT_ID>" \
   CLIENT_CIDR="68.65.169.128/28" \
   deploy/gcp/deploy.sh
@@ -133,10 +136,19 @@ PROJECT_ID="<PROJECT_ID>" deploy/gcp/status.sh
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/logs.sh
 ```
 
-Redeploy with the same `LIVEPROBE_API_KEY`. Deployment releases are immutable
+Redeploy with the same `LIVEPROBE_API_KEY` and `POSTGRES_PASSWORD`. Deployment releases are immutable
 directories under `/opt/liveprobe/releases`; `/opt/liveprobe/current` points to
 the active committed revision. Postgres state survives Compose replacement in
 its named volume.
+
+Create an off-VM custom-format Postgres backup before upgrades and at a regular
+interval during testing. Backups default to the ignored local `backups/`
+directory and are written with owner-only permissions.
+
+```sh
+PROJECT_ID="<PROJECT_ID>" deploy/gcp/backup.sh
+pg_restore --list backups/liveprobe-YYYYMMDDTHHMMSSZ.dump
+```
 
 To refresh firewall access after changing networks without redeploying:
 
@@ -172,6 +184,7 @@ For a live check from an allowed client address:
 
 ```sh
 curl --fail "http://BROKER_IP/healthz"
+curl --fail "http://BROKER_IP/readyz"
 curl --fail \
   -H "Authorization: Bearer ${LIVEPROBE_API_KEY}" \
   "http://BROKER_IP/v1/services"
@@ -180,8 +193,33 @@ curl --fail \
   "http://BROKER_IP/v1/safety"
 ```
 
-`/healthz` is intentionally unauthenticated and exposes no secrets. All `/v1/*`
+`/healthz` and `/readyz` are intentionally unauthenticated and expose no
+secrets. Readiness returns `503` when Postgres cannot be reached. All `/v1/*`
 routes reject missing or incorrect keys with `401`.
+
+## Production path
+
+The single-VM topology is suitable for controlled internal testing after
+regular off-VM backups are scheduled. Before storing important evidence or
+opening access beyond a narrow operator network, complete these items in order:
+
+1. Move `DATABASE_URL` to Cloud SQL for PostgreSQL over private IP or the Cloud
+   SQL Auth Proxy. Enable automated backups and point-in-time recovery; enable
+   regional high availability when recovery time requires it.
+2. Put the broker behind an HTTPS load balancer with a domain and a managed
+   certificate. Keep the VM without a public application port once the load
+   balancer or a private access path is in place.
+3. Store the broker key and database credential in Secret Manager and grant a
+   dedicated VM service account access to only those secrets.
+4. Install the Google Cloud Ops Agent and configure log-based alerts, an uptime
+   check on `/readyz`, CPU/disk alerts, and database storage/connection alerts.
+5. Build immutable images in CI, scan them, push them to Artifact Registry, and
+   deploy pinned digests with a tested rollback procedure.
+6. Define retention for probe events, expired probes, source maps, and backups.
+   Keep one broker replica until cross-instance long-poll notification and
+   shared coordination are implemented.
+7. Add per-operator identities, key rotation, audit retention, and tenant
+   isolation before treating the broker as a multi-user service.
 
 ## Destroy and cost control
 

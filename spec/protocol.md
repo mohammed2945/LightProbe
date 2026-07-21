@@ -28,7 +28,9 @@ behavior from another implementation.
   user.
 - All `/v1/*` routes require `Authorization: Bearer <key>` when the broker is
   configured with `LIVEPROBE_API_KEY`. `GET /healthz` is unauthenticated
-  liveness only. Invalid or missing credentials return HTTP 401:
+  process liveness. `GET /readyz` is also unauthenticated and returns 200 only
+  when the configured durable store is reachable. Neither endpoint exposes
+  configuration or secrets. Invalid or missing credentials return HTTP 401:
 
 ```json
 {

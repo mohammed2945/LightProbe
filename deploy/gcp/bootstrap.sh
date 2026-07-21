@@ -65,6 +65,7 @@ RELEASE_ARCHIVE="${RELEASE_ARCHIVE:-}"
 BROKER_PORT="${BROKER_PORT:-80}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 LIVEPROBE_API_KEY="${LIVEPROBE_API_KEY:-}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 
 [[ "$DEPLOY_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
   die "DEPLOY_COMMIT must be a full lowercase Git SHA"
@@ -76,6 +77,8 @@ LIVEPROBE_API_KEY="${LIVEPROBE_API_KEY:-}"
   die "BROKER_PORT must be between 1 and 65535"
 validate_ipv4 "$PUBLIC_IP"
 [[ -n "$LIVEPROBE_API_KEY" ]] || die "LIVEPROBE_API_KEY must not be empty"
+[[ "$POSTGRES_PASSWORD" =~ ^[0-9a-f]{64}$ ]] ||
+  die "POSTGRES_PASSWORD must be a 64-character lowercase hex value"
 
 trap 'rm -f -- "$RELEASE_ARCHIVE"' EXIT
 
@@ -166,9 +169,25 @@ pnpm --dir "$release_dir" install --frozen-lockfile
 ln --symbolic --force --no-dereference --no-target-directory \
   "$release_dir" /opt/liveprobe/current
 
+# POSTGRES_PASSWORD is only applied by the image when the data directory is
+# first initialized. Rotate an existing role before Compose recreates clients.
+existing_postgres="$({
+  docker ps \
+    --filter 'label=com.docker.compose.project=liveprobe-demo' \
+    --filter 'label=com.docker.compose.service=postgres' \
+    --format '{{.ID}}'
+} | head -n 1)"
+if [[ -n "$existing_postgres" ]]; then
+  printf "alter role liveprobe with password '%s';\n" "$POSTGRES_PASSWORD" | \
+    docker exec --interactive "$existing_postgres" \
+      psql --username=liveprobe --dbname=liveprobe --set=ON_ERROR_STOP=1 \
+      >/dev/null
+fi
+
 if ! BROKER_PORT="$BROKER_PORT" \
   GIT_COMMIT="${DEPLOY_COMMIT:-abcdef1234567890}" \
   LIVEPROBE_API_KEY="$LIVEPROBE_API_KEY" \
+  POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   make --directory=/opt/liveprobe/current \
     DOCKER_COMPOSE="docker compose" \
     gcp-demo-up; then
@@ -181,7 +200,7 @@ post_start_ok=false
 for attempt in {1..12}; do
   if compose_is_healthy "$release_dir" &&
     curl --fail --silent --show-error --max-time 5 \
-      "http://127.0.0.1:${BROKER_PORT}/healthz" >/dev/null; then
+      "http://127.0.0.1:${BROKER_PORT}/readyz" >/dev/null; then
     post_start_ok=true
     break
   fi

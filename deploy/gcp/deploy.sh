@@ -15,6 +15,8 @@ require_command node
   die "deployment requires a clean Git working tree"
 [[ -n "${LIVEPROBE_API_KEY:-}" ]] ||
   die "set LIVEPROBE_API_KEY to the shared broker/MCP/agent bearer key"
+[[ "${POSTGRES_PASSWORD:-}" =~ ^[0-9a-f]{64}$ ]] ||
+  die "set POSTGRES_PASSWORD to a 64-character lowercase hex value (openssl rand -hex 32)"
 
 DEPLOY_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 validate_commit "$DEPLOY_COMMIT"
@@ -147,12 +149,13 @@ gcloud_cmd compute scp "$archive" "$bootstrap_copy" \
 # The remote shell, not this local shell, must expand status.
 # shellcheck disable=SC2016
 printf -v remote_command \
-  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q LIVEPROBE_API_KEY=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
+  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q LIVEPROBE_API_KEY=%q POSTGRES_PASSWORD=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
   "$DEPLOY_COMMIT" \
   "$remote_archive" \
   "$BROKER_PORT" \
   "$public_ip" \
   "$LIVEPROBE_API_KEY" \
+  "$POSTGRES_PASSWORD" \
   "$remote_bootstrap" \
   "$remote_bootstrap"
 gcloud_cmd compute ssh "$VM_NAME" \

@@ -382,6 +382,7 @@ export interface PersistenceOptions {
 
 export interface BrokerStore {
   readonly incremental?: boolean;
+  healthCheck?(): Promise<void>;
   restore(state: BrokerState): Promise<void>;
   persist(state: BrokerState): Promise<void>;
   persistProbe?(state: BrokerState, probeId: string): Promise<void>;
@@ -1345,6 +1346,17 @@ export async function buildBroker(
   app.decorate("liveprobeState", state);
 
   app.get("/healthz", async () => ({ ok: true }));
+  app.get("/readyz", async (request, reply) => {
+    try {
+      if (store !== false) {
+        await store.healthCheck?.();
+      }
+      return { ok: true };
+    } catch (error: unknown) {
+      request.log.warn({ err: error }, "broker readiness check failed");
+      return reply.status(503).send({ ok: false });
+    }
+  });
 
   const apiKey = options.apiKey;
   if (apiKey !== undefined && apiKey.length === 0) {
