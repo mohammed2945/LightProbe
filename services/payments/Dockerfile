@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY common /app/common
+COPY services/__init__.py /app/services/__init__.py
+COPY services/payments /app/services/payments
+
+EXPOSE 8000
+
+CMD ["uvicorn", "services.payments.app:app", "--host", "0.0.0.0", "--port", "8000"]
