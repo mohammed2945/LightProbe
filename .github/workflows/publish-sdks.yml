@@ -3,6 +3,16 @@ name: Publish SDK packages
 on:
   workflow_dispatch:
     inputs:
+      package:
+        description: SDK package to build or publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - node
+          - python
+          - jvm
       dry_run:
         description: Build and inspect packages without publishing
         required: true
@@ -16,6 +26,7 @@ permissions:
 
 jobs:
   node:
+    if: ${{ inputs.package == 'all' || inputs.package == 'node' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -36,6 +47,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   python:
+    if: ${{ inputs.package == 'all' || inputs.package == 'python' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -56,6 +68,7 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
 
   jvm:
+    if: ${{ inputs.package == 'all' || inputs.package == 'jvm' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
