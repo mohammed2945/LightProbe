@@ -30,9 +30,15 @@ compose_is_healthy() {
   local service_count=0
   local -a compose=(
     docker compose
+    --env-file /etc/liveprobe/deployment.env
     -f "${release_dir}/demo/docker-compose.yml"
     -f "${release_dir}/deploy/gcp/docker-compose.gcp.yml"
   )
+  if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
+    compose+=(
+      -f "${release_dir}/deploy/gcp/docker-compose.cloud-sql.yml"
+    )
+  fi
 
   services="$("${compose[@]}" config --services)" || return 1
   while IFS= read -r service; do
@@ -47,7 +53,12 @@ compose_is_healthy() {
         --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
         "$container_id"
     )" || return 1
-    [[ "$state" == "running" && "$health" == "healthy" ]] || return 1
+    [[ "$state" == "running" ]] || return 1
+    if [[ "$service" == "cloud-sql-proxy" ]]; then
+      [[ "$health" == "none" || "$health" == "healthy" ]] || return 1
+    else
+      [[ "$health" == "healthy" ]] || return 1
+    fi
   done <<<"$services"
 
   ((service_count > 0))
@@ -66,6 +77,11 @@ BROKER_PORT="${BROKER_PORT:-80}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 LIVEPROBE_API_KEY="${LIVEPROBE_API_KEY:-}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+DATABASE_BACKEND="${DATABASE_BACKEND:-local}"
+CLOUD_SQL_INSTANCE_CONNECTION_NAME="${CLOUD_SQL_INSTANCE_CONNECTION_NAME:-}"
+CLOUD_SQL_DATABASE="${CLOUD_SQL_DATABASE:-liveprobe}"
+CLOUD_SQL_USER="${CLOUD_SQL_USER:-liveprobe}"
+LIVEPROBE_DB_POOL_SIZE="${LIVEPROBE_DB_POOL_SIZE:-10}"
 
 [[ "$DEPLOY_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
   die "DEPLOY_COMMIT must be a full lowercase Git SHA"
@@ -79,6 +95,20 @@ validate_ipv4 "$PUBLIC_IP"
 [[ -n "$LIVEPROBE_API_KEY" ]] || die "LIVEPROBE_API_KEY must not be empty"
 [[ "$POSTGRES_PASSWORD" =~ ^[0-9a-f]{64}$ ]] ||
   die "POSTGRES_PASSWORD must be a 64-character lowercase hex value"
+case "$DATABASE_BACKEND" in
+  local) ;;
+  cloud-sql)
+    [[ "$CLOUD_SQL_INSTANCE_CONNECTION_NAME" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]:[a-z][a-z0-9-]*[a-z0-9]:[a-z]([-a-z0-9]*[a-z0-9])?$ ]] ||
+      die "invalid CLOUD_SQL_INSTANCE_CONNECTION_NAME"
+    ;;
+  *) die "DATABASE_BACKEND must be local or cloud-sql" ;;
+esac
+[[ "$CLOUD_SQL_DATABASE" =~ ^[a-z][a-z0-9_]{0,62}$ ]] ||
+  die "invalid CLOUD_SQL_DATABASE"
+[[ "$CLOUD_SQL_USER" =~ ^[a-z][a-z0-9_]{0,62}$ ]] ||
+  die "invalid CLOUD_SQL_USER"
+[[ "$LIVEPROBE_DB_POOL_SIZE" =~ ^[1-9][0-9]*$ ]] ||
+  die "LIVEPROBE_DB_POOL_SIZE must be a positive integer"
 
 trap 'rm -f -- "$RELEASE_ARCHIVE"' EXIT
 
@@ -169,25 +199,44 @@ pnpm --dir "$release_dir" install --frozen-lockfile
 ln --symbolic --force --no-dereference --no-target-directory \
   "$release_dir" /opt/liveprobe/current
 
+install -d -m 0700 /etc/liveprobe
+deployment_env_tmp="$(mktemp /etc/liveprobe/deployment.env.XXXXXX)"
+chmod 0600 "$deployment_env_tmp"
+{
+  printf 'DATABASE_BACKEND=%s\n' "$DATABASE_BACKEND"
+  printf 'GCP_DATABASE_BACKEND=%s\n' "$DATABASE_BACKEND"
+  printf 'CLOUD_SQL_INSTANCE_CONNECTION_NAME=%s\n' \
+    "$CLOUD_SQL_INSTANCE_CONNECTION_NAME"
+  printf 'CLOUD_SQL_DATABASE=%s\n' "$CLOUD_SQL_DATABASE"
+  printf 'CLOUD_SQL_USER=%s\n' "$CLOUD_SQL_USER"
+  printf 'LIVEPROBE_DB_POOL_SIZE=%s\n' "$LIVEPROBE_DB_POOL_SIZE"
+  printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
+} >"$deployment_env_tmp"
+mv -- "$deployment_env_tmp" /etc/liveprobe/deployment.env
+
 # POSTGRES_PASSWORD is only applied by the image when the data directory is
 # first initialized. Rotate an existing role before Compose recreates clients.
-existing_postgres="$({
-  docker ps \
-    --filter 'label=com.docker.compose.project=liveprobe-demo' \
-    --filter 'label=com.docker.compose.service=postgres' \
-    --format '{{.ID}}'
-} | head -n 1)"
-if [[ -n "$existing_postgres" ]]; then
-  printf "alter role liveprobe with password '%s';\n" "$POSTGRES_PASSWORD" | \
-    docker exec --interactive "$existing_postgres" \
-      psql --username=liveprobe --dbname=liveprobe --set=ON_ERROR_STOP=1 \
-      >/dev/null
+if [[ "$DATABASE_BACKEND" == "local" ]]; then
+  existing_postgres="$({
+    docker ps \
+      --filter 'label=com.docker.compose.project=liveprobe-demo' \
+      --filter 'label=com.docker.compose.service=postgres' \
+      --format '{{.ID}}'
+  } | head -n 1)"
+  if [[ -n "$existing_postgres" ]]; then
+    printf "alter role liveprobe with password '%s';\n" "$POSTGRES_PASSWORD" | \
+      docker exec --interactive "$existing_postgres" \
+        psql --username=liveprobe --dbname=liveprobe --set=ON_ERROR_STOP=1 \
+        >/dev/null
+  fi
 fi
 
 if ! BROKER_PORT="$BROKER_PORT" \
   GIT_COMMIT="${DEPLOY_COMMIT:-abcdef1234567890}" \
   LIVEPROBE_API_KEY="$LIVEPROBE_API_KEY" \
   POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+  GCP_DATABASE_BACKEND="$DATABASE_BACKEND" \
+  GCP_ENV_FILE=/etc/liveprobe/deployment.env \
   make --directory=/opt/liveprobe/current \
     DOCKER_COMPOSE="docker compose" \
     gcp-demo-up; then

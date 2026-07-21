@@ -19,7 +19,7 @@ validate_ipv4 "$public_ip"
 gcloud_cmd compute ssh "$VM_NAME" \
   --project="$PROJECT_ID" \
   --zone="$ZONE" \
-  --command="make --directory=/opt/liveprobe/current DOCKER_COMPOSE='sudo docker compose' gcp-demo-status && printf 'Deployed SHA: ' && cat /opt/liveprobe/current/.deploy-commit" \
+  --command="sudo /opt/liveprobe/current/deploy/gcp/remote-compose.sh status && printf 'Deployed SHA: ' && cat /opt/liveprobe/current/.deploy-commit" \
   --quiet
 
 printf 'Broker URL: http://%s:%s\n' "$public_ip" "$BROKER_PORT"

@@ -39,6 +39,34 @@ validate_resource_name() {
     die "invalid ${label}: ${value}"
 }
 
+validate_database_backend() {
+  case "$1" in
+    local|cloud-sql) ;;
+    *) die "DATABASE_BACKEND must be local or cloud-sql: $1" ;;
+  esac
+}
+
+validate_database_identifier() {
+  local label="$1"
+  local value="$2"
+  [[ ${#value} -le 63 && "$value" =~ ^[a-z][a-z0-9_]*$ ]] ||
+    die "invalid ${label}: ${value}"
+}
+
+validate_service_account_name() {
+  local value="$1"
+  [[ ${#value} -ge 6 && ${#value} -le 30 && \
+    "$value" =~ ^[a-z]([-a-z0-9]*[a-z0-9])$ ]] ||
+    die "invalid runtime service account name: ${value}"
+}
+
+validate_positive_integer() {
+  local label="$1"
+  local value="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] ||
+    die "${label} must be a positive integer: ${value}"
+}
+
 validate_managed_firewall_name() {
   local label="$1"
   local value="$2"
@@ -217,6 +245,13 @@ load_gcp_config() {
   NETWORK="${NETWORK:-default}"
   NETWORK_TAG="${NETWORK_TAG:-liveprobe-demo}"
   BROKER_PORT="${BROKER_PORT:-80}"
+  DATABASE_BACKEND="${DATABASE_BACKEND:-local}"
+  CLOUD_SQL_INSTANCE="${CLOUD_SQL_INSTANCE:-${VM_NAME}-postgres}"
+  CLOUD_SQL_DATABASE="${CLOUD_SQL_DATABASE:-liveprobe}"
+  CLOUD_SQL_USER="${CLOUD_SQL_USER:-liveprobe}"
+  CLOUD_SQL_AVAILABILITY_TYPE="${CLOUD_SQL_AVAILABILITY_TYPE:-regional}"
+  RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-liveprobe-runtime}"
+  LIVEPROBE_DB_POOL_SIZE="${LIVEPROBE_DB_POOL_SIZE:-10}"
 
   validate_region "$REGION"
   validate_zone "$REGION" "$ZONE"
@@ -228,6 +263,18 @@ load_gcp_config() {
     die "broker and SSH firewall rules must have different names"
   validate_resource_name "network name" "$NETWORK"
   validate_resource_name "network tag" "$NETWORK_TAG"
+  validate_database_backend "$DATABASE_BACKEND"
+  validate_resource_name "Cloud SQL instance name" "$CLOUD_SQL_INSTANCE"
+  validate_database_identifier "Cloud SQL database name" "$CLOUD_SQL_DATABASE"
+  validate_database_identifier "Cloud SQL user name" "$CLOUD_SQL_USER"
+  case "$CLOUD_SQL_AVAILABILITY_TYPE" in
+    regional|zonal) ;;
+    *)
+      die "CLOUD_SQL_AVAILABILITY_TYPE must be regional or zonal: ${CLOUD_SQL_AVAILABILITY_TYPE}"
+      ;;
+  esac
+  validate_service_account_name "$RUNTIME_SERVICE_ACCOUNT"
+  validate_positive_integer "LIVEPROBE_DB_POOL_SIZE" "$LIVEPROBE_DB_POOL_SIZE"
   [[ "$MACHINE_TYPE" =~ ^[a-z0-9][-a-z0-9]*$ ]] ||
     die "invalid machine type: ${MACHINE_TYPE}"
   [[ "$DISK_SIZE" =~ ^[1-9][0-9]*GB$ ]] ||

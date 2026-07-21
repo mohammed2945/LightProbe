@@ -1,13 +1,15 @@
 # LiveProbe GCP demo operator guide
 
 This is the supported hosted MVP topology. It deploys one GCE VM containing
-Postgres, the broker, the Node/Python/JVM demo services, their traffic
-generators, and the private JVM bridge. The MCP server runs on the operator's
-computer and reaches the broker over HTTP.
+the broker, the Node/Python/JVM demo services, their traffic generators, and
+the private JVM bridge. The database can be either VM-local Postgres for the
+least expensive demo or Cloud SQL for a durable pilot. The MCP server runs on
+the operator's computer and reaches the broker over HTTP.
 
 This remains a demo deployment. Every `/v1/*` request requires a shared bearer
 key, but there is no per-user authorization, key rotation, tenant isolation,
-TLS termination, high availability, or replicated database.
+or TLS termination. Cloud SQL mode protects the database, but the broker is
+still a single instance.
 
 ## Topology
 
@@ -16,7 +18,7 @@ Cursor/Codex -- stdio --> @doomslayer2945/liveprobe-mcp
                            |
                            | HTTP + Authorization: Bearer <key>
                            v
-GCE :80 --> broker --> Postgres
+GCE :80 --> broker --> Postgres container or Cloud SQL Auth Proxy --> Cloud SQL
               ^          ^
               |          |
        Node/Python agents + JVM JDI bridge
@@ -89,6 +91,40 @@ committed archive, builds the Compose stack, and waits for every service to be
 healthy. It then prints the broker URL, deployed SHA, and exact MCP JSON. The
 JSON includes `LIVEPROBE_API_KEY`; treat terminal output as sensitive.
 
+### Cloud SQL database
+
+Set `DATABASE_BACKEND=cloud-sql` to provision and use a managed PostgreSQL 16
+database. New instances use the Enterprise edition with two vCPUs, 7.5 GiB of
+memory, regional high availability, 20 GiB SSD storage with bounded automatic
+growth, 14 automated backups, seven days of point-in-time recovery logs,
+deletion protection, encrypted connector-only access, and Query Insights.
+This is materially more expensive than the local database. For temporary
+testing, `CLOUD_SQL_AVAILABILITY_TYPE=zonal` removes cross-zone failover.
+
+```sh
+LIVEPROBE_API_KEY="<existing-shared-key>" \
+  POSTGRES_PASSWORD="<existing-database-password>" \
+  PROJECT_ID="<PROJECT_ID>" \
+  DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_AVAILABILITY_TYPE=regional \
+  deploy/gcp/deploy.sh
+```
+
+The provisioner creates a dedicated `liveprobe-runtime` service account with
+only `roles/cloudsql.client`, attaches it to the VM with the `cloud-platform`
+scope, and runs the pinned Cloud SQL Auth Proxy inside the private Compose
+network. The database has a public IP but rejects direct database connections;
+all connections must use a Cloud SQL connector. Existing instances must
+already be PostgreSQL 16 in the selected region.
+
+Cloud SQL starts with a fresh `liveprobe` database. Switching an existing
+deployment does not copy data from the VM-local Postgres volume. Export and
+restore that data before cutover when it must be retained.
+
+Supported overrides are `CLOUD_SQL_INSTANCE`, `CLOUD_SQL_DATABASE`,
+`CLOUD_SQL_USER`, `CLOUD_SQL_AVAILABILITY_TYPE`,
+`RUNTIME_SERVICE_ACCOUNT`, and `LIVEPROBE_DB_POOL_SIZE`.
+
 ## Configure MCP
 
 Use the exact JSON printed by `deploy.sh`. Its shape is:
@@ -136,14 +172,15 @@ PROJECT_ID="<PROJECT_ID>" deploy/gcp/status.sh
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/logs.sh
 ```
 
-Redeploy with the same `LIVEPROBE_API_KEY` and `POSTGRES_PASSWORD`. Deployment releases are immutable
-directories under `/opt/liveprobe/releases`; `/opt/liveprobe/current` points to
-the active committed revision. Postgres state survives Compose replacement in
-its named volume.
+Redeploy with the same `LIVEPROBE_API_KEY` and `POSTGRES_PASSWORD`. Deployment
+releases are immutable directories under `/opt/liveprobe/releases`;
+`/opt/liveprobe/current` points to the active committed revision. Database
+state survives Compose replacement in either database mode.
 
-Create an off-VM custom-format Postgres backup before upgrades and at a regular
-interval during testing. Backups default to the ignored local `backups/`
-directory and are written with owner-only permissions.
+Run a manual backup before upgrades. Local mode creates an off-VM custom-format
+dump in the ignored `backups/` directory with owner-only permissions. Cloud SQL
+mode creates an on-demand managed backup in addition to its automated backups
+and point-in-time recovery logs.
 
 ```sh
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/backup.sh
@@ -203,9 +240,8 @@ The single-VM topology is suitable for controlled internal testing after
 regular off-VM backups are scheduled. Before storing important evidence or
 opening access beyond a narrow operator network, complete these items in order:
 
-1. Move `DATABASE_URL` to Cloud SQL for PostgreSQL over private IP or the Cloud
-   SQL Auth Proxy. Enable automated backups and point-in-time recovery; enable
-   regional high availability when recovery time requires it.
+1. Use `DATABASE_BACKEND=cloud-sql`, verify a managed backup and a point-in-time
+   recovery drill, and migrate any retained local data before cutover.
 2. Put the broker behind an HTTPS load balancer with a domain and a managed
    certificate. Keep the VM without a public application port once the load
    balancer or a private access path is in place.
@@ -223,8 +259,8 @@ opening access beyond a narrow operator network, complete these items in order:
 
 ## Destroy and cost control
 
-The VM, disk, static address, and traffic incur charges until destroyed. Use
-the same overrides used at deployment:
+The VM, disk, static address, Cloud SQL instance, backups, and traffic can
+incur charges. Use the same overrides used at deployment:
 
 ```sh
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/destroy.sh
@@ -232,13 +268,17 @@ PROJECT_ID="<PROJECT_ID>" deploy/gcp/destroy.sh
 
 The script stops Compose when possible and deletes the VM and auto-delete disk,
 the two managed firewall rules, and the reserved regional static address. It
-does not alter unrelated firewall rules or delete the GCP project.
+does not alter unrelated firewall rules, delete the GCP project, or delete a
+Cloud SQL instance. Cloud SQL deletion protection remains enabled so database
+destruction requires a separate explicit administrative action.
 
 ## Security boundaries
 
 - The demo contains deterministic fake data only.
 - The bearer key is shared by operators and all agents; compromise requires a
   coordinated key rotation and redeployment.
+- Until the Secret Manager increment is complete, the database password is
+  retained in root-readable `/etc/liveprobe/deployment.env` on the VM.
 - HTTP is unencrypted. Use a trusted path, an SSH tunnel, or add TLS before
   carrying any non-demo data.
 - Node and JVM breakpoints can briefly pause an executing thread. Python line

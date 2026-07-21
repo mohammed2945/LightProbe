@@ -41,6 +41,28 @@ gcloud_cmd services enable compute.googleapis.com \
   --project="$PROJECT_ID" \
   --quiet
 
+cloud_sql_connection_name=""
+runtime_service_account=""
+if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
+  cloud_sql_connection_name="$(
+    PROJECT_ID="$PROJECT_ID" \
+    REGION="$REGION" \
+    ZONE="$ZONE" \
+    VM_NAME="$VM_NAME" \
+    DATABASE_BACKEND="$DATABASE_BACKEND" \
+    CLOUD_SQL_INSTANCE="$CLOUD_SQL_INSTANCE" \
+    CLOUD_SQL_DATABASE="$CLOUD_SQL_DATABASE" \
+    CLOUD_SQL_USER="$CLOUD_SQL_USER" \
+    CLOUD_SQL_AVAILABILITY_TYPE="$CLOUD_SQL_AVAILABILITY_TYPE" \
+    RUNTIME_SERVICE_ACCOUNT="$RUNTIME_SERVICE_ACCOUNT" \
+    LIVEPROBE_DB_POOL_SIZE="$LIVEPROBE_DB_POOL_SIZE" \
+    POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+    GCLOUD_BIN="$GCLOUD_BIN" \
+      "${SCRIPT_DIR}/provision-cloud-sql.sh"
+  )"
+  runtime_service_account="${RUNTIME_SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"
+fi
+
 if ! gcloud_cmd compute addresses describe "$STATIC_IP_NAME" \
   --project="$PROJECT_ID" \
   --region="$REGION" >/dev/null 2>&1; then
@@ -100,6 +122,36 @@ if gcloud_cmd compute instances describe "$VM_NAME" \
       --zone="$ZONE" \
       --format='value(status)'
   )"
+  if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
+    current_service_account="$(
+      gcloud_cmd compute instances describe "$VM_NAME" \
+        --project="$PROJECT_ID" \
+        --zone="$ZONE" \
+        --format='value(serviceAccounts[0].email)'
+    )"
+    current_scopes="$(
+      gcloud_cmd compute instances describe "$VM_NAME" \
+        --project="$PROJECT_ID" \
+        --zone="$ZONE" \
+        --format='value(serviceAccounts[0].scopes)'
+    )"
+    if [[ "$current_service_account" != "$runtime_service_account" ||
+      "$current_scopes" != *"https://www.googleapis.com/auth/cloud-platform"* ]]; then
+      if [[ "$instance_status" != "TERMINATED" ]]; then
+        gcloud_cmd compute instances stop "$VM_NAME" \
+          --project="$PROJECT_ID" \
+          --zone="$ZONE" \
+          --quiet
+      fi
+      gcloud_cmd compute instances set-service-account "$VM_NAME" \
+        --project="$PROJECT_ID" \
+        --zone="$ZONE" \
+        --service-account="$runtime_service_account" \
+        --scopes=cloud-platform \
+        --quiet
+      instance_status="TERMINATED"
+    fi
+  fi
   if [[ "$instance_status" != "RUNNING" ]]; then
     gcloud_cmd compute instances start "$VM_NAME" \
       --project="$PROJECT_ID" \
@@ -107,6 +159,13 @@ if gcloud_cmd compute instances describe "$VM_NAME" \
       --quiet
   fi
 else
+  vm_identity_args=()
+  if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
+    vm_identity_args=(
+      "--service-account=${runtime_service_account}"
+      "--scopes=cloud-platform"
+    )
+  fi
   gcloud_cmd compute instances create "$VM_NAME" \
     --project="$PROJECT_ID" \
     --zone="$ZONE" \
@@ -121,6 +180,7 @@ else
     --tags="$NETWORK_TAG" \
     --maintenance-policy=MIGRATE \
     --provisioning-model=STANDARD \
+    "${vm_identity_args[@]}" \
     --quiet
 fi
 
@@ -149,13 +209,18 @@ gcloud_cmd compute scp "$archive" "$bootstrap_copy" \
 # The remote shell, not this local shell, must expand status.
 # shellcheck disable=SC2016
 printf -v remote_command \
-  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q LIVEPROBE_API_KEY=%q POSTGRES_PASSWORD=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
+  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q LIVEPROBE_API_KEY=%q POSTGRES_PASSWORD=%q DATABASE_BACKEND=%q CLOUD_SQL_INSTANCE_CONNECTION_NAME=%q CLOUD_SQL_DATABASE=%q CLOUD_SQL_USER=%q LIVEPROBE_DB_POOL_SIZE=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
   "$DEPLOY_COMMIT" \
   "$remote_archive" \
   "$BROKER_PORT" \
   "$public_ip" \
   "$LIVEPROBE_API_KEY" \
   "$POSTGRES_PASSWORD" \
+  "$DATABASE_BACKEND" \
+  "$cloud_sql_connection_name" \
+  "$CLOUD_SQL_DATABASE" \
+  "$CLOUD_SQL_USER" \
+  "$LIVEPROBE_DB_POOL_SIZE" \
   "$remote_bootstrap" \
   "$remote_bootstrap"
 gcloud_cmd compute ssh "$VM_NAME" \

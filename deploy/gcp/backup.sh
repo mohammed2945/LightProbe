@@ -9,8 +9,42 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 load_gcp_config
 
-backup_dir="${BACKUP_DIR:-${REPO_ROOT}/backups}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+database_config="$(
+  gcloud_cmd compute ssh "$VM_NAME" \
+    --project="$PROJECT_ID" \
+    --zone="$ZONE" \
+    --command="sudo awk -F= '/^(DATABASE_BACKEND|CLOUD_SQL_INSTANCE_CONNECTION_NAME)=/ { print }' /etc/liveprobe/deployment.env" \
+    --quiet
+)"
+active_database_backend=""
+active_connection_name=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    DATABASE_BACKEND) active_database_backend="$value" ;;
+    CLOUD_SQL_INSTANCE_CONNECTION_NAME) active_connection_name="$value" ;;
+  esac
+done <<<"$database_config"
+
+case "$active_database_backend" in
+  cloud-sql)
+    [[ "$active_connection_name" == "${PROJECT_ID}:"*:* ]] ||
+      die "invalid deployed Cloud SQL connection name"
+    active_cloud_sql_instance="${active_connection_name##*:}"
+    validate_resource_name "Cloud SQL instance name" "$active_cloud_sql_instance"
+    gcloud_cmd sql backups create \
+      --instance="$active_cloud_sql_instance" \
+      --project="$PROJECT_ID" \
+      --description="manual-${timestamp}" \
+      --quiet
+    printf 'Cloud SQL backup completed for %s\n' "$active_cloud_sql_instance"
+    exit 0
+    ;;
+  local) ;;
+  *) die "unknown deployed database backend: ${active_database_backend:-<empty>}" ;;
+esac
+
+backup_dir="${BACKUP_DIR:-${REPO_ROOT}/backups}"
 backup_name="liveprobe-${timestamp}.dump"
 remote_backup="/tmp/${backup_name}"
 local_backup="${backup_dir}/${backup_name}"

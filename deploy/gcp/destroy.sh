@@ -14,7 +14,7 @@ if gcloud_cmd compute instances describe "$VM_NAME" \
   if ! gcloud_cmd compute ssh "$VM_NAME" \
     --project="$PROJECT_ID" \
     --zone="$ZONE" \
-    --command="make --directory=/opt/liveprobe/current DOCKER_COMPOSE='sudo docker compose' gcp-demo-down" \
+    --command="sudo /opt/liveprobe/current/deploy/gcp/remote-compose.sh down" \
     --quiet; then
     printf 'warning: could not stop Compose before deleting %s\n' "$VM_NAME" >&2
   fi

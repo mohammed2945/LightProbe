@@ -73,6 +73,9 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Test GCP deployment scripts
+        run: make gcp-deploy-test
+
       - name: Run security audits
         run: |
           make redaction-audit

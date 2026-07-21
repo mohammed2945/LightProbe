@@ -262,6 +262,11 @@ and cleanup:
 
 **[GCP single-VM demo operator guide](deploy/gcp/README.md)**
 
+The operator guide also provides an opt-in `DATABASE_BACKEND=cloud-sql` path
+with a dedicated runtime service account, Cloud SQL Auth Proxy, regional HA,
+automated backups, point-in-time recovery, and deletion protection. It does
+not migrate the existing local Docker volume automatically.
+
 ## All-language Docker demo
 
 ```sh
@@ -359,8 +364,9 @@ the deployment hardware for current numbers.
 
 - Shared-key authentication only; no RBAC, tenant isolation, TLS termination,
   key rotation, or immutable audit-log retention.
-- Postgres mutations are transactional and durable, but the deployment is
-  single-instance and unreplicated. JSON snapshots are a local/dev fallback.
+- Postgres mutations are transactional and durable. Cloud SQL mode can provide
+  regional database HA, but the broker remains single-instance. JSON snapshots
+  are a local/dev fallback.
 - No high availability, backpressure service, fleet rollout controller, or
   compatibility guarantees for private package APIs.
 - Source paths, generated JavaScript line mappings, and JVM debug metadata must

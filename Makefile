@@ -1,11 +1,21 @@
 SHELL := /bin/sh
 
 DOCKER_COMPOSE ?= docker compose
-GCP_COMPOSE = $(DOCKER_COMPOSE) -f demo/docker-compose.yml -f deploy/gcp/docker-compose.gcp.yml
+GCP_DATABASE_BACKEND ?= local
+GCP_ENV_FILE ?=
+GCP_COMPOSE = $(DOCKER_COMPOSE)
+ifneq ($(strip $(GCP_ENV_FILE)),)
+GCP_COMPOSE += --env-file $(GCP_ENV_FILE)
+endif
+GCP_COMPOSE += -f demo/docker-compose.yml -f deploy/gcp/docker-compose.gcp.yml
+ifeq ($(GCP_DATABASE_BACKEND),cloud-sql)
+GCP_COMPOSE += -f deploy/gcp/docker-compose.cloud-sql.yml
+endif
 GCP_LOGS_ARGS ?= --tail=200
 
 .PHONY: \
 	test fixtures-test typescript-test python-test java-test demo-unit-test \
+	gcp-deploy-test \
 	payment-deps python-demo-deps payment-test inventory-test \
 	build typescript-build payment-build java-build inventory-build \
 	redaction-audit readonly-audit bench \
@@ -51,6 +61,9 @@ inventory-test:
 	sh scripts/java17.sh $(MAKE) -C demo/inventory-service test
 
 demo-unit-test: payment-test inventory-test
+
+gcp-deploy-test:
+	deploy/gcp/test.sh
 
 typescript-build:
 	pnpm run build

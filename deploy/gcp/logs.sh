@@ -31,16 +31,17 @@ done
 
 load_gcp_config
 
-log_args="--tail=${tail_lines}"
+remote_args=(
+  sudo
+  /opt/liveprobe/current/deploy/gcp/remote-compose.sh
+  logs
+  --tail
+  "$tail_lines"
+)
 if [[ "$follow" == true ]]; then
-  log_args+=" --follow"
+  remote_args+=(--follow)
 fi
-
-printf -v remote_command \
-  'make --directory=%q DOCKER_COMPOSE=%q GCP_LOGS_ARGS=%q gcp-demo-logs' \
-  /opt/liveprobe/current \
-  'sudo docker compose' \
-  "$log_args"
+printf -v remote_command '%q ' "${remote_args[@]}"
 gcloud_cmd compute ssh "$VM_NAME" \
   --project="$PROJECT_ID" \
   --zone="$ZONE" \

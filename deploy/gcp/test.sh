@@ -113,6 +113,55 @@ grep -F "client_source_range=\"\$(resolve_client_source_range)\"" \
 grep -F "CLIENT_CIDR=\"\$client_source_range\"" \
   "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
   fail "deploy does not pass the normalized source to firewall refresh"
+grep -F '"${SCRIPT_DIR}/provision-cloud-sql.sh"' \
+  "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
+  fail "deploy does not invoke the Cloud SQL provisioner"
+grep -F -- '--service-account="$runtime_service_account"' \
+  "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
+  fail "deploy does not attach the dedicated runtime service account"
+grep -F 'GCP_DATABASE_BACKEND="$DATABASE_BACKEND"' \
+  "${SCRIPT_DIR}/bootstrap.sh" >/dev/null ||
+  fail "bootstrap does not select the deployed database Compose layer"
+grep -F 'GCP_ENV_FILE=/etc/liveprobe/deployment.env' \
+  "${SCRIPT_DIR}/remote-compose.sh" >/dev/null ||
+  fail "remote operations do not load the protected deployment env"
+
+cloud_sql_password="$(printf 'a%.0s' {1..64})"
+cloud_sql_connection_name="lightprobe-test:us-central1:lp-test-postgres"
+cloud_services="$(
+  POSTGRES_PASSWORD="$cloud_sql_password" \
+  CLOUD_SQL_INSTANCE_CONNECTION_NAME="$cloud_sql_connection_name" \
+    docker compose \
+      -f "${REPO_ROOT}/demo/docker-compose.yml" \
+      -f "${SCRIPT_DIR}/docker-compose.gcp.yml" \
+      -f "${SCRIPT_DIR}/docker-compose.cloud-sql.yml" \
+      config --services
+)"
+grep -Fx 'cloud-sql-proxy' <<<"$cloud_services" >/dev/null ||
+  fail "Cloud SQL Compose does not start the auth proxy"
+if grep -Fx 'postgres' <<<"$cloud_services" >/dev/null; then
+  fail "Cloud SQL Compose still starts VM-local Postgres"
+fi
+cloud_make_output="$(
+  make --directory="$REPO_ROOT" --dry-run \
+    DOCKER_COMPOSE='sudo docker compose' \
+    GCP_DATABASE_BACKEND=cloud-sql \
+    GCP_ENV_FILE=/etc/liveprobe/deployment.env \
+    gcp-demo-up
+)"
+grep -F -- '--env-file /etc/liveprobe/deployment.env' \
+  <<<"$cloud_make_output" >/dev/null ||
+  fail "Cloud SQL Make target does not load the protected deployment env"
+grep -F -- '-f deploy/gcp/docker-compose.cloud-sql.yml' \
+  <<<"$cloud_make_output" >/dev/null ||
+  fail "Cloud SQL Make target does not include its Compose layer"
+
+if (validate_database_backend unsupported) >/dev/null 2>&1; then
+  fail "unsupported database backend was accepted"
+fi
+if (validate_positive_integer LIVEPROBE_DB_POOL_SIZE 0) >/dev/null 2>&1; then
+  fail "invalid database pool size was accepted"
+fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/liveprobe-gcp-test.XXXXXX")"
 trap 'rm -rf -- "$tmp_dir"' EXIT
@@ -135,8 +184,123 @@ if [[ "${1:-} ${2:-} ${3:-}" == \
   [[ "${MOCK_FIREWALL_EXISTS:-false}" == true ]] && exit 0
   exit 1
 fi
+
+if [[ "${1:-} ${2:-} ${3:-}" == "compute ssh lp-test" &&
+  -n "${MOCK_DATABASE_CONFIG:-}" ]]; then
+  printf '%s\n' "$MOCK_DATABASE_CONFIG"
+  exit 0
+fi
+
+if [[ "${MOCK_PROVISION_CLOUD_SQL:-false}" == true ]]; then
+  case "${1:-} ${2:-} ${3:-}" in
+    "iam service-accounts describe") exit 1 ;;
+    "sql databases describe") exit 1 ;;
+    "sql users list")
+      if [[ "${MOCK_SQL_INSTANCE_EXISTS:-false}" == true ]]; then
+        printf 'liveprobe\n'
+      fi
+      exit 0
+      ;;
+    "sql instances describe")
+      for argument in "$@"; do
+        case "$argument" in
+          --format=value\(connectionName\))
+            printf '%s\n' "${MOCK_CONNECTION_NAME:?}"
+            exit 0
+            ;;
+          --format=value\(databaseVersion\))
+            printf 'POSTGRES_16\n'
+            exit 0
+            ;;
+          --format=value\(region\))
+            printf 'us-central1\n'
+            exit 0
+            ;;
+        esac
+      done
+      [[ "${MOCK_SQL_INSTANCE_EXISTS:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+  esac
+fi
 MOCK
 chmod +x "$mock_gcloud"
+
+: >"$mock_log"
+provisioned_connection_name="$(
+  PROJECT_ID=lightprobe-test \
+  REGION=us-central1 \
+  ZONE=us-central1-a \
+  VM_NAME=lp-test \
+  DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_INSTANCE=lp-test-postgres \
+  POSTGRES_PASSWORD="$cloud_sql_password" \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_PROVISION_CLOUD_SQL=true \
+  MOCK_CONNECTION_NAME="$cloud_sql_connection_name" \
+    "${SCRIPT_DIR}/provision-cloud-sql.sh" 2>/dev/null
+)"
+[[ "$provisioned_connection_name" == "$cloud_sql_connection_name" ]] ||
+  fail "Cloud SQL provisioner did not return the connection name"
+for expected_call in \
+  '<services> <enable> <iam.googleapis.com> <sqladmin.googleapis.com>' \
+  '<iam> <service-accounts> <create> <liveprobe-runtime>' \
+  '<projects> <add-iam-policy-binding> <lightprobe-test>' \
+  '<--role=roles/cloudsql.client>' \
+  '<sql> <instances> <create> <lp-test-postgres>' \
+  '<--database-version=POSTGRES_16>' \
+  '<--availability-type=regional>' \
+  '<--connector-enforcement=REQUIRED>' \
+  '<--enable-point-in-time-recovery>' \
+  '<--deletion-protection>' \
+  '<sql> <databases> <create> <liveprobe>' \
+  '<sql> <users> <create> <liveprobe>'; do
+  grep -F "$expected_call" "$mock_log" >/dev/null ||
+    fail "Cloud SQL provisioner omitted command: ${expected_call}"
+done
+
+: >"$mock_log"
+existing_connection_name="$(
+  PROJECT_ID=lightprobe-test \
+  REGION=us-central1 \
+  ZONE=us-central1-a \
+  VM_NAME=lp-test \
+  DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_INSTANCE=lp-test-postgres \
+  POSTGRES_PASSWORD="$cloud_sql_password" \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_PROVISION_CLOUD_SQL=true \
+  MOCK_SQL_INSTANCE_EXISTS=true \
+  MOCK_CONNECTION_NAME="$cloud_sql_connection_name" \
+    "${SCRIPT_DIR}/provision-cloud-sql.sh" 2>/dev/null
+)"
+[[ "$existing_connection_name" == "$cloud_sql_connection_name" ]] ||
+  fail "existing Cloud SQL provisioner did not return the connection name"
+grep -F '<sql> <instances> <patch> <lp-test-postgres>' \
+  "$mock_log" >/dev/null ||
+  fail "existing Cloud SQL instance security settings were not converged"
+grep -F '<sql> <users> <set-password> <liveprobe>' \
+  "$mock_log" >/dev/null ||
+  fail "existing Cloud SQL user password was not updated"
+if grep -F '<sql> <instances> <create> <lp-test-postgres>' \
+  "$mock_log" >/dev/null; then
+  fail "existing Cloud SQL instance was recreated"
+fi
+
+: >"$mock_log"
+PROJECT_ID=lightprobe-test \
+REGION=us-central1 \
+ZONE=us-central1-a \
+VM_NAME=lp-test \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_DATABASE_CONFIG=$'DATABASE_BACKEND=cloud-sql\nCLOUD_SQL_INSTANCE_CONNECTION_NAME=lightprobe-test:us-central1:lp-test-postgres' \
+  "${SCRIPT_DIR}/backup.sh" >/dev/null
+grep -F '<sql> <backups> <create> <--instance=lp-test-postgres>' \
+  "$mock_log" >/dev/null ||
+  fail "Cloud SQL backup did not create a managed on-demand backup"
 
 PROJECT_ID=lightprobe-test \
 REGION=us-central1 \
