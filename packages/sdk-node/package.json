@@ -2,6 +2,11 @@
   "name": "@doomslayer2945/liveprobe-node",
   "version": "0.1.1",
   "description": "Node.js runtime agent for LiveProbe",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mohammed2945/LightProbe.git",
+    "directory": "packages/sdk-node"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
