@@ -56,8 +56,10 @@ start without it.
 
 ## Deploy
 
-Generate both credentials once and store them in your password manager. Reuse
-them for redeployments unless you intend to rotate every component together.
+Generate both credentials once and store them in your password manager. The
+first deployment creates Secret Manager resources and seeds their first
+versions. Later deployments read those versions and do not require either
+plaintext value in the command environment.
 
 ```sh
 export LIVEPROBE_API_KEY="$(openssl rand -hex 32)"
@@ -75,24 +77,26 @@ By default the deployment uses:
 | Broker | external HTTP port `80` |
 | Firewall rules | `liveprobe-demo-broker`, `liveprobe-demo-ssh` |
 | Database | Postgres 16 in the `liveprobe-demo_postgres-data` volume |
+| Secrets | Secret Manager: `liveprobe-demo-broker-api-keys`, `liveprobe-demo-postgres-password` |
 
 Set `CLIENT_IP` for a specific `/32`, or `CLIENT_CIDR` for a narrowly scoped
 NAT pool. They are mutually exclusive. Other supported resource overrides are
 defined in `deploy/gcp/lib/common.sh`.
 
 ```sh
-LIVEPROBE_API_KEY="<existing-shared-key>" \
-  POSTGRES_PASSWORD="<existing-database-password>" \
-  PROJECT_ID="<PROJECT_ID>" \
+PROJECT_ID="<PROJECT_ID>" \
   CLIENT_CIDR="68.65.169.128/28" \
   deploy/gcp/deploy.sh
 ```
 
-The script enables Compute Engine, reserves or reuses the static address,
-creates or updates both firewall rules, creates or reuses the VM, uploads the
-committed archive, builds the Compose stack, and waits for every service to be
-healthy. It then prints the broker URL, deployed SHA, and exact MCP JSON. The
-JSON includes `LIVEPROBE_API_KEY`; treat terminal output as sensitive.
+The script enables Compute Engine and Secret Manager, grants the runtime
+service account access to only the two deployment secrets, reserves or reuses
+the static address, creates or updates firewall rules, creates or reuses the
+VM, uploads the committed archive, builds the Compose stack, and waits for
+every service to be healthy. The VM retrieves secret payloads through its
+metadata identity; plaintext values are not placed in the SSH command. The
+script prints the broker URL, deployed SHA, and exact MCP JSON. The JSON
+includes the current `LIVEPROBE_API_KEY`; treat terminal output as sensitive.
 
 ### Cloud SQL database
 
@@ -105,20 +109,19 @@ This is materially more expensive than the local database. For temporary
 testing, `CLOUD_SQL_AVAILABILITY_TYPE=zonal` removes cross-zone failover.
 
 ```sh
-LIVEPROBE_API_KEY="<existing-shared-key>" \
-  POSTGRES_PASSWORD="<existing-database-password>" \
-  PROJECT_ID="<PROJECT_ID>" \
+PROJECT_ID="<PROJECT_ID>" \
   DATABASE_BACKEND=cloud-sql \
   CLOUD_SQL_AVAILABILITY_TYPE=regional \
   deploy/gcp/deploy.sh
 ```
 
-The provisioner creates a dedicated `liveprobe-runtime` service account with
-only `roles/cloudsql.client`, attaches it to the VM with the `cloud-platform`
-scope, and runs the pinned Cloud SQL Auth Proxy inside the private Compose
-network. The database has a public IP but rejects direct database connections;
-all connections must use a Cloud SQL connector. Existing instances must
-already be PostgreSQL 16 in the selected region.
+The provisioners create a dedicated `liveprobe-runtime` service account with
+`roles/cloudsql.client` plus accessor grants on only the two deployment
+secrets, attach it to the VM with the `cloud-platform` scope, and run the pinned
+Cloud SQL Auth Proxy inside the private Compose network. The database has a
+public IP but rejects direct database connections; all connections must use a
+Cloud SQL connector. Existing instances must already be PostgreSQL 16 in the
+selected region.
 
 Cloud SQL starts with a fresh `liveprobe` database. Switching an existing
 deployment does not copy data from the VM-local Postgres volume. Export and
@@ -127,6 +130,36 @@ restore that data before cutover when it must be retained.
 Supported overrides are `CLOUD_SQL_INSTANCE`, `CLOUD_SQL_DATABASE`,
 `CLOUD_SQL_USER`, `CLOUD_SQL_AVAILABILITY_TYPE`,
 `RUNTIME_SERVICE_ACCOUNT`, and `LIVEPROBE_DB_POOL_SIZE`.
+
+### Secrets and API-key rotation
+
+GCP deployment defaults to `SECRETS_BACKEND=secret-manager`. The broker key
+ring and database password are stored in separate secrets. Secret payloads are
+still materialized in root-readable `/etc/liveprobe/deployment.env` because
+Docker Compose needs them, but Secret Manager is the source of truth and the
+runtime service account has no project-wide secret accessor role.
+
+To rotate the shared API key without disconnecting every client at once:
+
+```sh
+PROJECT_ID="<PROJECT_ID>" deploy/gcp/rotate-api-key.sh begin
+PROJECT_ID="<PROJECT_ID>" DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_AVAILABILITY_TYPE=zonal deploy/gcp/deploy.sh
+```
+
+Securely distribute the printed new key and update every MCP and agent process.
+During this window, the broker accepts the new key and the immediately previous
+key. Once migration is complete:
+
+```sh
+PROJECT_ID="<PROJECT_ID>" deploy/gcp/rotate-api-key.sh finish
+PROJECT_ID="<PROJECT_ID>" DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_AVAILABILITY_TYPE=zonal deploy/gcp/deploy.sh
+```
+
+The second deployment removes acceptance of the previous key. Never start a
+second rotation while an overlap is active. Use `SECRETS_BACKEND=environment`
+only for recovery or non-GCP development.
 
 ### HTTPS and TLS
 
@@ -213,8 +246,9 @@ PROJECT_ID="<PROJECT_ID>" deploy/gcp/status.sh
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/logs.sh
 ```
 
-Redeploy with the same `LIVEPROBE_API_KEY` and `POSTGRES_PASSWORD`. Deployment
-releases are immutable directories under `/opt/liveprobe/releases`;
+Redeploy without passing plaintext secrets; the deployer reads the current
+Secret Manager versions. Deployment releases are immutable directories under
+`/opt/liveprobe/releases`;
 `/opt/liveprobe/current` points to the active committed revision. Database
 state survives Compose replacement in either database mode.
 
@@ -286,8 +320,8 @@ opening access beyond a narrow operator network, complete these items in order:
    recovery drill, and migrate any retained local data before cutover.
 2. Activate the provided HTTPS load-balancer path with a domain and verify that
    direct broker ingress has been removed.
-3. Store the broker key and database credential in Secret Manager and grant a
-   dedicated VM service account access to only those secrets.
+3. Rotate the initial shared key, distribute it outside source control, and
+   periodically disable obsolete Secret Manager versions.
 4. Install the Google Cloud Ops Agent and configure log-based alerts, an uptime
    check on `/readyz`, CPU/disk alerts, and database storage/connection alerts.
 5. Build immutable images in CI, scan them, push them to Artifact Registry, and
@@ -319,8 +353,8 @@ administrative action.
 - The demo contains deterministic fake data only.
 - The bearer key is shared by operators and all agents; compromise requires a
   coordinated key rotation and redeployment.
-- Until the Secret Manager increment is complete, the database password is
-  retained in root-readable `/etc/liveprobe/deployment.env` on the VM.
+- Secret Manager is the source of truth, but Docker Compose still requires
+  secret payloads in root-readable `/etc/liveprobe/deployment.env` on the VM.
 - Before HTTPS activation, HTTP is unencrypted. Use a trusted path or an SSH
   tunnel and do not carry non-demo data.
 - TLS protects network transport after activation; the shared bearer key still

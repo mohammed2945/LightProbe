@@ -161,6 +161,35 @@ describe("broker validation and storage", () => {
     expect(authorized.json()).toEqual({ ok: true });
   });
 
+  it("accepts current and previous bearer keys during rotation", async () => {
+    const broker = await buildBroker({
+      apiKeys: ["current-fixture-key", "previous-fixture-key"],
+    });
+    openBrokers.push(broker);
+
+    for (const apiKey of ["current-fixture-key", "previous-fixture-key"]) {
+      const response = await broker.inject({
+        method: "GET",
+        url: "/v1/ping",
+        headers: { authorization: `Bearer ${apiKey}` },
+      });
+      expect(response.statusCode).toBe(200);
+    }
+
+    const rejected = await broker.inject({
+      method: "GET",
+      url: "/v1/ping",
+      headers: { authorization: "Bearer retired-fixture-key" },
+    });
+    expect(rejected.statusCode).toBe(401);
+  });
+
+  it("rejects more than two configured bearer keys", async () => {
+    await expect(
+      buildBroker({ apiKeys: ["key-one", "key-two", "key-three"] }),
+    ).rejects.toThrow("at most two API keys");
+  });
+
   it("reports unavailable when the durable store fails its readiness check", async () => {
     const broker = await buildBroker({
       store: {

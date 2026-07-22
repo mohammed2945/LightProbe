@@ -20,6 +20,67 @@ validate_ipv4() {
   done
 }
 
+validate_api_key_ring() {
+  local value="$1"
+  local key
+  local -a keys
+
+  IFS=',' read -r -a keys <<<"$value"
+  [[ ${#keys[@]} -ge 1 && ${#keys[@]} -le 2 ]] ||
+    die "broker API key ring must contain one or two keys"
+  for key in "${keys[@]}"; do
+    [[ ${#key} -ge 32 && ${#key} -le 256 &&
+      "$key" =~ ^[A-Za-z0-9._~-]+$ ]] ||
+      die "broker API keys must be 32-256 URL-safe characters"
+  done
+  if [[ ${#keys[@]} -eq 2 && "${keys[0]}" == "${keys[1]}" ]]; then
+    die "broker API key ring contains a duplicate key"
+  fi
+}
+
+fetch_secret() {
+  local project_id="$1"
+  local secret_name="$2"
+
+  node --input-type=module - "$project_id" "$secret_name" <<'NODE'
+const [projectId, secretName] = process.argv.slice(2);
+const sleep = (milliseconds) =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function fetchWithRetry(url, options) {
+  let lastError;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response;
+      lastError = new Error(`request failed: ${response.status}`);
+      if (![403, 429, 500, 502, 503, 504].includes(response.status)) break;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 8) await sleep(2_000);
+  }
+  throw lastError;
+}
+const metadataResponse = await fetchWithRetry(
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+  { headers: { "Metadata-Flavor": "Google" } },
+);
+const { access_token: accessToken } = await metadataResponse.json();
+if (typeof accessToken !== "string" || accessToken.length === 0) {
+  throw new Error("metadata token response did not include an access token");
+}
+const secretResponse = await fetchWithRetry(
+  `https://secretmanager.googleapis.com/v1/projects/${projectId}/secrets/${secretName}/versions/latest:access`,
+  { headers: { Authorization: `Bearer ${accessToken}` } },
+);
+const body = await secretResponse.json();
+if (typeof body?.payload?.data !== "string") {
+  throw new Error("Secret Manager response did not include payload data");
+}
+process.stdout.write(Buffer.from(body.payload.data, "base64").toString("utf8"));
+NODE
+}
+
 compose_is_healthy() {
   local release_dir="$1"
   local services
@@ -76,7 +137,12 @@ RELEASE_ARCHIVE="${RELEASE_ARCHIVE:-}"
 BROKER_PORT="${BROKER_PORT:-80}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 LIVEPROBE_API_KEY="${LIVEPROBE_API_KEY:-}"
+LIVEPROBE_API_KEYS="${LIVEPROBE_API_KEYS:-}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+PROJECT_ID="${PROJECT_ID:-}"
+SECRETS_BACKEND="${SECRETS_BACKEND:-environment}"
+LIVEPROBE_API_KEYS_SECRET="${LIVEPROBE_API_KEYS_SECRET:-}"
+POSTGRES_PASSWORD_SECRET="${POSTGRES_PASSWORD_SECRET:-}"
 DATABASE_BACKEND="${DATABASE_BACKEND:-local}"
 CLOUD_SQL_INSTANCE_CONNECTION_NAME="${CLOUD_SQL_INSTANCE_CONNECTION_NAME:-}"
 CLOUD_SQL_DATABASE="${CLOUD_SQL_DATABASE:-liveprobe}"
@@ -92,9 +158,21 @@ LIVEPROBE_DB_POOL_SIZE="${LIVEPROBE_DB_POOL_SIZE:-10}"
 ((10#${BROKER_PORT} >= 1 && 10#${BROKER_PORT} <= 65535)) ||
   die "BROKER_PORT must be between 1 and 65535"
 validate_ipv4 "$PUBLIC_IP"
-[[ -n "$LIVEPROBE_API_KEY" ]] || die "LIVEPROBE_API_KEY must not be empty"
-[[ "$POSTGRES_PASSWORD" =~ ^[0-9a-f]{64}$ ]] ||
-  die "POSTGRES_PASSWORD must be a 64-character lowercase hex value"
+case "$SECRETS_BACKEND" in
+  environment) ;;
+  secret-manager)
+    [[ "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] ||
+      die "invalid PROJECT_ID"
+    for secret_name in \
+      "$LIVEPROBE_API_KEYS_SECRET" \
+      "$POSTGRES_PASSWORD_SECRET"; do
+      [[ ${#secret_name} -le 63 &&
+        "$secret_name" =~ ^[a-z]([-a-z0-9]*[a-z0-9])?$ ]] ||
+        die "invalid Secret Manager secret name: ${secret_name:-<empty>}"
+    done
+    ;;
+  *) die "SECRETS_BACKEND must be environment or secret-manager" ;;
+esac
 case "$DATABASE_BACKEND" in
   local) ;;
   cloud-sql)
@@ -160,6 +238,17 @@ systemctl enable --now docker
   die "Node.js 24 was not installed"
 docker compose version >/dev/null
 
+if [[ "$SECRETS_BACKEND" == "secret-manager" ]]; then
+  LIVEPROBE_API_KEYS="$(fetch_secret "$PROJECT_ID" "$LIVEPROBE_API_KEYS_SECRET")"
+  POSTGRES_PASSWORD="$(fetch_secret "$PROJECT_ID" "$POSTGRES_PASSWORD_SECRET")"
+elif [[ -z "$LIVEPROBE_API_KEYS" ]]; then
+  LIVEPROBE_API_KEYS="$LIVEPROBE_API_KEY"
+fi
+validate_api_key_ring "$LIVEPROBE_API_KEYS"
+LIVEPROBE_API_KEY="${LIVEPROBE_API_KEYS%%,*}"
+[[ "$POSTGRES_PASSWORD" =~ ^[0-9a-f]{64}$ ]] ||
+  die "POSTGRES_PASSWORD must be a 64-character lowercase hex value"
+
 release_root="/opt/liveprobe/releases"
 release_dir="${release_root}/${DEPLOY_COMMIT}"
 install -d -m 0755 "$release_root"
@@ -210,6 +299,11 @@ chmod 0600 "$deployment_env_tmp"
   printf 'CLOUD_SQL_DATABASE=%s\n' "$CLOUD_SQL_DATABASE"
   printf 'CLOUD_SQL_USER=%s\n' "$CLOUD_SQL_USER"
   printf 'LIVEPROBE_DB_POOL_SIZE=%s\n' "$LIVEPROBE_DB_POOL_SIZE"
+  printf 'SECRETS_BACKEND=%s\n' "$SECRETS_BACKEND"
+  printf 'LIVEPROBE_API_KEYS_SECRET=%s\n' "$LIVEPROBE_API_KEYS_SECRET"
+  printf 'POSTGRES_PASSWORD_SECRET=%s\n' "$POSTGRES_PASSWORD_SECRET"
+  printf 'LIVEPROBE_API_KEY=%s\n' "$LIVEPROBE_API_KEY"
+  printf 'LIVEPROBE_API_KEYS=%s\n' "$LIVEPROBE_API_KEYS"
   printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
 } >"$deployment_env_tmp"
 mv -- "$deployment_env_tmp" /etc/liveprobe/deployment.env
@@ -234,6 +328,7 @@ fi
 if ! BROKER_PORT="$BROKER_PORT" \
   GIT_COMMIT="${DEPLOY_COMMIT:-abcdef1234567890}" \
   LIVEPROBE_API_KEY="$LIVEPROBE_API_KEY" \
+  LIVEPROBE_API_KEYS="$LIVEPROBE_API_KEYS" \
   POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   GCP_DATABASE_BACKEND="$DATABASE_BACKEND" \
   GCP_ENV_FILE=/etc/liveprobe/deployment.env \

@@ -145,6 +145,10 @@ grep -F '"${SCRIPT_DIR}/provision-cloud-sql.sh"' \
   "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
   fail "deploy does not invoke the Cloud SQL provisioner"
 # shellcheck disable=SC2016
+grep -F '"${SCRIPT_DIR}/provision-secrets.sh"' \
+  "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
+  fail "deploy does not invoke the Secret Manager provisioner"
+# shellcheck disable=SC2016
 grep -F -- '--service-account="$runtime_service_account"' \
   "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
   fail "deploy does not attach the dedicated runtime service account"
@@ -155,6 +159,17 @@ grep -F 'GCP_DATABASE_BACKEND="$DATABASE_BACKEND"' \
 grep -F 'GCP_ENV_FILE=/etc/liveprobe/deployment.env' \
   "${SCRIPT_DIR}/remote-compose.sh" >/dev/null ||
   fail "remote operations do not load the protected deployment env"
+grep -F 'metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+  "${SCRIPT_DIR}/bootstrap.sh" >/dev/null ||
+  fail "bootstrap does not use the VM metadata identity for secrets"
+grep -F 'remote_api_keys=""' "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
+  fail "Secret Manager deploy does not clear API keys from the SSH command"
+grep -F 'remote_postgres_password=""' "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
+  fail "Secret Manager deploy does not clear the database password from SSH"
+# shellcheck disable=SC2016
+grep -F 'LIVEPROBE_API_KEYS: ${LIVEPROBE_API_KEYS:-}' \
+  "${REPO_ROOT}/demo/docker-compose.yml" >/dev/null ||
+  fail "broker Compose service does not receive the rotation key ring"
 
 cloud_sql_password="$(printf 'a%.0s' {1..64})"
 cloud_sql_connection_name="lightprobe-test:us-central1:lp-test-postgres"
@@ -192,12 +207,31 @@ fi
 if (validate_positive_integer LIVEPROBE_DB_POOL_SIZE 0) >/dev/null 2>&1; then
   fail "invalid database pool size was accepted"
 fi
+fixture_api_key="$(printf 'a%.0s' {1..64})"
+previous_api_key="$(printf 'b%.0s' {1..64})"
+validate_api_key_ring "$fixture_api_key"
+validate_api_key_ring "${fixture_api_key},${previous_api_key}"
+[[ "$(primary_api_key "${fixture_api_key},${previous_api_key}")" == \
+  "$fixture_api_key" ]] || fail "primary API key was not selected"
+if (validate_api_key_ring 'short') >/dev/null 2>&1; then
+  fail "short API key was accepted"
+fi
+if (validate_api_key_ring "${fixture_api_key},${fixture_api_key}") \
+  >/dev/null 2>&1; then
+  fail "duplicate API key ring was accepted"
+fi
+if (validate_api_key_ring \
+  "${fixture_api_key},${previous_api_key},$(printf 'c%.0s' {1..64})") \
+  >/dev/null 2>&1; then
+  fail "API key ring with more than two keys was accepted"
+fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/liveprobe-gcp-test.XXXXXX")"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 mock_gcloud="${tmp_dir}/gcloud"
 mock_log="${tmp_dir}/gcloud.log"
 mock_curl_log="${tmp_dir}/curl.log"
+mock_secret_data_log="${tmp_dir}/secret-data.log"
 
 cat >"$mock_gcloud" <<'MOCK'
 #!/usr/bin/env bash
@@ -280,6 +314,37 @@ if [[ "${MOCK_PROVISION_HTTPS:-false}" == true ||
   esac
 fi
 
+if [[ "${MOCK_PROVISION_SECRETS:-false}" == true ||
+  "${MOCK_ROTATE_SECRET:-false}" == true ]]; then
+  case "${1:-} ${2:-} ${3:-}" in
+    "iam service-accounts describe")
+      [[ "${MOCK_SECRETS_EXIST:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+    "secrets describe liveprobe-test-broker-api-keys"|\
+    "secrets describe liveprobe-test-postgres-password")
+      [[ "${MOCK_SECRETS_EXIST:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+    "secrets versions list")
+      if [[ "${MOCK_SECRETS_EXIST:-false}" == true ]]; then
+        printf '1\n'
+      fi
+      exit 0
+      ;;
+    "secrets versions access")
+      printf '%s\n' "${MOCK_SECRET_RING:?}"
+      exit 0
+      ;;
+    "secrets versions add")
+      payload="$(cat)"
+      printf '%s <%s>\n' "${4:-}" "$payload" \
+        >>"${MOCK_SECRET_DATA_LOG:?}"
+      exit 0
+      ;;
+  esac
+fi
+
 if [[ "${MOCK_PROVISION_CLOUD_SQL:-false}" == true ]]; then
   case "${1:-} ${2:-} ${3:-}" in
     "iam service-accounts describe") exit 1 ;;
@@ -331,6 +396,93 @@ printf '\n' >>"${MOCK_CURL_LOG:?}"
 printf '{"ok":true}\n'
 MOCK
 chmod +x "${tmp_dir}/dig" "${tmp_dir}/curl"
+
+: >"$mock_log"
+: >"$mock_secret_data_log"
+PROJECT_ID=lightprobe-test \
+REGION=us-central1 \
+ZONE=us-central1-a \
+VM_NAME=liveprobe-test \
+SECRETS_BACKEND=secret-manager \
+LIVEPROBE_API_KEY="$fixture_api_key" \
+POSTGRES_PASSWORD="$cloud_sql_password" \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_SECRET_DATA_LOG="$mock_secret_data_log" \
+MOCK_PROVISION_SECRETS=true \
+  "${SCRIPT_DIR}/provision-secrets.sh" >/dev/null
+for expected_call in \
+  '<services> <enable> <iam.googleapis.com> <secretmanager.googleapis.com>' \
+  '<iam> <service-accounts> <create> <liveprobe-runtime>' \
+  '<secrets> <create> <liveprobe-test-broker-api-keys>' \
+  '<secrets> <create> <liveprobe-test-postgres-password>' \
+  '<secrets> <add-iam-policy-binding> <liveprobe-test-broker-api-keys>' \
+  '<secrets> <add-iam-policy-binding> <liveprobe-test-postgres-password>' \
+  '<--role=roles/secretmanager.secretAccessor>'; do
+  grep -F "$expected_call" "$mock_log" >/dev/null ||
+    fail "Secret Manager provisioner omitted command: ${expected_call}"
+done
+grep -F "liveprobe-test-broker-api-keys <${fixture_api_key}>" \
+  "$mock_secret_data_log" >/dev/null ||
+  fail "broker API key secret was not initialized through stdin"
+grep -F "liveprobe-test-postgres-password <${cloud_sql_password}>" \
+  "$mock_secret_data_log" >/dev/null ||
+  fail "Postgres password secret was not initialized through stdin"
+if grep -F "$fixture_api_key" "$mock_log" >/dev/null ||
+  grep -F "$cloud_sql_password" "$mock_log" >/dev/null; then
+  fail "secret payload leaked into gcloud arguments"
+fi
+
+: >"$mock_log"
+: >"$mock_secret_data_log"
+PROJECT_ID=lightprobe-test \
+VM_NAME=liveprobe-test \
+SECRETS_BACKEND=secret-manager \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_SECRET_DATA_LOG="$mock_secret_data_log" \
+MOCK_PROVISION_SECRETS=true \
+MOCK_SECRETS_EXIST=true \
+  "${SCRIPT_DIR}/provision-secrets.sh" >/dev/null
+if grep -F '<secrets> <create>' "$mock_log" >/dev/null ||
+  grep -F '<secrets> <versions> <add>' "$mock_log" >/dev/null; then
+  fail "existing secrets were recreated or overwritten"
+fi
+
+: >"$mock_log"
+: >"$mock_secret_data_log"
+new_api_key="$(printf 'c%.0s' {1..64})"
+rotation_output="$(
+  PROJECT_ID=lightprobe-test \
+  VM_NAME=liveprobe-test \
+  SECRETS_BACKEND=secret-manager \
+  LIVEPROBE_NEW_API_KEY="$new_api_key" \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_SECRET_DATA_LOG="$mock_secret_data_log" \
+  MOCK_ROTATE_SECRET=true \
+  MOCK_SECRET_RING="$fixture_api_key" \
+    "${SCRIPT_DIR}/rotate-api-key.sh" begin
+)"
+grep -F "New API key: ${new_api_key}" <<<"$rotation_output" >/dev/null ||
+  fail "API key rotation did not return its new primary key"
+grep -F "liveprobe-test-broker-api-keys <${new_api_key},${fixture_api_key}>" \
+  "$mock_secret_data_log" >/dev/null ||
+  fail "API key rotation did not create an overlap version"
+
+: >"$mock_secret_data_log"
+PROJECT_ID=lightprobe-test \
+VM_NAME=liveprobe-test \
+SECRETS_BACKEND=secret-manager \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_SECRET_DATA_LOG="$mock_secret_data_log" \
+MOCK_ROTATE_SECRET=true \
+MOCK_SECRET_RING="${new_api_key},${fixture_api_key}" \
+  "${SCRIPT_DIR}/rotate-api-key.sh" finish >/dev/null
+grep -F "liveprobe-test-broker-api-keys <${new_api_key}>" \
+  "$mock_secret_data_log" >/dev/null ||
+  fail "API key rotation did not retire the previous key"
 
 : >"$mock_log"
 provisioned_connection_name="$(

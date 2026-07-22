@@ -46,6 +46,57 @@ validate_database_backend() {
   esac
 }
 
+validate_secrets_backend() {
+  case "$1" in
+    environment|secret-manager) ;;
+    *) die "SECRETS_BACKEND must be environment or secret-manager: $1" ;;
+  esac
+}
+
+validate_api_key() {
+  local value="$1"
+
+  [[ ${#value} -ge 32 && ${#value} -le 256 &&
+    "$value" =~ ^[A-Za-z0-9._~-]+$ ]] ||
+    die "broker API keys must be 32-256 URL-safe characters"
+}
+
+validate_api_key_ring() {
+  local value="$1"
+  local key
+  local -a keys
+
+  IFS=',' read -r -a keys <<<"$value"
+  [[ ${#keys[@]} -ge 1 && ${#keys[@]} -le 2 ]] ||
+    die "broker API key ring must contain one or two comma-separated keys"
+  for key in "${keys[@]}"; do
+    validate_api_key "$key"
+  done
+  if [[ ${#keys[@]} -eq 2 && "${keys[0]}" == "${keys[1]}" ]]; then
+    die "broker API key ring contains a duplicate key"
+  fi
+}
+
+primary_api_key() {
+  local key_ring="$1"
+
+  validate_api_key_ring "$key_ring"
+  printf '%s\n' "${key_ring%%,*}"
+}
+
+read_secret_version() {
+  local secret_name="$1"
+  local value
+
+  value="$(
+    gcloud_cmd secrets versions access latest \
+      --project="$PROJECT_ID" \
+      --secret="$secret_name"
+  )"
+  [[ -n "$value" ]] || die "Secret Manager value is empty: ${secret_name}"
+  printf '%s\n' "$value"
+}
+
 validate_database_identifier() {
   local label="$1"
   local value="$2"
@@ -308,6 +359,9 @@ load_gcp_config() {
   CLOUD_SQL_AVAILABILITY_TYPE="${CLOUD_SQL_AVAILABILITY_TYPE:-regional}"
   RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-liveprobe-runtime}"
   LIVEPROBE_DB_POOL_SIZE="${LIVEPROBE_DB_POOL_SIZE:-10}"
+  SECRETS_BACKEND="${SECRETS_BACKEND:-secret-manager}"
+  LIVEPROBE_API_KEYS_SECRET="${LIVEPROBE_API_KEYS_SECRET:-${VM_NAME}-broker-api-keys}"
+  POSTGRES_PASSWORD_SECRET="${POSTGRES_PASSWORD_SECRET:-${VM_NAME}-postgres-password}"
   HTTPS_DOMAIN="${HTTPS_DOMAIN:-}"
   HTTPS_IP_NAME="${HTTPS_IP_NAME:-${VM_NAME}-https-ip}"
   HTTPS_INSTANCE_GROUP="${HTTPS_INSTANCE_GROUP:-${VM_NAME}-https-backend}"
@@ -338,6 +392,9 @@ load_gcp_config() {
   validate_resource_name "network name" "$NETWORK"
   validate_resource_name "network tag" "$NETWORK_TAG"
   validate_database_backend "$DATABASE_BACKEND"
+  validate_secrets_backend "$SECRETS_BACKEND"
+  validate_resource_name "broker API keys secret name" "$LIVEPROBE_API_KEYS_SECRET"
+  validate_resource_name "Postgres password secret name" "$POSTGRES_PASSWORD_SECRET"
   validate_resource_name "Cloud SQL instance name" "$CLOUD_SQL_INSTANCE"
   validate_database_identifier "Cloud SQL database name" "$CLOUD_SQL_DATABASE"
   validate_database_identifier "Cloud SQL user name" "$CLOUD_SQL_USER"

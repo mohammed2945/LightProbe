@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -400,6 +400,7 @@ export interface BuildBrokerOptions {
   logger?: FastifyServerOptions["logger"];
   state?: BrokerState;
   apiKey?: string;
+  apiKeys?: readonly string[];
   store?: BrokerStore | false;
   clock?: () => number;
   idGenerator?: (now: number) => string;
@@ -422,6 +423,22 @@ class BrokerHttpError extends Error {
     super(message);
     this.name = "BrokerHttpError";
   }
+}
+
+function bearerTokenMatches(
+  authorization: string | undefined,
+  apiKeys: readonly string[],
+): boolean {
+  if (authorization === undefined || !authorization.startsWith("Bearer ")) {
+    return false;
+  }
+  const supplied = Buffer.from(authorization.slice("Bearer ".length));
+  return apiKeys.some((apiKey) => {
+    const expected = Buffer.from(apiKey);
+    return (
+      supplied.length === expected.length && timingSafeEqual(supplied, expected)
+    );
+  });
 }
 
 function encodeCrockford(value: bigint, length: number): string {
@@ -1365,16 +1382,23 @@ export async function buildBroker(
     }
   });
 
-  const apiKey = options.apiKey;
-  if (apiKey !== undefined && apiKey.length === 0) {
-    throw new Error("apiKey must be non-empty when configured");
+  const apiKeys = Array.from(
+    new Set([
+      ...(options.apiKey === undefined ? [] : [options.apiKey]),
+      ...(options.apiKeys ?? []),
+    ]),
+  );
+  if (apiKeys.some((apiKey) => apiKey.length === 0)) {
+    throw new Error("API keys must be non-empty when configured");
+  }
+  if (apiKeys.length > 2) {
+    throw new Error("at most two API keys can be configured");
   }
   app.addHook("preHandler", async (request) => {
-    if (!request.url.startsWith("/v1/") || apiKey === undefined) {
+    if (!request.url.startsWith("/v1/") || apiKeys.length === 0) {
       return;
     }
-    const authorization = request.headers.authorization;
-    if (authorization !== `Bearer ${apiKey}`) {
+    if (!bearerTokenMatches(request.headers.authorization, apiKeys)) {
       throw new BrokerHttpError(
         401,
         "unauthorized",
@@ -1730,8 +1754,19 @@ async function main(): Promise<void> {
   );
   const persistencePath = process.env["LIVEPROBE_STATE_FILE"];
   const apiKey = process.env["LIVEPROBE_API_KEY"];
-  if ((process.env["NODE_ENV"] === "production" || process.env["LIVEPROBE_REQUIRE_API_KEY"] === "true") && (apiKey === undefined || apiKey.length === 0)) {
-    throw new Error("LIVEPROBE_API_KEY is required in production");
+  const apiKeys = (process.env["LIVEPROBE_API_KEYS"] ?? "")
+    .split(",")
+    .filter((value) => value.length > 0);
+  if (apiKey !== undefined && apiKey.length > 0) apiKeys.unshift(apiKey);
+  const configuredApiKeys = Array.from(new Set(apiKeys));
+  if (
+    (process.env["NODE_ENV"] === "production" ||
+      process.env["LIVEPROBE_REQUIRE_API_KEY"] === "true") &&
+    configuredApiKeys.length === 0
+  ) {
+    throw new Error(
+      "LIVEPROBE_API_KEY or LIVEPROBE_API_KEYS is required in production",
+    );
   }
   const persistence =
     persistencePath === undefined || persistencePath.length === 0
@@ -1746,7 +1781,7 @@ async function main(): Promise<void> {
     host: process.env["HOST"] ?? "0.0.0.0",
     port,
     logger: true,
-    ...(apiKey === undefined || apiKey.length === 0 ? {} : { apiKey }),
+    ...(configuredApiKeys.length === 0 ? {} : { apiKeys: configuredApiKeys }),
     persistence,
   });
   app.log.info(

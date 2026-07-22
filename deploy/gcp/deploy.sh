@@ -13,16 +13,35 @@ require_command node
   die "deploy.sh must be located inside the repository root"
 [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]] ||
   die "deployment requires a clean Git working tree"
-[[ -n "${LIVEPROBE_API_KEY:-}" ]] ||
-  die "set LIVEPROBE_API_KEY to the shared broker/MCP/agent bearer key"
-[[ "${POSTGRES_PASSWORD:-}" =~ ^[0-9a-f]{64}$ ]] ||
-  die "set POSTGRES_PASSWORD to a 64-character lowercase hex value (openssl rand -hex 32)"
 
 DEPLOY_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 validate_commit "$DEPLOY_COMMIT"
 
 load_gcp_config
 load_persisted_https_domain
+if [[ "$SECRETS_BACKEND" == "secret-manager" ]]; then
+  PROJECT_ID="$PROJECT_ID" \
+  REGION="$REGION" \
+  ZONE="$ZONE" \
+  VM_NAME="$VM_NAME" \
+  SECRETS_BACKEND="$SECRETS_BACKEND" \
+  LIVEPROBE_API_KEYS_SECRET="$LIVEPROBE_API_KEYS_SECRET" \
+  POSTGRES_PASSWORD_SECRET="$POSTGRES_PASSWORD_SECRET" \
+  RUNTIME_SERVICE_ACCOUNT="$RUNTIME_SERVICE_ACCOUNT" \
+  LIVEPROBE_API_KEY="${LIVEPROBE_API_KEY:-}" \
+  LIVEPROBE_API_KEYS="${LIVEPROBE_API_KEYS:-}" \
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}" \
+  GCLOUD_BIN="$GCLOUD_BIN" \
+    "${SCRIPT_DIR}/provision-secrets.sh"
+  LIVEPROBE_API_KEYS="$(read_secret_version "$LIVEPROBE_API_KEYS_SECRET")"
+  POSTGRES_PASSWORD="$(read_secret_version "$POSTGRES_PASSWORD_SECRET")"
+else
+  LIVEPROBE_API_KEYS="${LIVEPROBE_API_KEYS:-${LIVEPROBE_API_KEY:-}}"
+fi
+validate_api_key_ring "$LIVEPROBE_API_KEYS"
+LIVEPROBE_API_KEY="$(primary_api_key "$LIVEPROBE_API_KEYS")"
+[[ "$POSTGRES_PASSWORD" =~ ^[0-9a-f]{64}$ ]] ||
+  die "POSTGRES_PASSWORD must be a 64-character lowercase hex value"
 if ! client_source_range="$(resolve_client_source_range)"; then
   exit 1
 fi
@@ -57,7 +76,12 @@ gcloud_cmd services enable compute.googleapis.com \
   --quiet
 
 cloud_sql_connection_name=""
-runtime_service_account=""
+runtime_service_account="${RUNTIME_SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"
+needs_runtime_identity=false
+if [[ "$DATABASE_BACKEND" == "cloud-sql" ||
+  "$SECRETS_BACKEND" == "secret-manager" ]]; then
+  needs_runtime_identity=true
+fi
 if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
   cloud_sql_connection_name="$(
     PROJECT_ID="$PROJECT_ID" \
@@ -75,7 +99,6 @@ if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
     GCLOUD_BIN="$GCLOUD_BIN" \
       "${SCRIPT_DIR}/provision-cloud-sql.sh"
   )"
-  runtime_service_account="${RUNTIME_SERVICE_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"
 fi
 
 if ! gcloud_cmd compute addresses describe "$STATIC_IP_NAME" \
@@ -139,7 +162,7 @@ if gcloud_cmd compute instances describe "$VM_NAME" \
       --zone="$ZONE" \
       --format='value(status)'
   )"
-  if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
+  if [[ "$needs_runtime_identity" == true ]]; then
     current_service_account="$(
       gcloud_cmd compute instances describe "$VM_NAME" \
         --project="$PROJECT_ID" \
@@ -177,7 +200,7 @@ if gcloud_cmd compute instances describe "$VM_NAME" \
   fi
 else
   vm_identity_args=()
-  if [[ "$DATABASE_BACKEND" == "cloud-sql" ]]; then
+  if [[ "$needs_runtime_identity" == true ]]; then
     vm_identity_args=(
       "--service-account=${runtime_service_account}"
       "--scopes=cloud-platform"
@@ -223,16 +246,30 @@ gcloud_cmd compute scp "$archive" "$bootstrap_copy" \
   --zone="$ZONE" \
   --quiet
 
+remote_api_key="$LIVEPROBE_API_KEY"
+remote_api_keys="$LIVEPROBE_API_KEYS"
+remote_postgres_password="$POSTGRES_PASSWORD"
+if [[ "$SECRETS_BACKEND" == "secret-manager" ]]; then
+  remote_api_key=""
+  remote_api_keys=""
+  remote_postgres_password=""
+fi
+
 # The remote shell, not this local shell, must expand status.
 # shellcheck disable=SC2016
 printf -v remote_command \
-  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q LIVEPROBE_API_KEY=%q POSTGRES_PASSWORD=%q DATABASE_BACKEND=%q CLOUD_SQL_INSTANCE_CONNECTION_NAME=%q CLOUD_SQL_DATABASE=%q CLOUD_SQL_USER=%q LIVEPROBE_DB_POOL_SIZE=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
+  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q PROJECT_ID=%q SECRETS_BACKEND=%q LIVEPROBE_API_KEYS_SECRET=%q POSTGRES_PASSWORD_SECRET=%q LIVEPROBE_API_KEY=%q LIVEPROBE_API_KEYS=%q POSTGRES_PASSWORD=%q DATABASE_BACKEND=%q CLOUD_SQL_INSTANCE_CONNECTION_NAME=%q CLOUD_SQL_DATABASE=%q CLOUD_SQL_USER=%q LIVEPROBE_DB_POOL_SIZE=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
   "$DEPLOY_COMMIT" \
   "$remote_archive" \
   "$BROKER_PORT" \
   "$public_ip" \
-  "$LIVEPROBE_API_KEY" \
-  "$POSTGRES_PASSWORD" \
+  "$PROJECT_ID" \
+  "$SECRETS_BACKEND" \
+  "$LIVEPROBE_API_KEYS_SECRET" \
+  "$POSTGRES_PASSWORD_SECRET" \
+  "$remote_api_key" \
+  "$remote_api_keys" \
+  "$remote_postgres_password" \
   "$DATABASE_BACKEND" \
   "$cloud_sql_connection_name" \
   "$CLOUD_SQL_DATABASE" \

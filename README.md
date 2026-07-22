@@ -190,6 +190,10 @@ cryptographic proof that the target bytecode exactly matches that revision.
 | Variable | Used by | Purpose |
 | --- | --- | --- |
 | `LIVEPROBE_API_KEY` | broker, MCP, agents | Shared bearer token for all `/v1/*` broker calls. |
+| `LIVEPROBE_API_KEYS` | broker | One or two comma-separated bearer keys during rotation; the first is primary. |
+| `SECRETS_BACKEND` | GCP deploy | `secret-manager` by default; `environment` is the recovery fallback. |
+| `LIVEPROBE_API_KEYS_SECRET` | GCP deploy | Secret Manager ID containing the one- or two-key broker ring. |
+| `POSTGRES_PASSWORD_SECRET` | GCP deploy | Secret Manager ID containing the Postgres password. |
 | `DATABASE_URL` | broker | Enables Postgres durable state. If unset, `LIVEPROBE_STATE_FILE` JSON fallback is used. |
 | `LIVEPROBE_DB_POOL_SIZE` | broker | Maximum Postgres connections held by the broker. Defaults to `10`. |
 | `LIVEPROBE_STATE_FILE` | broker | Local/dev JSON fallback state file. |
@@ -234,27 +238,27 @@ The deployer rejects tracked modifications and untracked files because it
 archives the clean local `HEAD`. Commit every intended change, confirm
 `git status --short` is empty, make sure
 `@doomslayer2945/liveprobe-mcp@0.1.1` is available from npm, set a strong
-shared key, and deploy:
+shared key and database password for first-time Secret Manager initialization,
+and deploy:
 
 ```sh
 LIVEPROBE_API_KEY="$(openssl rand -hex 32)" \
+  POSTGRES_PASSWORD="$(openssl rand -hex 32)" \
   PROJECT_ID="<PROJECT_ID>" deploy/gcp/deploy.sh
 ```
 
-For the current Stanford visitor Wi-Fi NAT pool and healthy demo, use exactly:
+After Secret Manager has been initialized, redeploy the current hosted pilot
+without putting either secret in the command environment:
 
 ```sh
-LIVEPROBE_API_KEY="<existing-shared-key>" \
-  PROJECT_ID=totemic-studio-502902-u2 \
-  CLIENT_CIDR=68.65.169.128/28 \
+PROJECT_ID=totemic-studio-502902-u2 \
+  DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_AVAILABILITY_TYPE=zonal \
   deploy/gcp/deploy.sh
 ```
 
-`CLIENT_CIDR` configures the inbound GCP firewall rules; it cannot alter or
-bypass Stanford's outbound campus firewall. The observed network blocks
-outbound TCP `7070` but reaches the current broker on port `80`. If port `80`
-is also blocked, use the SSH-tunnel fallback in the operator guide and point
-the local MCP process at the tunnel.
+The current broker is `https://liveprobe.tryastrea.tech`. Public HTTP redirects
+to HTTPS, and the VM origin is restricted to Google load-balancer traffic.
 
 The default `e2-standard-4` VM, 40 GB balanced disk, premium static IPv4
 address, and network traffic can incur charges until destroyed. The complete
@@ -270,6 +274,11 @@ automated backups, point-in-time recovery, and deletion protection. It does
 not migrate the existing local Docker volume automatically. Its staged HTTPS
 procedure waits for DNS and a Google-managed certificate before restricting the
 VM origin to load-balancer traffic.
+
+GCP deployments use Secret Manager by default for the broker key ring and
+Postgres password. The runtime service account receives accessor permission on
+only those two secrets. A two-key overlap allows clients to migrate without a
+coordinated outage.
 
 ## All-language Docker demo
 

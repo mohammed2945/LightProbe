@@ -8,11 +8,10 @@ client to an existing LiveProbe broker. It does not cover deploying the broker.
 The current internal test deployment uses:
 
 - `BROKER_URL`: `https://liveprobe.tryastrea.tech`
-- `LIVEPROBE_API_KEY`: `31a0b10124f362ed92a465754d358e28d460fea0659d7d84793cae36fb2a5884`
+- `LIVEPROBE_API_KEY`: obtain the current key from the LiveProbe operator
 
-These values are intentionally included for internal testing. The repository
-and broker must remain restricted, and this key must be rotated before broader
-access or non-test data is allowed. Public traffic terminates TLS at the Google
+Do not commit the shared key to an application repository or paste it into
+issues, logs, or recordings. Public traffic terminates TLS at the Google
 Cloud load balancer, and HTTP redirects to HTTPS. The VM origin accepts broker
 traffic only from Google's load-balancer and health-check ranges. External port
 `7070` is not published; it is only the broker container's internal port.
@@ -23,7 +22,7 @@ Secret Manager, and add per-operator authorization and tenant isolation.
 
 ```sh
 export BROKER_URL="https://liveprobe.tryastrea.tech"
-export LIVEPROBE_API_KEY="31a0b10124f362ed92a465754d358e28d460fea0659d7d84793cae36fb2a5884"
+export LIVEPROBE_API_KEY="<provided-separately>"
 export GIT_COMMIT="$(git rev-parse HEAD)"
 ```
 
@@ -222,7 +221,7 @@ add this configuration:
         "https://liveprobe.tryastrea.tech"
       ],
       "env": {
-        "LIVEPROBE_API_KEY": "31a0b10124f362ed92a465754d358e28d460fea0659d7d84793cae36fb2a5884"
+        "LIVEPROBE_API_KEY": "<provided-separately>"
       }
     }
   }
