@@ -4,11 +4,12 @@ This is the supported hosted MVP topology. It deploys one GCE VM containing
 the broker, the Node/Python/JVM demo services, their traffic generators, and
 the private JVM bridge. The database can be either VM-local Postgres for the
 least expensive demo or Cloud SQL for a durable pilot. The MCP server runs on
-the operator's computer and reaches the broker over HTTP.
+the operator's computer. An optional global HTTPS load balancer provides a
+Google-managed certificate and redirects public HTTP to HTTPS.
 
 This remains a demo deployment. Every `/v1/*` request requires a shared bearer
-key, but there is no per-user authorization, key rotation, tenant isolation,
-or TLS termination. Cloud SQL mode protects the database, but the broker is
+key, but there is no per-user authorization, key rotation, or tenant isolation.
+Cloud SQL and TLS improve durability and transport security, but the broker is
 still a single instance.
 
 ## Topology
@@ -16,19 +17,20 @@ still a single instance.
 ```text
 Cursor/Codex -- stdio --> @doomslayer2945/liveprobe-mcp
                            |
-                           | HTTP + Authorization: Bearer <key>
+                           | HTTPS + Authorization: Bearer <key>
                            v
-GCE :80 --> broker --> Postgres container or Cloud SQL Auth Proxy --> Cloud SQL
-              ^          ^
-              |          |
-       Node/Python agents + JVM JDI bridge
+Global HTTPS LB :443 --> GCE :80 --> broker --> Cloud SQL Auth Proxy --> Cloud SQL
+                                      ^
+                                      |
+                         Node/Python agents + JVM JDI bridge
 ```
 
-Only SSH and the broker port are exposed by this deployment. Both managed GCP
-firewall rules are restricted to the detected operator IPv4 `/32`, or to an
-explicit `CLIENT_CIDR` between `/24` and `/32`. Application ports are bound to
-VM loopback. JDWP stays on a Docker `internal: true` network and is never
-published.
+Before HTTPS activation, SSH and the broker port are restricted to the detected
+operator IPv4 `/32`, or to an explicit `CLIENT_CIDR` between `/24` and `/32`.
+Activation removes direct broker ingress and permits port 80 only from Google's
+load-balancer and health-check ranges. SSH remains restricted to the operator.
+Application ports are bound to VM loopback. JDWP stays on a Docker
+`internal: true` network and is never published.
 
 ## Prerequisites
 
@@ -39,6 +41,7 @@ published.
 - Published `@doomslayer2945/liveprobe-mcp@0.1.1`
 - A strong `LIVEPROBE_API_KEY` retained by the operator
 - A separate 64-character hex `POSTGRES_PASSWORD` retained by the operator
+- For HTTPS: a DNS hostname and permission to create its `A` record
 
 ```sh
 gcloud auth login
@@ -125,6 +128,44 @@ Supported overrides are `CLOUD_SQL_INSTANCE`, `CLOUD_SQL_DATABASE`,
 `CLOUD_SQL_USER`, `CLOUD_SQL_AVAILABILITY_TYPE`,
 `RUNTIME_SERVICE_ACCOUNT`, and `LIVEPROBE_DB_POOL_SIZE`.
 
+### HTTPS and TLS
+
+Deploy the VM first. Then create the global external Application Load Balancer,
+reserved IPv4 address, Google-managed certificate, TLS 1.2 `MODERN` policy,
+HTTP-to-HTTPS redirect, health check, and backend firewall rule:
+
+```sh
+HTTPS_DOMAIN="probe.example.com" \
+  PROJECT_ID="<PROJECT_ID>" \
+  deploy/gcp/provision-https.sh
+```
+
+The command is idempotent and prints the required DNS record. Create that exact
+`A` record at the domain's DNS provider. Direct HTTP remains available during
+certificate provisioning, so this step does not interrupt the existing broker.
+Rerun the provisioner to inspect certificate status.
+
+Once the status is `ACTIVE`, perform the guarded cutover:
+
+```sh
+LIVEPROBE_API_KEY="<existing-shared-key>" \
+  HTTPS_DOMAIN="probe.example.com" \
+  PROJECT_ID="<PROJECT_ID>" \
+  CLIENT_IP="<operator-public-ip>" \
+  deploy/gcp/activate-https.sh
+```
+
+Activation requires DNS to resolve to the reserved load-balancer address. It
+checks `/healthz`, `/readyz`, and authenticated `/v1/ping` over HTTPS before
+closing direct ingress, repeats readiness and authentication checks afterward,
+and prints the HTTPS MCP configuration. It also records the hostname in VM
+metadata, so later `deploy.sh`, `status.sh`, and `refresh-firewall.sh` runs keep
+HTTPS mode even when `HTTPS_DOMAIN` is omitted.
+
+Do not point MCP clients at the load-balancer IP. The managed certificate is
+valid for the configured hostname, and clients must use
+`https://probe.example.com` (with the actual hostname).
+
 ## Configure MCP
 
 Use the exact JSON printed by `deploy.sh`. Its shape is:
@@ -138,7 +179,7 @@ Use the exact JSON printed by `deploy.sh`. Its shape is:
         "-y",
         "@doomslayer2945/liveprobe-mcp@0.1.1",
         "--broker-url",
-        "http://BROKER_IP:80"
+        "https://probe.example.com"
       ],
       "env": {
         "LIVEPROBE_API_KEY": "REDACTED_SHARED_KEY"
@@ -187,13 +228,14 @@ PROJECT_ID="<PROJECT_ID>" deploy/gcp/backup.sh
 pg_restore --list backups/liveprobe-YYYYMMDDTHHMMSSZ.dump
 ```
 
-To refresh firewall access after changing networks without redeploying:
+To refresh SSH access after changing networks without redeploying:
 
 ```sh
-PROJECT_ID="<PROJECT_ID>" deploy/gcp/refresh-firewall.sh
+PROJECT_ID="<PROJECT_ID>" CLIENT_IP="<operator-public-ip>" \
+  deploy/gcp/refresh-firewall.sh
 ```
 
-If outbound port 80 is blocked, create an SSH tunnel:
+Before HTTPS activation, if outbound port 80 is blocked, create an SSH tunnel:
 
 ```sh
 gcloud compute ssh liveprobe-demo \
@@ -217,17 +259,17 @@ docker compose \
   config --quiet
 ```
 
-For a live check from an allowed client address:
+For a live HTTPS check after activation:
 
 ```sh
-curl --fail "http://BROKER_IP/healthz"
-curl --fail "http://BROKER_IP/readyz"
+curl --fail "https://probe.example.com/healthz"
+curl --fail "https://probe.example.com/readyz"
 curl --fail \
   -H "Authorization: Bearer ${LIVEPROBE_API_KEY}" \
-  "http://BROKER_IP/v1/services"
+  "https://probe.example.com/v1/services"
 curl --fail \
   -H "Authorization: Bearer ${LIVEPROBE_API_KEY}" \
-  "http://BROKER_IP/v1/safety"
+  "https://probe.example.com/v1/safety"
 ```
 
 `/healthz` and `/readyz` are intentionally unauthenticated and expose no
@@ -242,9 +284,8 @@ opening access beyond a narrow operator network, complete these items in order:
 
 1. Use `DATABASE_BACKEND=cloud-sql`, verify a managed backup and a point-in-time
    recovery drill, and migrate any retained local data before cutover.
-2. Put the broker behind an HTTPS load balancer with a domain and a managed
-   certificate. Keep the VM without a public application port once the load
-   balancer or a private access path is in place.
+2. Activate the provided HTTPS load-balancer path with a domain and verify that
+   direct broker ingress has been removed.
 3. Store the broker key and database credential in Secret Manager and grant a
    dedicated VM service account access to only those secrets.
 4. Install the Google Cloud Ops Agent and configure log-based alerts, an uptime
@@ -267,10 +308,11 @@ PROJECT_ID="<PROJECT_ID>" deploy/gcp/destroy.sh
 ```
 
 The script stops Compose when possible and deletes the VM and auto-delete disk,
-the two managed firewall rules, and the reserved regional static address. It
-does not alter unrelated firewall rules, delete the GCP project, or delete a
-Cloud SQL instance. Cloud SQL deletion protection remains enabled so database
-destruction requires a separate explicit administrative action.
+the deployment's regional and global addresses, HTTPS load-balancer resources,
+and managed firewall rules. It does not alter unrelated firewall rules, delete
+the GCP project, or delete a Cloud SQL instance. Cloud SQL deletion protection
+remains enabled so database destruction requires a separate explicit
+administrative action.
 
 ## Security boundaries
 
@@ -279,8 +321,10 @@ destruction requires a separate explicit administrative action.
   coordinated key rotation and redeployment.
 - Until the Secret Manager increment is complete, the database password is
   retained in root-readable `/etc/liveprobe/deployment.env` on the VM.
-- HTTP is unencrypted. Use a trusted path, an SSH tunnel, or add TLS before
-  carrying any non-demo data.
+- Before HTTPS activation, HTTP is unencrypted. Use a trusted path or an SSH
+  tunnel and do not carry non-demo data.
+- TLS protects network transport after activation; the shared bearer key still
+  provides no per-user authorization or tenant boundary.
 - Node and JVM breakpoints can briefly pause an executing thread. Python line
   callbacks add target-process work. Read-only does not mean zero impact.
 - Redaction and bounded serialization are defense in depth, not proof that an

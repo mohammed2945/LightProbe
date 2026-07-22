@@ -22,8 +22,23 @@ DEPLOY_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 validate_commit "$DEPLOY_COMMIT"
 
 load_gcp_config
+load_persisted_https_domain
 if ! client_source_range="$(resolve_client_source_range)"; then
   exit 1
+fi
+if [[ -n "$HTTPS_DOMAIN" ]]; then
+  certificate_status="$(
+    gcloud_cmd compute ssl-certificates describe "$HTTPS_CERTIFICATE" \
+      --project="$PROJECT_ID" \
+      --global \
+      --format='value(managed.status)' 2>/dev/null || true
+  )"
+  [[ "$certificate_status" == "ACTIVE" ]] ||
+    die "HTTPS_DOMAIN requires an ACTIVE managed certificate; run provision-https.sh first"
+  gcloud_cmd compute forwarding-rules describe "$HTTPS_FORWARDING_RULE" \
+    --project="$PROJECT_ID" \
+    --global >/dev/null 2>&1 ||
+    die "HTTPS forwarding rule is missing; run provision-https.sh first"
 fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/liveprobe-deploy.XXXXXX")"
@@ -90,6 +105,8 @@ DISK_SIZE="$DISK_SIZE" \
 STATIC_IP_NAME="$STATIC_IP_NAME" \
 FIREWALL_RULE="$FIREWALL_RULE" \
 FIREWALL_SSH_RULE="$FIREWALL_SSH_RULE" \
+HTTPS_FIREWALL_RULE="$HTTPS_FIREWALL_RULE" \
+HTTPS_DOMAIN="$HTTPS_DOMAIN" \
 NETWORK="$NETWORK" \
 NETWORK_TAG="$NETWORK_TAG" \
 BROKER_PORT="$BROKER_PORT" \
@@ -229,7 +246,12 @@ gcloud_cmd compute ssh "$VM_NAME" \
   --command="$remote_command" \
   --quiet
 
-printf 'Broker URL: http://%s:%s\n' "$public_ip" "$BROKER_PORT"
+if [[ -n "$HTTPS_DOMAIN" ]]; then
+  broker_url="https://${HTTPS_DOMAIN}"
+else
+  broker_url="http://${public_ip}:${BROKER_PORT}"
+fi
+printf 'Broker URL: %s\n' "$broker_url"
 printf 'Deployed SHA to paste when asked: %s\n' "$DEPLOY_COMMIT"
 printf '\nExact Cursor MCP JSON:\n'
-print_cursor_mcp_json "$public_ip" "$BROKER_PORT" "$LIVEPROBE_API_KEY"
+print_broker_mcp_json "$broker_url" "$LIVEPROBE_API_KEY"

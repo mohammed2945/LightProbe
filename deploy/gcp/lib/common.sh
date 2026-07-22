@@ -60,6 +60,22 @@ validate_service_account_name() {
     die "invalid runtime service account name: ${value}"
 }
 
+validate_domain_name() {
+  local domain="$1"
+  local label
+  local -a labels
+
+  [[ ${#domain} -le 253 && "$domain" == *.* &&
+    "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])$ ]] ||
+    die "invalid HTTPS domain: ${domain}"
+  IFS='.' read -r -a labels <<<"$domain"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 &&
+      "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+      die "invalid HTTPS domain label: ${label:-<empty>}"
+  done
+}
+
 validate_positive_integer() {
   local label="$1"
   local value="$2"
@@ -144,16 +160,19 @@ normalize_client_cidr() {
     "$((10#${prefix}))"
 }
 
-print_cursor_mcp_json() {
-  local ip="$1"
-  local port="$2"
-  local api_key="$3"
+print_broker_mcp_json() {
+  local broker_url="$1"
+  local api_key="$2"
 
-  validate_ipv4 "$ip"
-  validate_port "$port"
   [[ -n "$api_key" ]] || die "LIVEPROBE_API_KEY must not be empty"
-  node - "$ip" "$port" "$api_key" <<'NODE'
-const [ip, port, apiKey] = process.argv.slice(2);
+  node - "$broker_url" "$api_key" <<'NODE'
+const [brokerUrl, apiKey] = process.argv.slice(2);
+const parsed = new URL(brokerUrl);
+if (!['http:', 'https:'].includes(parsed.protocol) ||
+    parsed.username || parsed.password || parsed.search || parsed.hash ||
+    parsed.pathname !== '/') {
+  throw new Error('invalid broker URL');
+}
 const config = {
   mcpServers: {
     liveprobe: {
@@ -162,7 +181,7 @@ const config = {
         "-y",
         "@doomslayer2945/liveprobe-mcp@0.1.1",
         "--broker-url",
-        `http://${ip}:${port}`,
+        brokerUrl,
       ],
       env: { LIVEPROBE_API_KEY: apiKey },
     },
@@ -170,6 +189,43 @@ const config = {
 };
 process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
 NODE
+}
+
+print_cursor_mcp_json() {
+  local ip="$1"
+  local port="$2"
+  local api_key="$3"
+
+  validate_ipv4 "$ip"
+  validate_port "$port"
+  print_broker_mcp_json "http://${ip}:${port}" "$api_key"
+}
+
+load_persisted_https_domain() {
+  local metadata_json
+  local persisted_domain
+
+  [[ -z "$HTTPS_DOMAIN" ]] || return 0
+  metadata_json="$(
+    gcloud_cmd compute instances describe "$VM_NAME" \
+      --project="$PROJECT_ID" \
+      --zone="$ZONE" \
+      --format='json(metadata.items)' 2>/dev/null || true
+  )"
+  [[ -n "$metadata_json" && "$metadata_json" != "null" ]] || return 0
+  require_command node
+  persisted_domain="$(
+    node -e '
+      const instance = JSON.parse(process.argv[1]);
+      const item = instance?.metadata?.items?.find(
+        ({ key }) => key === process.argv[2],
+      );
+      if (typeof item?.value === "string") process.stdout.write(item.value);
+    ' "$metadata_json" "$HTTPS_DOMAIN_METADATA_KEY"
+  )"
+  [[ -n "$persisted_domain" ]] || return 0
+  validate_domain_name "$persisted_domain"
+  HTTPS_DOMAIN="$persisted_domain"
 }
 
 resolve_project_id() {
@@ -252,6 +308,22 @@ load_gcp_config() {
   CLOUD_SQL_AVAILABILITY_TYPE="${CLOUD_SQL_AVAILABILITY_TYPE:-regional}"
   RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-liveprobe-runtime}"
   LIVEPROBE_DB_POOL_SIZE="${LIVEPROBE_DB_POOL_SIZE:-10}"
+  HTTPS_DOMAIN="${HTTPS_DOMAIN:-}"
+  HTTPS_IP_NAME="${HTTPS_IP_NAME:-${VM_NAME}-https-ip}"
+  HTTPS_INSTANCE_GROUP="${HTTPS_INSTANCE_GROUP:-${VM_NAME}-https-backend}"
+  HTTPS_HEALTH_CHECK="${HTTPS_HEALTH_CHECK:-${VM_NAME}-https-health}"
+  HTTPS_BACKEND_SERVICE="${HTTPS_BACKEND_SERVICE:-${VM_NAME}-https-service}"
+  HTTPS_URL_MAP="${HTTPS_URL_MAP:-${VM_NAME}-https-map}"
+  HTTPS_CERTIFICATE="${HTTPS_CERTIFICATE:-${VM_NAME}-certificate}"
+  HTTPS_SSL_POLICY="${HTTPS_SSL_POLICY:-${VM_NAME}-tls-policy}"
+  HTTPS_PROXY="${HTTPS_PROXY:-${VM_NAME}-https-proxy}"
+  HTTPS_FORWARDING_RULE="${HTTPS_FORWARDING_RULE:-${VM_NAME}-https-forwarding}"
+  HTTP_REDIRECT_URL_MAP="${HTTP_REDIRECT_URL_MAP:-${VM_NAME}-http-redirect-map}"
+  HTTP_REDIRECT_PROXY="${HTTP_REDIRECT_PROXY:-${VM_NAME}-http-redirect-proxy}"
+  HTTP_REDIRECT_FORWARDING_RULE="${HTTP_REDIRECT_FORWARDING_RULE:-${VM_NAME}-http-redirect-forwarding}"
+  HTTPS_FIREWALL_RULE="${HTTPS_FIREWALL_RULE:-${VM_NAME}-lb-backend}"
+  HTTPS_PROXY_SOURCE_RANGES="35.191.0.0/16,130.211.0.0/22"
+  HTTPS_DOMAIN_METADATA_KEY="liveprobe-https-domain"
 
   validate_region "$REGION"
   validate_zone "$REGION" "$ZONE"
@@ -275,6 +347,22 @@ load_gcp_config() {
   esac
   validate_service_account_name "$RUNTIME_SERVICE_ACCOUNT"
   validate_positive_integer "LIVEPROBE_DB_POOL_SIZE" "$LIVEPROBE_DB_POOL_SIZE"
+  if [[ -n "$HTTPS_DOMAIN" ]]; then
+    validate_domain_name "$HTTPS_DOMAIN"
+  fi
+  validate_resource_name "HTTPS IP name" "$HTTPS_IP_NAME"
+  validate_resource_name "HTTPS instance group name" "$HTTPS_INSTANCE_GROUP"
+  validate_resource_name "HTTPS health check name" "$HTTPS_HEALTH_CHECK"
+  validate_resource_name "HTTPS backend service name" "$HTTPS_BACKEND_SERVICE"
+  validate_resource_name "HTTPS URL map name" "$HTTPS_URL_MAP"
+  validate_resource_name "HTTPS certificate name" "$HTTPS_CERTIFICATE"
+  validate_resource_name "HTTPS SSL policy name" "$HTTPS_SSL_POLICY"
+  validate_resource_name "HTTPS proxy name" "$HTTPS_PROXY"
+  validate_resource_name "HTTPS forwarding rule name" "$HTTPS_FORWARDING_RULE"
+  validate_resource_name "HTTP redirect URL map name" "$HTTP_REDIRECT_URL_MAP"
+  validate_resource_name "HTTP redirect proxy name" "$HTTP_REDIRECT_PROXY"
+  validate_resource_name "HTTP redirect forwarding rule name" "$HTTP_REDIRECT_FORWARDING_RULE"
+  validate_managed_firewall_name "HTTPS firewall rule name" "$HTTPS_FIREWALL_RULE"
   [[ "$MACHINE_TYPE" =~ ^[a-z0-9][-a-z0-9]*$ ]] ||
     die "invalid machine type: ${MACHINE_TYPE}"
   [[ "$DISK_SIZE" =~ ^[1-9][0-9]*GB$ ]] ||

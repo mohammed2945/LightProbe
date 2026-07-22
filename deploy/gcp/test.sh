@@ -56,6 +56,32 @@ node -e '
   }
 ' "$mcp_json" || fail "Cursor MCP JSON is invalid"
 
+https_mcp_json="$(
+  print_broker_mcp_json \
+    'https://probe.example.com' \
+    'fixture-key-with-"quote'
+)"
+node -e '
+  const config = JSON.parse(process.argv[1]);
+  const server = config.mcpServers?.liveprobe;
+  if (server?.args?.at(-1) !== "https://probe.example.com" ||
+      server.env?.LIVEPROBE_API_KEY !== "fixture-key-with-\"quote") {
+    process.exit(1);
+  }
+' "$https_mcp_json" || fail "HTTPS MCP JSON is invalid"
+
+for invalid_domain in \
+  'localhost' \
+  '-probe.example.com' \
+  'probe..example.com' \
+  'probe_example.com' \
+  'https://probe.example.com'; do
+  if (validate_domain_name "$invalid_domain") >/dev/null 2>&1; then
+    fail "invalid HTTPS domain was accepted: ${invalid_domain}"
+  fi
+done
+validate_domain_name 'probe.example.com'
+
 detected_range="$(
   (
     unset CLIENT_IP CLIENT_CIDR
@@ -167,6 +193,7 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/liveprobe-gcp-test.XXXXXX")"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 mock_gcloud="${tmp_dir}/gcloud"
 mock_log="${tmp_dir}/gcloud.log"
+mock_curl_log="${tmp_dir}/curl.log"
 
 cat >"$mock_gcloud" <<'MOCK'
 #!/usr/bin/env bash
@@ -189,6 +216,64 @@ if [[ "${1:-} ${2:-} ${3:-}" == "compute ssh lp-test" &&
   -n "${MOCK_DATABASE_CONFIG:-}" ]]; then
   printf '%s\n' "$MOCK_DATABASE_CONFIG"
   exit 0
+fi
+
+if [[ "${1:-} ${2:-} ${3:-}" == "compute instances describe" &&
+  -n "${MOCK_PERSISTED_HTTPS_DOMAIN:-}" ]]; then
+  for argument in "$@"; do
+    if [[ "$argument" == "--format=json(metadata.items)" ]]; then
+      printf '{"metadata":{"items":[{"key":"unrelated","value":"ignored"},'
+      printf '{"key":"liveprobe-https-domain","value":"%s"}]}}\n' \
+        "$MOCK_PERSISTED_HTTPS_DOMAIN"
+      exit 0
+    fi
+  done
+fi
+
+if [[ "${MOCK_PROVISION_HTTPS:-false}" == true ||
+  "${MOCK_ACTIVATE_HTTPS:-false}" == true ]]; then
+  case "${1:-} ${2:-} ${3:-}" in
+    "compute instances describe") exit 0 ;;
+    "compute addresses describe")
+      for argument in "$@"; do
+        if [[ "$argument" == "--format=value(address)" ]]; then
+          printf '198.51.100.40\n'
+          exit 0
+        fi
+      done
+      [[ "${MOCK_ACTIVATE_HTTPS:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+    "compute instance-groups unmanaged")
+      [[ "${4:-}" == "list-instances" ]] && exit 0
+      [[ "${4:-}" == "describe" ]] && exit 1
+      ;;
+    "compute health-checks describe"|"compute url-maps describe"|\
+    "compute ssl-policies describe"|"compute target-https-proxies describe"|\
+    "compute target-http-proxies describe")
+      exit 1
+      ;;
+    "compute backend-services describe")
+      for argument in "$@"; do
+        [[ "$argument" == "--format=value(backends.group)" ]] && exit 0
+      done
+      exit 1
+      ;;
+    "compute ssl-certificates describe")
+      for argument in "$@"; do
+        if [[ "$argument" == "--format=value(managed.status)" ]]; then
+          printf '%s\n' "${MOCK_CERTIFICATE_STATUS:-PROVISIONING}"
+          exit 0
+        fi
+      done
+      [[ "${MOCK_ACTIVATE_HTTPS:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+    "compute forwarding-rules describe")
+      [[ "${MOCK_ACTIVATE_HTTPS:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+  esac
 fi
 
 if [[ "${MOCK_PROVISION_CLOUD_SQL:-false}" == true ]]; then
@@ -226,6 +311,23 @@ fi
 MOCK
 chmod +x "$mock_gcloud"
 
+cat >"${tmp_dir}/dig" <<'MOCK'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "${MOCK_DNS_IP:?}"
+MOCK
+cat >"${tmp_dir}/curl" <<'MOCK'
+#!/usr/bin/env bash
+set -u
+printf 'CALL' >>"${MOCK_CURL_LOG:?}"
+for argument in "$@"; do
+  printf ' <%s>' "$argument" >>"${MOCK_CURL_LOG:?}"
+done
+printf '\n' >>"${MOCK_CURL_LOG:?}"
+printf '{"ok":true}\n'
+MOCK
+chmod +x "${tmp_dir}/dig" "${tmp_dir}/curl"
+
 : >"$mock_log"
 provisioned_connection_name="$(
   PROJECT_ID=lightprobe-test \
@@ -239,7 +341,7 @@ provisioned_connection_name="$(
   MOCK_GCLOUD_LOG="$mock_log" \
   MOCK_PROVISION_CLOUD_SQL=true \
   MOCK_CONNECTION_NAME="$cloud_sql_connection_name" \
-    "${SCRIPT_DIR}/provision-cloud-sql.sh" 2>/dev/null
+    "${SCRIPT_DIR}/provision-cloud-sql.sh"
 )"
 [[ "$provisioned_connection_name" == "$cloud_sql_connection_name" ]] ||
   fail "Cloud SQL provisioner did not return the connection name"
@@ -287,6 +389,106 @@ grep -F '<sql> <users> <set-password> <liveprobe>' \
 if grep -F '<sql> <instances> <create> <lp-test-postgres>' \
   "$mock_log" >/dev/null; then
   fail "existing Cloud SQL instance was recreated"
+fi
+
+: >"$mock_log"
+https_output="$(
+  PROJECT_ID=lightprobe-test \
+  REGION=us-central1 \
+  ZONE=us-central1-a \
+  VM_NAME=lp-test \
+  HTTPS_DOMAIN=probe.example.com \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_PROVISION_HTTPS=true \
+    "${SCRIPT_DIR}/provision-https.sh"
+)"
+grep -F 'HTTPS load balancer IP: 198.51.100.40' <<<"$https_output" >/dev/null ||
+  fail "HTTPS provisioner did not print the reserved address"
+grep -F 'Required DNS record: probe.example.com A 198.51.100.40' \
+  <<<"$https_output" >/dev/null ||
+  fail "HTTPS provisioner did not print the required DNS record"
+for expected_call in \
+  '<compute> <addresses> <create> <lp-test-https-ip>' \
+  '<compute> <instance-groups> <unmanaged> <create> <lp-test-https-backend>' \
+  '<--named-ports=http:80>' \
+  '<compute> <health-checks> <create> <http> <lp-test-https-health>' \
+  '<--request-path=/healthz>' \
+  '<compute> <backend-services> <create> <lp-test-https-service>' \
+  '<--load-balancing-scheme=EXTERNAL_MANAGED>' \
+  '<compute> <backend-services> <add-backend> <lp-test-https-service>' \
+  '<--source-ranges=35.191.0.0/16,130.211.0.0/22>' \
+  '<compute> <ssl-certificates> <create> <lp-test-certificate>' \
+  '<--domains=probe.example.com>' \
+  '<--profile=MODERN>' \
+  '<--min-tls-version=TLS_1_2>' \
+  '<compute> <target-https-proxies> <create> <lp-test-https-proxy>' \
+  '<compute> <forwarding-rules> <create> <lp-test-https-forwarding>' \
+  '<--ports=443>' \
+  '<compute> <url-maps> <import> <lp-test-http-redirect-map>' \
+  '<compute> <forwarding-rules> <create> <lp-test-http-redirect-forwarding>' \
+  '<--ports=80>'; do
+  grep -F "$expected_call" "$mock_log" >/dev/null ||
+    fail "HTTPS provisioner omitted command: ${expected_call}"
+done
+
+: >"$mock_log"
+: >"$mock_curl_log"
+activation_output="$(
+  PATH="${tmp_dir}:$PATH" \
+  PROJECT_ID=lightprobe-test \
+  REGION=us-central1 \
+  ZONE=us-central1-a \
+  VM_NAME=lp-test \
+  FIREWALL_RULE=lp-test-broker \
+  FIREWALL_SSH_RULE=lp-test-ssh \
+  HTTPS_FIREWALL_RULE=lp-test-lb-backend \
+  HTTPS_DOMAIN=probe.example.com \
+  LIVEPROBE_API_KEY=fixture-api-key \
+  CLIENT_IP=203.0.113.9 \
+  CLIENT_CIDR='' \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_CURL_LOG="$mock_curl_log" \
+  MOCK_DNS_IP=198.51.100.40 \
+  MOCK_ACTIVATE_HTTPS=true \
+  MOCK_CERTIFICATE_STATUS=ACTIVE \
+  MOCK_FIREWALL_EXISTS=true \
+    "${SCRIPT_DIR}/activate-https.sh"
+)"
+grep -F 'HTTPS is active: https://probe.example.com' \
+  <<<"$activation_output" >/dev/null ||
+  fail "HTTPS activation did not report the public broker URL"
+[[ "$(grep -F -c '<https://probe.example.com/readyz>' "$mock_curl_log")" -eq 2 ]] ||
+  fail "HTTPS activation did not verify readiness before and after firewall cutover"
+[[ "$(grep -F -c '<https://probe.example.com/v1/ping>' "$mock_curl_log")" -eq 2 ]] ||
+  fail "HTTPS activation did not verify authenticated access around cutover"
+grep -F '<compute> <firewall-rules> <delete> <lp-test-broker>' \
+  "$mock_log" >/dev/null ||
+  fail "HTTPS activation did not close direct broker ingress"
+grep -F '<compute> <instances> <add-metadata> <lp-test>' \
+  "$mock_log" >/dev/null ||
+  fail "HTTPS activation did not persist its hostname on the VM"
+
+: >"$mock_log"
+if PATH="${tmp_dir}:$PATH" \
+  PROJECT_ID=lightprobe-test \
+  VM_NAME=lp-test \
+  HTTPS_DOMAIN=probe.example.com \
+  LIVEPROBE_API_KEY=fixture-api-key \
+  CLIENT_IP=203.0.113.9 \
+  CLIENT_CIDR='' \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_CURL_LOG="$mock_curl_log" \
+  MOCK_DNS_IP=198.51.100.41 \
+  MOCK_ACTIVATE_HTTPS=true \
+  MOCK_CERTIFICATE_STATUS=ACTIVE \
+    "${SCRIPT_DIR}/activate-https.sh" >/dev/null 2>&1; then
+  fail "HTTPS activation accepted DNS pointing away from the load balancer"
+fi
+if grep -F '<compute> <firewall-rules>' "$mock_log" >/dev/null; then
+  fail "failed HTTPS activation changed firewall rules"
 fi
 
 : >"$mock_log"
@@ -360,6 +562,61 @@ PROJECT_ID=lightprobe-test \
 REGION=us-central1 \
 ZONE=us-central1-a \
 VM_NAME=lp-test \
+FIREWALL_RULE=lp-test-broker \
+FIREWALL_SSH_RULE=lp-test-ssh \
+HTTPS_FIREWALL_RULE=lp-test-lb-backend \
+HTTPS_DOMAIN=probe.example.com \
+NETWORK=default \
+NETWORK_TAG=liveprobe-demo \
+BROKER_PORT='' \
+CLIENT_IP=203.0.113.9 \
+CLIENT_CIDR='' \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_FIREWALL_EXISTS=true \
+  "${SCRIPT_DIR}/refresh-firewall.sh" >/dev/null
+
+grep -F '<compute> <firewall-rules> <update> <lp-test-lb-backend>' \
+  "$mock_log" >/dev/null ||
+  fail "HTTPS firewall was not updated"
+grep -F '<--source-ranges=35.191.0.0/16,130.211.0.0/22>' \
+  "$mock_log" >/dev/null ||
+  fail "HTTPS firewall does not restrict origin ingress to Google proxies"
+grep -F '<compute> <firewall-rules> <delete> <lp-test-broker>' \
+  "$mock_log" >/dev/null ||
+  fail "HTTPS activation did not remove direct broker ingress"
+grep -F '<--source-ranges=203.0.113.9/32>' "$mock_log" >/dev/null ||
+  fail "HTTPS firewall refresh did not preserve restricted SSH access"
+
+: >"$mock_log"
+PROJECT_ID=lightprobe-test \
+REGION=us-central1 \
+ZONE=us-central1-a \
+VM_NAME=lp-test \
+FIREWALL_RULE=lp-test-broker \
+FIREWALL_SSH_RULE=lp-test-ssh \
+HTTPS_FIREWALL_RULE=lp-test-lb-backend \
+HTTPS_DOMAIN='' \
+NETWORK=default \
+NETWORK_TAG=liveprobe-demo \
+BROKER_PORT='' \
+CLIENT_IP=203.0.113.9 \
+CLIENT_CIDR='' \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_FIREWALL_EXISTS=true \
+MOCK_PERSISTED_HTTPS_DOMAIN=probe.example.com \
+  "${SCRIPT_DIR}/refresh-firewall.sh" >/dev/null
+
+grep -F '<compute> <firewall-rules> <update> <lp-test-lb-backend>' \
+  "$mock_log" >/dev/null ||
+  fail "firewall refresh did not recover the activated HTTPS configuration"
+
+: >"$mock_log"
+PROJECT_ID=lightprobe-test \
+REGION=us-central1 \
+ZONE=us-central1-a \
+VM_NAME=lp-test \
 STATIC_IP_NAME=lp-test-ip \
 FIREWALL_RULE=lp-test-broker \
 FIREWALL_SSH_RULE=lp-test-ssh \
@@ -410,6 +667,12 @@ grep -F '<compute> <firewall-rules> <delete> <lp-test-broker>' \
 grep -F '<compute> <firewall-rules> <delete> <lp-test-ssh>' \
   "$mock_log" >/dev/null ||
   fail "destroy did not delete the managed SSH firewall"
+grep -F '<compute> <target-https-proxies> <delete> <lp-test-https-proxy>' \
+  "$mock_log" >/dev/null ||
+  fail "destroy did not delete the managed HTTPS proxy"
+grep -F '<compute> <addresses> <delete> <lp-test-https-ip>' \
+  "$mock_log" >/dev/null ||
+  fail "destroy did not delete the managed HTTPS address"
 if grep -F 'default-allow-ssh' "$mock_log" >/dev/null; then
   fail "destroy attempted to modify an unrelated default firewall"
 fi

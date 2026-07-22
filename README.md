@@ -206,17 +206,19 @@ targets must include debug line/local-variable metadata.
 
 ## GCP single-VM demo
 
-> **Demo only:** this is a fake-data, single-instance HTTP deployment. Broker
-> calls require one shared bearer key, but there is no per-user authorization,
-> tenant isolation, or TLS. It is not a production topology.
+> **Pilot topology:** this is a fake-data, single-broker deployment. Broker
+> calls require one shared bearer key, and the operator guide provides optional
+> Cloud SQL plus a global HTTPS load balancer. There is still no per-user
+> authorization or tenant isolation.
 
 The accepted GCE path places the broker, three intentionally buggy services,
 their traffic generators, and the JVM bridge on one VM. Only the broker and SSH
 are opened externally, and each managed firewall rule is restricted to the
 operator's detected public IPv4 `/32` or one explicit `/24` through `/32` NAT
 pool. The external broker defaults to HTTP port `80`; the local Docker demo
-still defaults to `7070`. The MCP server runs locally through the published npm
-package.
+still defaults to `7070`. The optional HTTPS path places a Google global load
+balancer in front, redirects public HTTP to HTTPS, and closes direct broker
+ingress. The MCP server runs locally through the published npm package.
 
 You need a billing-enabled GCP project, Docker, Node.js 20+, npm, and the Google
 Cloud CLI. On macOS, install it if needed and authenticate first:
@@ -265,7 +267,9 @@ and cleanup:
 The operator guide also provides an opt-in `DATABASE_BACKEND=cloud-sql` path
 with a dedicated runtime service account, Cloud SQL Auth Proxy, regional HA,
 automated backups, point-in-time recovery, and deletion protection. It does
-not migrate the existing local Docker volume automatically.
+not migrate the existing local Docker volume automatically. Its staged HTTPS
+procedure waits for DNS and a Google-managed certificate before restricting the
+VM origin to load-balancer traffic.
 
 ## All-language Docker demo
 
@@ -337,10 +341,10 @@ custom watch paths, and remove probes promptly.
 All `/v1/*` broker routes require the shared `LIVEPROBE_API_KEY`; `/healthz`
 and `/readyz` are unauthenticated liveness and database-readiness routes. This
 is authentication without user-level
-authorization, key rotation, tenant isolation, or TLS. Restrict network access
-and terminate TLS before any use beyond a controlled demo. The internal
-Compose network reduces JVM diagnostic exposure but is not a substitute for
-production network policy.
+authorization, key rotation, or tenant isolation. The GCP operator path can
+terminate TLS at a managed load balancer; local and pre-activation HTTP must
+remain on a trusted network. The internal Compose network reduces JVM
+diagnostic exposure but is not a substitute for production network policy.
 
 ## Benchmarks
 
@@ -362,8 +366,9 @@ the deployment hardware for current numbers.
 
 ## Known production limitations
 
-- Shared-key authentication only; no RBAC, tenant isolation, TLS termination,
-  key rotation, or immutable audit-log retention.
+- Shared-key authentication only; no RBAC, tenant isolation, key rotation, or
+  immutable audit-log retention. Managed TLS is available only on the GCP
+  deployment path after explicit activation.
 - Postgres mutations are transactional and durable. Cloud SQL mode can provide
   regional database HA, but the broker remains single-instance. JSON snapshots
   are a local/dev fallback.
