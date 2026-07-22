@@ -70,6 +70,16 @@ node -e '
   }
 ' "$https_mcp_json" || fail "HTTPS MCP JSON is invalid"
 
+for deploy_script in deploy.sh activate-https.sh; do
+  if grep -F 'print_broker_mcp_json "$broker_url" "$LIVEPROBE_API_KEY"' \
+    "${SCRIPT_DIR}/${deploy_script}" >/dev/null; then
+    fail "${deploy_script} prints the live broker API key"
+  fi
+  grep -F "print_broker_mcp_json \"\$broker_url\" '<LIVEPROBE_API_KEY>'" \
+    "${SCRIPT_DIR}/${deploy_script}" >/dev/null ||
+    fail "${deploy_script} does not print a redacted MCP template"
+done
+
 for invalid_domain in \
   'localhost' \
   '-probe.example.com' \

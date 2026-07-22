@@ -97,13 +97,14 @@ PROJECT_ID="<PROJECT_ID>" \
 ```
 
 The script enables Compute Engine and Secret Manager, grants the runtime
-service account access to only the two deployment secrets, reserves or reuses
+service account access to only the deployment secrets, reserves or reuses
 the static address, creates or updates firewall rules, creates or reuses the
 VM, uploads the committed archive, builds the Compose stack, and waits for
 every service to be healthy. The VM retrieves secret payloads through its
 metadata identity; plaintext values are not placed in the SSH command. The
-script prints the broker URL, deployed SHA, and exact MCP JSON. The JSON
-includes the current `LIVEPROBE_API_KEY`; treat terminal output as sensitive.
+script prints the broker URL, deployed SHA, and an MCP JSON template containing
+`<LIVEPROBE_API_KEY>`. Retrieve the key from Secret Manager only when securely
+configuring a client; deployment logs never print the live key.
 
 ### Cloud SQL database
 

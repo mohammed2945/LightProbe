@@ -303,5 +303,5 @@ else
 fi
 printf 'Broker URL: %s\n' "$broker_url"
 printf 'Deployed SHA to paste when asked: %s\n' "$DEPLOY_COMMIT"
-printf '\nExact Cursor MCP JSON:\n'
-print_broker_mcp_json "$broker_url" "$LIVEPROBE_API_KEY"
+printf '\nCursor MCP JSON template (retrieve the key from Secret Manager):\n'
+print_broker_mcp_json "$broker_url" '<LIVEPROBE_API_KEY>'

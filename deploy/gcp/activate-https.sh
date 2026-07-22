@@ -82,5 +82,5 @@ gcloud_cmd compute instances add-metadata "$VM_NAME" \
 printf 'HTTPS is active: %s\n' "$broker_url"
 printf 'Direct broker ingress is closed; SSH remains restricted to %s.\n' \
   "$source_range"
-printf '\nExact Cursor MCP JSON:\n'
-print_broker_mcp_json "$broker_url" "$LIVEPROBE_API_KEY"
+printf '\nCursor MCP JSON template (retrieve the key from Secret Manager):\n'
+print_broker_mcp_json "$broker_url" '<LIVEPROBE_API_KEY>'
