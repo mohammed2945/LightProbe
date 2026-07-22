@@ -322,6 +322,8 @@ load_gcp_config() {
   HTTP_REDIRECT_PROXY="${HTTP_REDIRECT_PROXY:-${VM_NAME}-http-redirect-proxy}"
   HTTP_REDIRECT_FORWARDING_RULE="${HTTP_REDIRECT_FORWARDING_RULE:-${VM_NAME}-http-redirect-forwarding}"
   HTTPS_FIREWALL_RULE="${HTTPS_FIREWALL_RULE:-${VM_NAME}-lb-backend}"
+  # Consumed by scripts that source this library.
+  # shellcheck disable=SC2034
   HTTPS_PROXY_SOURCE_RANGES="35.191.0.0/16,130.211.0.0/22"
   HTTPS_DOMAIN_METADATA_KEY="liveprobe-https-domain"
 

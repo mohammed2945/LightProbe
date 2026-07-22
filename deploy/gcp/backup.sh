@@ -60,6 +60,8 @@ cleanup_remote() {
 }
 trap cleanup_remote EXIT
 
+# Expansion of container_id intentionally happens on the remote VM.
+# shellcheck disable=SC2016
 printf -v remote_command \
   'set -Eeuo pipefail; container_id="$(sudo docker compose -f /opt/liveprobe/current/demo/docker-compose.yml -f /opt/liveprobe/current/deploy/gcp/docker-compose.gcp.yml ps -q postgres)"; test -n "$container_id"; sudo docker exec "$container_id" pg_dump --username=liveprobe --dbname=liveprobe --format=custom > %q; test -s %q' \
   "$remote_backup" \

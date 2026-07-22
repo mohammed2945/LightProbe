@@ -191,14 +191,14 @@ if ! gcloud_cmd compute ssl-policies describe "$HTTPS_SSL_POLICY" \
   gcloud_cmd compute ssl-policies create "$HTTPS_SSL_POLICY" \
     --project="$PROJECT_ID" \
     --profile=MODERN \
-    --min-tls-version=TLS_1_2 \
+    --min-tls-version=1.2 \
     --quiet
 else
   gcloud_cmd compute ssl-policies update "$HTTPS_SSL_POLICY" \
     --project="$PROJECT_ID" \
     --global \
     --profile=MODERN \
-    --min-tls-version=TLS_1_2 \
+    --min-tls-version=1.2 \
     --quiet
 fi
 

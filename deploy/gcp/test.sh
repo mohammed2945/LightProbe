@@ -139,12 +139,16 @@ grep -F "client_source_range=\"\$(resolve_client_source_range)\"" \
 grep -F "CLIENT_CIDR=\"\$client_source_range\"" \
   "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
   fail "deploy does not pass the normalized source to firewall refresh"
+# These assertions intentionally search for literal shell expressions.
+# shellcheck disable=SC2016
 grep -F '"${SCRIPT_DIR}/provision-cloud-sql.sh"' \
   "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
   fail "deploy does not invoke the Cloud SQL provisioner"
+# shellcheck disable=SC2016
 grep -F -- '--service-account="$runtime_service_account"' \
   "${SCRIPT_DIR}/deploy.sh" >/dev/null ||
   fail "deploy does not attach the dedicated runtime service account"
+# shellcheck disable=SC2016
 grep -F 'GCP_DATABASE_BACKEND="$DATABASE_BACKEND"' \
   "${SCRIPT_DIR}/bootstrap.sh" >/dev/null ||
   fail "bootstrap does not select the deployed database Compose layer"
@@ -421,7 +425,7 @@ for expected_call in \
   '<compute> <ssl-certificates> <create> <lp-test-certificate>' \
   '<--domains=probe.example.com>' \
   '<--profile=MODERN>' \
-  '<--min-tls-version=TLS_1_2>' \
+  '<--min-tls-version=1.2>' \
   '<compute> <target-https-proxies> <create> <lp-test-https-proxy>' \
   '<compute> <forwarding-rules> <create> <lp-test-https-forwarding>' \
   '<--ports=443>' \
