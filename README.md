@@ -192,6 +192,8 @@ cryptographic proof that the target bytecode exactly matches that revision.
 | `LIVEPROBE_API_KEY` | broker, MCP, agents | Broker/MCP operator key, or an agent's per-service key in that agent process. |
 | `LIVEPROBE_API_KEYS` | broker | One or two comma-separated shared operator keys during rotation; the first is primary. |
 | `CLERK_SECRET_KEY` | broker | Optional Clerk backend secret used to retrieve cached JWKS and verify human session tokens. |
+| `CLERK_PUBLISHABLE_KEY` | broker | Clerk `pk_live_...` key used to validate OAuth access tokens for the remote MCP endpoint. |
+| `CLERK_FRONTEND_API_URL` | broker | Clerk production authorization-server origin, for example `https://clerk.liveprobe.tryastrea.tech`. |
 | `CLERK_JWT_KEY` | broker | Optional Clerk PEM public key for networkless session-token verification. Takes effect alongside or instead of `CLERK_SECRET_KEY`. |
 | `CLERK_AUTHORIZED_PARTIES` | broker | Required when Clerk is enabled. Comma-separated frontend origins allowed by the session token `azp` claim. |
 | `CLERK_AUDIENCE` | broker | Optional comma-separated JWT audience allowlist. |
@@ -203,6 +205,7 @@ cryptographic proof that the target bytecode exactly matches that revision.
 | `LIVEPROBE_DB_POOL_SIZE` | broker | Maximum Postgres connections held by the broker. Defaults to `10`. |
 | `LIVEPROBE_STATE_FILE` | broker | Local/dev JSON fallback state file. |
 | `BROKER_URL` | MCP, agents | HTTP origin for the broker. |
+| `LIVEPROBE_PUBLIC_URL` | broker | Public HTTPS broker origin used in MCP OAuth protected-resource metadata. |
 | `LIVEPROBE_COMMIT_SHA` / `GIT_COMMIT` | agents | Required deployed commit SHA reported on every ingest. |
 | `LIVEPROBE_SOURCE_MAP_DIR` | Node agent | Directory containing generated `.map` files. |
 | `LIVEPROBE_DIST_LOCATION` | Node agent | Generated output path segment, default `dist`. |
@@ -235,13 +238,29 @@ increment. Shared operator keys remain available as a migration and
 break-glass path and operate only in `internal/default/default`. Agents should
 use their tenant's individually revocable `lp_service_...` key.
 
+When `CLERK_PUBLISHABLE_KEY`, `CLERK_FRONTEND_API_URL`, and
+`LIVEPROBE_PUBLIC_URL` are set, the broker also exposes a stateless Streamable
+HTTP MCP endpoint at `/mcp`. OAuth-capable clients discover Clerk through
+RFC 9728 metadata and request `user:org:read`; Clerk's organization selection
+provides the tenant ID. Clients handle Authorization Code + PKCE, token storage,
+and refresh tokens. A hosted Cursor entry therefore contains only:
+
+```json
+{
+  "mcpServers": {
+    "liveprobe": { "url": "https://liveprobe.tryastrea.tech/mcp" }
+  }
+}
+```
+
 ## GCP single-VM demo
 
 > **Pilot topology:** this is a fake-data, single-broker deployment. Broker
 > calls require bearer authentication; operators may use Clerk organization
 > sessions or the transitional shared key, while agents use per-service
 > credentials. The operator guide provides optional Cloud SQL plus a global
-> HTTPS load balancer. Human RBAC and MCP browser login are not included yet.
+> HTTPS load balancer. Clerk organization isolation and MCP browser login are
+> included; fine-grained roles and immutable audit retention remain later work.
 
 The accepted GCE path places the broker, three intentionally buggy services,
 their traffic generators, and the JVM bridge on one VM. Only the broker and SSH

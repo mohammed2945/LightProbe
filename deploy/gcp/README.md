@@ -71,6 +71,10 @@ export POSTGRES_PASSWORD="$(openssl rand -hex 32)"
 # Optional until the Clerk frontend exists:
 export CLERK_SECRET_KEY="<Clerk Dashboard backend secret key>"
 export CLERK_AUTHORIZED_PARTIES="https://app.tryastrea.tech"
+# Required for hosted MCP browser login:
+export CLERK_PUBLISHABLE_KEY="<Clerk production pk_live_ key>"
+export CLERK_FRONTEND_API_URL="https://clerk.liveprobe.tryastrea.tech"
+export HTTPS_DOMAIN="liveprobe.tryastrea.tech"
 PROJECT_ID="<PROJECT_ID>" deploy/gcp/deploy.sh
 ```
 

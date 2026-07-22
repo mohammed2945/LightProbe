@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -63,6 +64,76 @@ function dataEvents(events: Record<string, unknown>[]): ProbeEvent[] {
 }
 
 describe("Phase 1 MCP and fake-agent integration", () => {
+  it("serves the complete tool set over authenticated Streamable HTTP", async () => {
+    const principal = {
+      type: "user" as const,
+      role: "operator" as const,
+      principalId: "user-remote",
+      tenantId: "org-remote",
+      projectId: "default",
+      environmentId: "default",
+      organizationId: "org-remote",
+    };
+    const authenticate = async (token: string) =>
+      token === "oauth-token" ? principal : undefined;
+    const backend = await buildBroker({ authenticateBearer: authenticate });
+    openBrokers.push(backend);
+    await backend.listen({ host: "127.0.0.1", port: 0 });
+    const backendAddress = backend.server.address();
+    if (backendAddress === null || typeof backendAddress === "string") {
+      throw new Error("expected backend broker TCP address");
+    }
+
+    const frontend = await buildBroker({
+      authenticateBearer: authenticate,
+      remoteMcp: {
+        publicUrl: "https://probe.example.com",
+        brokerUrl: `http://127.0.0.1:${backendAddress.port}`,
+        authorizationServerUrl: "https://clerk.probe.example.com",
+        authenticateBearer: authenticate,
+      },
+    });
+    openBrokers.push(frontend);
+    await frontend.listen({ host: "127.0.0.1", port: 0 });
+    const frontendAddress = frontend.server.address();
+    if (frontendAddress === null || typeof frontendAddress === "string") {
+      throw new Error("expected frontend broker TCP address");
+    }
+
+    const client = new Client({ name: "remote-test", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${frontendAddress.port}/mcp`),
+      {
+        requestInit: {
+          headers: { authorization: "Bearer oauth-token" },
+        },
+      },
+    );
+    await client.connect(
+      transport as Parameters<Client["connect"]>[0],
+    );
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
+        "get_probe_data",
+        "get_safety_overview",
+        "list_probes",
+        "list_services",
+        "ping_broker",
+        "remove_probe",
+        "set_counter_probe",
+        "set_log_probe",
+        "set_metric_probe",
+        "set_snapshot_probe",
+      ]);
+      const ping = await client.callTool({ name: "ping_broker", arguments: {} });
+      expect(ping.isError).not.toBe(true);
+      expect(ping.content).toEqual([{ type: "text", text: '{\n  "ok": true\n}' }]);
+    } finally {
+      await client.close();
+    }
+  });
+
   it("creates every probe type and exposes status transitions and data", async () => {
     const { broker, brokerUrl } = await startBroker();
     const handlers = createToolHandlers(new BrokerClient(brokerUrl));

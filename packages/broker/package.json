@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@clerk/backend": "^3.12.0",
+    "@doomslayer2945/liveprobe-mcp": "workspace:*",
     "@jridgewell/trace-mapping": "^0.3.31",
     "fastify": "^5.10.0",
     "pg": "^8.16.3",

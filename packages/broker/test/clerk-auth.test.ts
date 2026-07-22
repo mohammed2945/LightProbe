@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   BearerAuthenticationError,
   clerkAuthenticatorFromEnv,
+  clerkOAuthAuthenticatorFromEnv,
   createClerkAuthenticator,
+  createClerkOAuthAuthenticator,
   type ClerkTokenVerifier,
 } from "../src/index.js";
 
@@ -135,5 +137,78 @@ describe("Clerk authentication", () => {
         CLERK_AUTHORIZED_PARTIES: "https://app.example.com",
       }),
     ).toBeTypeOf("function");
+  });
+
+  it("maps a Clerk OAuth organization grant to a tenant principal", async () => {
+    const authenticate = createClerkOAuthAuthenticator({
+      secretKey: "sk_test_fixture",
+      publishableKey: "pk_test_fixture",
+      resourceUrl: "https://probe.example.com",
+      verifier: async () => ({
+        userId: "user_oauth",
+        scopes: ["openid", "user:org:read"],
+        claims: {
+          sub: "user_oauth",
+          org_id: "org_oauth",
+          org_slug: "oauth-team",
+        },
+      }),
+    });
+
+    await expect(authenticate("oauth-token")).resolves.toMatchObject({
+      type: "user",
+      principalId: "user_oauth",
+      tenantId: "org_oauth",
+      organizationId: "org_oauth",
+      tenantDisplayName: "oauth-team",
+    });
+  });
+
+  it("requires the organization scope and selected organization for OAuth", async () => {
+    const missingScope = createClerkOAuthAuthenticator({
+      secretKey: "sk_test_fixture",
+      publishableKey: "pk_test_fixture",
+      resourceUrl: "https://probe.example.com",
+      verifier: async () => ({
+        userId: "user_oauth",
+        scopes: ["openid"],
+        claims: { sub: "user_oauth", org_id: "org_oauth" },
+      }),
+    });
+    await expect(missingScope("oauth-token")).rejects.toMatchObject({
+      statusCode: 403,
+      code: "insufficient_scope",
+    } satisfies Partial<BearerAuthenticationError>);
+
+    const missingOrganization = createClerkOAuthAuthenticator({
+      secretKey: "sk_test_fixture",
+      publishableKey: "pk_test_fixture",
+      resourceUrl: "https://probe.example.com",
+      verifier: async () => ({
+        userId: "user_oauth",
+        scopes: ["user:org:read"],
+        claims: { sub: "user_oauth" },
+      }),
+    });
+    await expect(missingOrganization("oauth-token")).rejects.toMatchObject({
+      statusCode: 403,
+      code: "organization_required",
+    } satisfies Partial<BearerAuthenticationError>);
+  });
+
+  it("requires complete HTTPS OAuth environment configuration", () => {
+    expect(clerkOAuthAuthenticatorFromEnv({})).toBeUndefined();
+    expect(() =>
+      clerkOAuthAuthenticatorFromEnv({
+        CLERK_PUBLISHABLE_KEY: "pk_test_fixture",
+      }),
+    ).toThrow("CLERK_SECRET_KEY");
+    expect(() =>
+      createClerkOAuthAuthenticator({
+        secretKey: "sk_test_fixture",
+        publishableKey: "pk_test_fixture",
+        resourceUrl: "http://probe.example.com",
+      }),
+    ).toThrow("must use https");
   });
 });

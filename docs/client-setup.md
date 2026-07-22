@@ -9,22 +9,20 @@ The current internal test deployment uses:
 
 - `BROKER_URL`: `https://liveprobe.tryastrea.tech`
 - Runtime `LIVEPROBE_API_KEY`: obtain a key created for the exact `serviceId`
-- MCP `LIVEPROBE_API_KEY`: obtain the current operator key separately
+- A Clerk account invited to the client's LiveProbe workspace
 
-Do not commit either key to an application repository or paste it into issues,
-logs, or recordings. A service key cannot list services, manage probes, or act
-as another service. The current MCP operator key can manage all internal-test
-resources and must not be placed in the target application. Public traffic
+Do not commit the service key to an application repository or paste it into
+issues, logs, or recordings. A service key cannot list services, manage probes,
+or act as another service. Human MCP access uses Clerk instead of exposing an
+operator key. Public traffic
 terminates TLS at the Google Cloud load balancer, and HTTP redirects to HTTPS.
 The VM origin accepts broker traffic only from Google's load-balancer and
 health-check ranges. External port `7070` is not published; it is only the
 broker container's internal port.
 
-The public HTTPS endpoint is suitable for internal integration testing with
-these bearer credentials. The broker supports Clerk organization identities
-and tenant isolation when the hosted deployment enables them. MCP browser
-login is not implemented yet, so this guide continues to use the transitional
-shared operator key for MCP.
+The public HTTPS endpoint is suitable for internal integration testing. The
+broker uses Clerk organizations for human tenant isolation and browser login.
+Shared operator keys are reserved for local fallback and break-glass use.
 
 ```sh
 export BROKER_URL="https://liveprobe.tryastrea.tech"
@@ -202,6 +200,24 @@ the target's `LineNumberTable`; local capture also requires its
 `LocalVariableTable`.
 
 ## 3. Configure the MCP tools
+
+For the hosted service, no SDK package or API key is needed for MCP. Add:
+
+```json
+{
+  "mcpServers": {
+    "liveprobe": {
+      "url": "https://liveprobe.tryastrea.tech/mcp"
+    }
+  }
+}
+```
+
+Choose **Login** in the MCP client, complete Clerk sign-in in the browser, and
+select the workspace you were invited to. The client refreshes its OAuth token
+automatically. Restart the MCP client if it does not detect the new server.
+
+### Local stdio fallback
 
 The MCP server runs locally over stdio and requires Node.js 20 or newer. The
 package does not need to be installed globally.

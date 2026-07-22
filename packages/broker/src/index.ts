@@ -8,6 +8,7 @@ import Fastify, {
   type FastifyRequest,
   type FastifyServerOptions,
 } from "fastify";
+import { handleStatelessHttpMcpRequest } from "@doomslayer2945/liveprobe-mcp";
 import { z, ZodError } from "zod";
 
 import {
@@ -25,7 +26,11 @@ import {
   type ServiceCredentialRecord,
   type StoredServiceCredential,
 } from "./auth.js";
-import { clerkAuthenticatorFromEnv } from "./clerk-auth.js";
+import {
+  clerkAuthenticatorFromEnv,
+  clerkOAuthAuthenticatorFromEnv,
+  combineBearerAuthenticators,
+} from "./clerk-auth.js";
 import { PostgresStore } from "./store/postgres.js";
 import {
   resolveSourceLocation,
@@ -44,11 +49,17 @@ export {
 export {
   clerkAuthenticatorFromEnv,
   createClerkAuthenticator,
+  clerkOAuthAuthenticatorFromEnv,
+  combineBearerAuthenticators,
+  createClerkOAuthAuthenticator,
 } from "./clerk-auth.js";
 export type {
+  ClerkOAuthTokenVerifier,
+  ClerkOAuthVerificationResult,
   ClerkTokenVerifier,
   ClerkVerificationOptions,
   CreateClerkAuthenticatorOptions,
+  CreateClerkOAuthAuthenticatorOptions,
 } from "./clerk-auth.js";
 export type {
   BearerAuthenticator,
@@ -484,6 +495,14 @@ export interface BuildBrokerOptions {
   ringCapacity?: number;
   ttlSweepIntervalMs?: number;
   persistence?: PersistenceOptions | false;
+  remoteMcp?: RemoteMcpOptions;
+}
+
+export interface RemoteMcpOptions {
+  publicUrl: string;
+  brokerUrl: string;
+  authorizationServerUrl: string;
+  authenticateBearer: BearerAuthenticator;
 }
 
 export interface StartBrokerOptions extends BuildBrokerOptions {
@@ -1748,6 +1767,154 @@ export async function buildBroker(
   if (apiKeys.length > 2) {
     throw new Error("at most two API keys can be configured");
   }
+
+  const authenticateExternalBearer = async (
+    token: string,
+    authenticate: BearerAuthenticator,
+  ): Promise<BrokerPrincipal | undefined> => {
+    let principal: BrokerPrincipal | undefined;
+    try {
+      principal = await authenticate(token);
+    } catch (error: unknown) {
+      if (error instanceof BearerAuthenticationError) {
+        throw new BrokerHttpError(error.statusCode, error.code, error.message);
+      }
+      throw error;
+    }
+    if (
+      principal?.type === "user" &&
+      store !== false &&
+      store.ensureResourceScope !== undefined
+    ) {
+      await store.ensureResourceScope(principal, {
+        ...(principal.tenantDisplayName === undefined
+          ? {}
+          : { tenantDisplayName: principal.tenantDisplayName }),
+      });
+    }
+    return principal;
+  };
+
+  if (options.remoteMcp !== undefined) {
+    const publicUrl = new URL(options.remoteMcp.publicUrl);
+    const brokerUrl = new URL(options.remoteMcp.brokerUrl);
+    const authorizationServerUrl = new URL(
+      options.remoteMcp.authorizationServerUrl,
+    );
+    if (publicUrl.protocol !== "https:") {
+      throw new Error("remote MCP publicUrl must use https");
+    }
+    if (brokerUrl.protocol !== "http:" && brokerUrl.protocol !== "https:") {
+      throw new Error("remote MCP brokerUrl must use http or https");
+    }
+    if (authorizationServerUrl.protocol !== "https:") {
+      throw new Error("remote MCP authorizationServerUrl must use https");
+    }
+    const resourceUrl = new URL("/mcp", publicUrl).href;
+    const resourceMetadataUrl = new URL(
+      "/.well-known/oauth-protected-resource/mcp",
+      publicUrl,
+    ).href;
+    const protectedResourceMetadata = {
+      resource: resourceUrl,
+      authorization_servers: [authorizationServerUrl.href.replace(/\/$/, "")],
+      scopes_supported: ["user:org:read"],
+      bearer_methods_supported: ["header"],
+      resource_name: "LiveProbe MCP",
+    };
+    app.get("/.well-known/oauth-protected-resource", async () =>
+      protectedResourceMetadata,
+    );
+    app.get("/.well-known/oauth-protected-resource/mcp", async () =>
+      protectedResourceMetadata,
+    );
+
+    const requireMcpPrincipal = async (
+      request: FastifyRequest,
+    ): Promise<string> => {
+      const token = bearerToken(request.headers.authorization);
+      const principal =
+        token === undefined
+          ? undefined
+          : await authenticateExternalBearer(
+              token,
+              options.remoteMcp!.authenticateBearer,
+            );
+      if (principal === undefined) {
+        throw new BrokerHttpError(
+          401,
+          "unauthorized",
+          "missing or invalid Clerk OAuth bearer token",
+        );
+      }
+      request.liveprobePrincipal = principal;
+      return token!;
+    };
+
+    app.options("/mcp", async (_request, reply) => reply.status(204).send());
+    app.get("/mcp", async (request, reply) => {
+      await requireMcpPrincipal(request);
+      return reply.status(405).send({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Method not allowed" },
+        id: null,
+      });
+    });
+    app.delete("/mcp", async (request, reply) => {
+      await requireMcpPrincipal(request);
+      return reply.status(405).send({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Method not allowed" },
+        id: null,
+      });
+    });
+    app.post("/mcp", async (request, reply) => {
+      const token = await requireMcpPrincipal(request);
+      reply.hijack();
+      try {
+        await handleStatelessHttpMcpRequest({
+          brokerUrl: brokerUrl.href,
+          bearerToken: token,
+          request: request.raw,
+          response: reply.raw,
+          body: request.body,
+        });
+      } catch (error: unknown) {
+        request.log.error({ err: error }, "remote MCP request failed");
+        if (!reply.raw.headersSent) {
+          reply.raw.writeHead(500, { "content-type": "application/json" });
+          reply.raw.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32603, message: "Internal server error" },
+              id: null,
+            }),
+          );
+        }
+      }
+    });
+
+    app.addHook("onSend", async (request, reply, payload) => {
+      if (request.url.startsWith("/.well-known/oauth-protected-resource")) {
+        void reply.header("access-control-allow-origin", "*");
+      }
+      return payload;
+    });
+
+    app.addHook("onError", async (request, reply, error) => {
+      if (
+        request.url.startsWith("/mcp") &&
+        error instanceof BrokerHttpError &&
+        error.statusCode === 401
+      ) {
+        void reply.header(
+          "www-authenticate",
+          `Bearer resource_metadata="${resourceMetadataUrl}", scope="user:org:read"`,
+        );
+      }
+    });
+  }
+
   app.addHook("preHandler", async (request) => {
     if (!request.url.startsWith("/v1/")) {
       return;
@@ -1775,31 +1942,11 @@ export async function buildBroker(
       }
     }
     if (token !== undefined && options.authenticateBearer !== undefined) {
-      let principal: BrokerPrincipal | undefined;
-      try {
-        principal = await options.authenticateBearer(token);
-      } catch (error: unknown) {
-        if (error instanceof BearerAuthenticationError) {
-          throw new BrokerHttpError(
-            error.statusCode,
-            error.code,
-            error.message,
-          );
-        }
-        throw error;
-      }
+      const principal = await authenticateExternalBearer(
+        token,
+        options.authenticateBearer,
+      );
       if (principal !== undefined) {
-        if (
-          principal.type === "user" &&
-          store !== false &&
-          store.ensureResourceScope !== undefined
-        ) {
-          await store.ensureResourceScope(principal, {
-            ...(principal.tenantDisplayName === undefined
-              ? {}
-              : { tenantDisplayName: principal.tenantDisplayName }),
-          });
-        }
         request.liveprobePrincipal = principal;
         return;
       }
@@ -2254,7 +2401,24 @@ async function main(): Promise<void> {
     .filter((value) => value.length > 0);
   if (apiKey !== undefined && apiKey.length > 0) apiKeys.unshift(apiKey);
   const configuredApiKeys = Array.from(new Set(apiKeys));
-  const authenticateBearer = clerkAuthenticatorFromEnv();
+  const clerkSessionAuthenticator = clerkAuthenticatorFromEnv();
+  const clerkOAuthAuthenticator = clerkOAuthAuthenticatorFromEnv();
+  const clerkFrontendApiUrl = process.env["CLERK_FRONTEND_API_URL"];
+  if (
+    clerkOAuthAuthenticator !== undefined &&
+    (clerkFrontendApiUrl === undefined ||
+      clerkFrontendApiUrl.trim().length === 0)
+  ) {
+    throw new Error(
+      "CLERK_FRONTEND_API_URL is required for remote MCP OAuth discovery",
+    );
+  }
+  const authenticateBearer = combineBearerAuthenticators(
+    [clerkOAuthAuthenticator, clerkSessionAuthenticator].filter(
+      (authenticate): authenticate is BearerAuthenticator =>
+        authenticate !== undefined,
+    ),
+  );
   if (
     (process.env["NODE_ENV"] === "production" ||
       process.env["LIVEPROBE_REQUIRE_API_KEY"] === "true") &&
@@ -2280,6 +2444,18 @@ async function main(): Promise<void> {
     logger: true,
     ...(configuredApiKeys.length === 0 ? {} : { apiKeys: configuredApiKeys }),
     ...(authenticateBearer === undefined ? {} : { authenticateBearer }),
+    ...(clerkOAuthAuthenticator === undefined
+      ? {}
+      : {
+          remoteMcp: {
+            publicUrl: process.env["LIVEPROBE_PUBLIC_URL"]!,
+            brokerUrl:
+              process.env["LIVEPROBE_INTERNAL_BROKER_URL"] ??
+              `http://127.0.0.1:${port}`,
+            authorizationServerUrl: clerkFrontendApiUrl!,
+            authenticateBearer: clerkOAuthAuthenticator,
+          },
+        }),
     persistence,
   });
   app.log.info(

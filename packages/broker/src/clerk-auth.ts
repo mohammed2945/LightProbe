@@ -1,4 +1,4 @@
-import { verifyToken } from "@clerk/backend";
+import { createClerkClient, verifyToken } from "@clerk/backend";
 import { z } from "zod";
 
 import {
@@ -29,6 +29,15 @@ const clerkClaimsSchema = z
   })
   .passthrough();
 
+const clerkOAuthClaimsSchema = z
+  .object({
+    sub: z.string().min(1).max(512),
+    org_id: z.string().min(1).max(512).optional(),
+    org_name: z.string().min(1).max(512).optional(),
+    org_slug: z.string().min(1).max(512).optional(),
+  })
+  .passthrough();
+
 export interface ClerkVerificationOptions {
   secretKey?: string | undefined;
   jwtKey?: string | undefined;
@@ -51,6 +60,26 @@ export interface CreateClerkAuthenticatorOptions
   projectId?: string | undefined;
   environmentId?: string | undefined;
   verifier?: ClerkTokenVerifier | undefined;
+}
+
+export interface ClerkOAuthVerificationResult {
+  userId: string;
+  scopes: readonly string[];
+  claims: unknown;
+}
+
+export type ClerkOAuthTokenVerifier = (
+  token: string,
+) => Promise<ClerkOAuthVerificationResult | undefined>;
+
+export interface CreateClerkOAuthAuthenticatorOptions {
+  secretKey: string;
+  publishableKey: string;
+  resourceUrl: string;
+  requiredScopes?: readonly string[] | undefined;
+  projectId?: string | undefined;
+  environmentId?: string | undefined;
+  verifier?: ClerkOAuthTokenVerifier | undefined;
 }
 
 function requiredNonEmpty(value: string | undefined, name: string): string {
@@ -144,6 +173,121 @@ export function createClerkAuthenticator(
   };
 }
 
+function decodeJwtPayload(token: string): unknown {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[1] === undefined) return undefined;
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+export function createClerkOAuthAuthenticator(
+  options: CreateClerkOAuthAuthenticatorOptions,
+): BearerAuthenticator {
+  const secretKey = requiredNonEmpty(options.secretKey, "CLERK_SECRET_KEY");
+  const publishableKey = requiredNonEmpty(
+    options.publishableKey,
+    "CLERK_PUBLISHABLE_KEY",
+  );
+  const resourceUrl = new URL(
+    requiredNonEmpty(options.resourceUrl, "LIVEPROBE_PUBLIC_URL"),
+  );
+  if (resourceUrl.protocol !== "https:") {
+    throw new Error("LIVEPROBE_PUBLIC_URL must use https for Clerk OAuth");
+  }
+  resourceUrl.pathname = "/mcp";
+  resourceUrl.search = "";
+  resourceUrl.hash = "";
+  const projectId = requiredNonEmpty(
+    options.projectId ?? DEFAULT_PROJECT_ID,
+    "Clerk OAuth projectId",
+  );
+  const environmentId = requiredNonEmpty(
+    options.environmentId ?? DEFAULT_ENVIRONMENT_ID,
+    "Clerk OAuth environmentId",
+  );
+  const requiredScopes = options.requiredScopes ?? ["user:org:read"];
+  const clerk =
+    options.verifier === undefined
+      ? createClerkClient({ secretKey, publishableKey })
+      : undefined;
+  const verifier =
+    options.verifier ??
+    (async (token): Promise<ClerkOAuthVerificationResult | undefined> => {
+      const state = await clerk!.authenticateRequest(
+        new Request(resourceUrl, {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+        { acceptsToken: "oauth_token", publishableKey },
+      );
+      if (!state.isAuthenticated) return undefined;
+      const auth = state.toAuth();
+      return {
+        userId: auth.userId,
+        scopes: auth.scopes,
+        claims: decodeJwtPayload(token),
+      };
+    });
+
+  return async (token): Promise<BrokerPrincipal | undefined> => {
+    let verified: ClerkOAuthVerificationResult | undefined;
+    try {
+      verified = await verifier(token);
+    } catch {
+      return undefined;
+    }
+    if (verified === undefined) return undefined;
+    const missingScope = requiredScopes.find(
+      (scope) => !verified.scopes.includes(scope),
+    );
+    if (missingScope !== undefined) {
+      throw new BearerAuthenticationError(
+        403,
+        "insufficient_scope",
+        `Clerk OAuth token is missing required scope ${missingScope}`,
+      );
+    }
+    const parsed = clerkOAuthClaimsSchema.safeParse(verified.claims);
+    if (!parsed.success || parsed.data.sub !== verified.userId) {
+      return undefined;
+    }
+    if (parsed.data.org_id === undefined) {
+      throw new BearerAuthenticationError(
+        403,
+        "organization_required",
+        "select a Clerk organization when authorizing LiveProbe",
+      );
+    }
+    const displayName =
+      parsed.data.org_slug ?? parsed.data.org_name ?? parsed.data.org_id;
+    return {
+      type: "user",
+      role: "operator",
+      principalId: verified.userId,
+      tenantId: parsed.data.org_id,
+      projectId,
+      environmentId,
+      organizationId: parsed.data.org_id,
+      tenantDisplayName: displayName,
+    };
+  };
+}
+
+export function combineBearerAuthenticators(
+  authenticators: readonly BearerAuthenticator[],
+): BearerAuthenticator | undefined {
+  if (authenticators.length === 0) return undefined;
+  return async (token) => {
+    for (const authenticate of authenticators) {
+      const principal = await authenticate(token);
+      if (principal !== undefined) return principal;
+    }
+    return undefined;
+  };
+}
+
 export function clerkAuthenticatorFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): BearerAuthenticator | undefined {
@@ -169,5 +313,25 @@ export function clerkAuthenticatorFromEnv(
     ...(jwtKey === undefined ? {} : { jwtKey }),
     authorizedParties,
     ...(audience.length === 0 ? {} : { audience }),
+  });
+}
+
+export function clerkOAuthAuthenticatorFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): BearerAuthenticator | undefined {
+  const secretKey = env["CLERK_SECRET_KEY"];
+  const publishableKey = env["CLERK_PUBLISHABLE_KEY"];
+  const publicUrl = env["LIVEPROBE_PUBLIC_URL"];
+  const configured = [publishableKey, publicUrl].some(
+    (value) => value !== undefined && value.trim().length > 0,
+  );
+  if (!configured) return undefined;
+  return createClerkOAuthAuthenticator({
+    secretKey: requiredNonEmpty(secretKey, "CLERK_SECRET_KEY"),
+    publishableKey: requiredNonEmpty(
+      publishableKey,
+      "CLERK_PUBLISHABLE_KEY",
+    ),
+    resourceUrl: requiredNonEmpty(publicUrl, "LIVEPROBE_PUBLIC_URL"),
   });
 }

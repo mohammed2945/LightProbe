@@ -5,6 +5,7 @@ FROM node:24-bookworm-slim AS build
 WORKDIR /workspace
 COPY pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages/broker/package.json packages/broker/
+COPY packages/mcp-server/package.json packages/mcp-server/
 RUN corepack enable \
     && corepack prepare pnpm@11.9.0 --activate \
     && pnpm install --frozen-lockfile --filter @liveprobe/broker...
@@ -12,6 +13,9 @@ RUN corepack enable \
 COPY packages/broker/tsconfig.json packages/broker/
 COPY packages/broker/src packages/broker/src
 COPY packages/broker/scripts packages/broker/scripts
+COPY packages/mcp-server/tsconfig.json packages/mcp-server/
+COPY packages/mcp-server/src packages/mcp-server/src
+RUN pnpm --filter @doomslayer2945/liveprobe-mcp run build
 RUN pnpm --filter @liveprobe/broker run build
 
 FROM node:24-bookworm-slim AS runtime
@@ -24,10 +28,12 @@ ENV NODE_ENV=production \
 WORKDIR /workspace
 COPY pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/broker/package.json packages/broker/
+COPY packages/mcp-server/package.json packages/mcp-server/
 RUN corepack enable \
     && corepack prepare pnpm@11.9.0 --activate \
     && pnpm install --frozen-lockfile --prod --filter @liveprobe/broker...
 COPY --from=build /workspace/packages/broker/dist packages/broker/dist
+COPY --from=build /workspace/packages/mcp-server/dist packages/mcp-server/dist
 
 RUN mkdir -p /var/lib/liveprobe && chown -R node:node /var/lib/liveprobe
 USER node

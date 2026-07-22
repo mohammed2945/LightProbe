@@ -257,6 +257,10 @@ remote_api_key="$LIVEPROBE_API_KEY"
 remote_api_keys="$LIVEPROBE_API_KEYS"
 remote_postgres_password="$POSTGRES_PASSWORD"
 remote_clerk_secret_key="$CLERK_SECRET_KEY"
+remote_liveprobe_public_url=""
+if [[ -n "$HTTPS_DOMAIN" ]]; then
+  remote_liveprobe_public_url="https://${HTTPS_DOMAIN}"
+fi
 if [[ "$SECRETS_BACKEND" == "secret-manager" ]]; then
   remote_api_key=""
   remote_api_keys=""
@@ -267,7 +271,7 @@ fi
 # The remote shell, not this local shell, must expand status.
 # shellcheck disable=SC2016
 printf -v remote_command \
-  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q PROJECT_ID=%q SECRETS_BACKEND=%q LIVEPROBE_API_KEYS_SECRET=%q POSTGRES_PASSWORD_SECRET=%q CLERK_SECRET_KEY_SECRET=%q LIVEPROBE_API_KEY=%q LIVEPROBE_API_KEYS=%q POSTGRES_PASSWORD=%q CLERK_SECRET_KEY=%q CLERK_AUTHORIZED_PARTIES=%q CLERK_AUDIENCE=%q DATABASE_BACKEND=%q CLOUD_SQL_INSTANCE_CONNECTION_NAME=%q CLOUD_SQL_DATABASE=%q CLOUD_SQL_USER=%q LIVEPROBE_DB_POOL_SIZE=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
+  'sudo env DEPLOY_COMMIT=%q RELEASE_ARCHIVE=%q BROKER_PORT=%q PUBLIC_IP=%q PROJECT_ID=%q SECRETS_BACKEND=%q LIVEPROBE_API_KEYS_SECRET=%q POSTGRES_PASSWORD_SECRET=%q CLERK_SECRET_KEY_SECRET=%q LIVEPROBE_API_KEY=%q LIVEPROBE_API_KEYS=%q POSTGRES_PASSWORD=%q CLERK_SECRET_KEY=%q CLERK_PUBLISHABLE_KEY=%q CLERK_FRONTEND_API_URL=%q LIVEPROBE_PUBLIC_URL=%q CLERK_AUTHORIZED_PARTIES=%q CLERK_AUDIENCE=%q DATABASE_BACKEND=%q CLOUD_SQL_INSTANCE_CONNECTION_NAME=%q CLOUD_SQL_DATABASE=%q CLOUD_SQL_USER=%q LIVEPROBE_DB_POOL_SIZE=%q bash %q; status=$?; sudo rm -f -- %q; exit $status' \
   "$DEPLOY_COMMIT" \
   "$remote_archive" \
   "$BROKER_PORT" \
@@ -281,6 +285,9 @@ printf -v remote_command \
   "$remote_api_keys" \
   "$remote_postgres_password" \
   "$remote_clerk_secret_key" \
+  "$CLERK_PUBLISHABLE_KEY" \
+  "$CLERK_FRONTEND_API_URL" \
+  "$remote_liveprobe_public_url" \
   "$CLERK_AUTHORIZED_PARTIES" \
   "$CLERK_AUDIENCE" \
   "$DATABASE_BACKEND" \

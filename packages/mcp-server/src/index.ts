@@ -1,8 +1,10 @@
 import { resolve } from "node:path";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
 const serviceIdSchema = z.string().trim().min(1).max(200);
@@ -968,6 +970,38 @@ export function createMcpServer(
     async (input) => executeTool(() => handlers.remove_probe(input)),
   );
   return server;
+}
+
+export interface StatelessHttpMcpRequest {
+  brokerUrl: string;
+  bearerToken: string;
+  request: IncomingMessage;
+  response: ServerResponse;
+  body: unknown;
+}
+
+export async function handleStatelessHttpMcpRequest(
+  input: StatelessHttpMcpRequest,
+): Promise<void> {
+  const server = createMcpServer(
+    new BrokerClient(input.brokerUrl, { apiKey: input.bearerToken }),
+  );
+  const transport = new StreamableHTTPServerTransport();
+  const close = (): void => {
+    void transport.close();
+    void server.close();
+  };
+  input.response.once("close", close);
+  try {
+    await server.connect(
+      transport as Parameters<McpServer["connect"]>[0],
+    );
+    await transport.handleRequest(input.request, input.response, input.body);
+  } catch (error: unknown) {
+    input.response.off("close", close);
+    close();
+    throw error;
+  }
 }
 
 export async function startStdioServer(

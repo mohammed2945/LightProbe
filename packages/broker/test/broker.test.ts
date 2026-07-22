@@ -172,6 +172,66 @@ describe("broker validation and storage", () => {
     expect(authorized.json()).toEqual({ ok: true });
   });
 
+  it("publishes OAuth discovery and challenges unauthenticated remote MCP clients", async () => {
+    const principal: BrokerPrincipal = {
+      type: "user",
+      role: "operator",
+      principalId: "user-alpha",
+      tenantId: "org-alpha",
+      projectId: "default",
+      environmentId: "default",
+      organizationId: "org-alpha",
+    };
+    const authenticate = async (token: string) =>
+      token === "oauth-token" ? principal : undefined;
+    const broker = await buildBroker({
+      authenticateBearer: authenticate,
+      remoteMcp: {
+        publicUrl: "https://probe.example.com",
+        brokerUrl: "http://127.0.0.1:7070",
+        authorizationServerUrl: "https://clerk.probe.example.com",
+        authenticateBearer: authenticate,
+      },
+    });
+    openBrokers.push(broker);
+
+    for (const path of [
+      "/.well-known/oauth-protected-resource",
+      "/.well-known/oauth-protected-resource/mcp",
+    ]) {
+      const metadata = await broker.inject({ method: "GET", url: path });
+      expect(metadata.statusCode).toBe(200);
+      expect(metadata.headers["access-control-allow-origin"]).toBe("*");
+      expect(metadata.json()).toEqual({
+        resource: "https://probe.example.com/mcp",
+        authorization_servers: ["https://clerk.probe.example.com"],
+        scopes_supported: ["user:org:read"],
+        bearer_methods_supported: ["header"],
+        resource_name: "LiveProbe MCP",
+      });
+    }
+
+    const unauthorized = await broker.inject({
+      method: "POST",
+      url: "/mcp",
+      payload: {},
+    });
+    expect(unauthorized.statusCode).toBe(401);
+    expect(unauthorized.headers["www-authenticate"]).toBe(
+      'Bearer resource_metadata="https://probe.example.com/.well-known/oauth-protected-resource/mcp", scope="user:org:read"',
+    );
+    expect(unauthorized.json()).toMatchObject({
+      error: { code: "unauthorized" },
+    });
+
+    const methodNotAllowed = await broker.inject({
+      method: "GET",
+      url: "/mcp",
+      headers: { authorization: "Bearer oauth-token" },
+    });
+    expect(methodNotAllowed.statusCode).toBe(405);
+  });
+
   it("accepts current and previous bearer keys during rotation", async () => {
     const broker = await buildBroker({
       apiKeys: ["current-fixture-key", "previous-fixture-key"],

@@ -99,6 +99,22 @@ validate_clerk_secret_key() {
     die "CLERK_SECRET_KEY must be a 20-512 character single-line key"
 }
 
+validate_clerk_publishable_key() {
+  local value="$1"
+
+  [[ ${#value} -ge 20 && ${#value} -le 512 &&
+    "$value" =~ ^pk_(test|live)_[A-Za-z0-9_-]+$ ]] ||
+    die "CLERK_PUBLISHABLE_KEY must be a valid Clerk publishable key"
+}
+
+validate_https_origin() {
+  local name="$1"
+  local value="$2"
+
+  [[ "$value" =~ ^https://[^/[:space:]]+$ ]] ||
+    die "${name} must be an HTTPS origin without a path"
+}
+
 validate_clerk_audience() {
   local value="$1"
   local audience
@@ -399,6 +415,8 @@ load_gcp_config() {
   POSTGRES_PASSWORD_SECRET="${POSTGRES_PASSWORD_SECRET:-${VM_NAME}-postgres-password}"
   CLERK_SECRET_KEY_SECRET="${CLERK_SECRET_KEY_SECRET:-${VM_NAME}-clerk-secret-key}"
   CLERK_SECRET_KEY="${CLERK_SECRET_KEY:-}"
+  CLERK_PUBLISHABLE_KEY="${CLERK_PUBLISHABLE_KEY:-}"
+  CLERK_FRONTEND_API_URL="${CLERK_FRONTEND_API_URL:-}"
   CLERK_AUTHORIZED_PARTIES="${CLERK_AUTHORIZED_PARTIES:-}"
   CLERK_AUDIENCE="${CLERK_AUDIENCE:-}"
   HTTPS_DOMAIN="${HTTPS_DOMAIN:-}"
@@ -436,7 +454,8 @@ load_gcp_config() {
   validate_resource_name "Postgres password secret name" "$POSTGRES_PASSWORD_SECRET"
   validate_resource_name "Clerk secret key secret name" "$CLERK_SECRET_KEY_SECRET"
   if [[ -n "$CLERK_SECRET_KEY" || -n "$CLERK_AUTHORIZED_PARTIES" ||
-    -n "$CLERK_AUDIENCE" ]]; then
+    -n "$CLERK_AUDIENCE" || -n "$CLERK_PUBLISHABLE_KEY" ||
+    -n "$CLERK_FRONTEND_API_URL" ]]; then
     [[ -n "$CLERK_AUTHORIZED_PARTIES" ]] ||
       die "CLERK_AUTHORIZED_PARTIES is required when Clerk is configured"
     validate_clerk_authorized_parties "$CLERK_AUTHORIZED_PARTIES"
@@ -444,6 +463,14 @@ load_gcp_config() {
       validate_clerk_secret_key "$CLERK_SECRET_KEY"
     fi
     validate_clerk_audience "$CLERK_AUDIENCE"
+    if [[ -n "$CLERK_PUBLISHABLE_KEY" || -n "$CLERK_FRONTEND_API_URL" ]]; then
+      [[ -n "$CLERK_PUBLISHABLE_KEY" && -n "$CLERK_FRONTEND_API_URL" ]] ||
+        die "CLERK_PUBLISHABLE_KEY and CLERK_FRONTEND_API_URL must be set together"
+      [[ -n "$HTTPS_DOMAIN" ]] ||
+        die "Clerk MCP OAuth requires HTTPS_DOMAIN"
+      validate_clerk_publishable_key "$CLERK_PUBLISHABLE_KEY"
+      validate_https_origin "CLERK_FRONTEND_API_URL" "$CLERK_FRONTEND_API_URL"
+    fi
     if [[ "$SECRETS_BACKEND" == "environment" ]]; then
       [[ -n "$CLERK_SECRET_KEY" ]] ||
         die "CLERK_SECRET_KEY is required for environment-backed Clerk auth"

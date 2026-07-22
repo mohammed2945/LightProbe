@@ -23,6 +23,9 @@ importers:
       '@clerk/backend':
         specifier: ^3.12.0
         version: 3.12.0
+      '@doomslayer2945/liveprobe-mcp':
+        specifier: workspace:*
+        version: link:../mcp-server
       '@jridgewell/trace-mapping':
         specifier: ^0.3.31
         version: 0.3.31
