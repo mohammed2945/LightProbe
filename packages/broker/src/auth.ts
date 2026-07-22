@@ -41,6 +41,11 @@ export type BrokerPrincipal =
       role: "operator";
     })
   | (ResourceScope & {
+      type: "user";
+      principalId: string;
+      role: "operator";
+    })
+  | (ResourceScope & {
       type: "service";
       principalId: string;
       role: "agent";
@@ -51,6 +56,10 @@ export interface ServiceCredentialMaterial {
   apiKey: string;
   record: StoredServiceCredential;
 }
+
+export type BearerAuthenticator = (
+  token: string,
+) => Promise<BrokerPrincipal | undefined>;
 
 export function hashBearerToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");

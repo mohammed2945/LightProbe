@@ -1,4 +1,4 @@
-export const POSTGRES_SCHEMA_VERSION = 4;
+export const POSTGRES_SCHEMA_VERSION = 5;
 
 export const DEFAULT_TENANT_ID = "internal";
 export const DEFAULT_PROJECT_ID = "default";
@@ -54,12 +54,13 @@ export const POSTGRES_MIGRATION_SQL = `
     tenant_id text not null default '${DEFAULT_TENANT_ID}',
     project_id text not null default '${DEFAULT_PROJECT_ID}',
     environment_id text not null default '${DEFAULT_ENVIRONMENT_ID}',
-    service_id text primary key,
+    service_id text not null,
     last_seen timestamptz not null,
     sdk text,
     commit_sha text,
     commit_source text,
-    agent_status jsonb
+    agent_status jsonb,
+    primary key (tenant_id, project_id, environment_id, service_id)
   );
 
   create table if not exists probes (
@@ -95,8 +96,9 @@ export const POSTGRES_MIGRATION_SQL = `
     tenant_id text not null default '${DEFAULT_TENANT_ID}',
     project_id text not null default '${DEFAULT_PROJECT_ID}',
     environment_id text not null default '${DEFAULT_ENVIRONMENT_ID}',
-    service_id text primary key,
-    version integer not null
+    service_id text not null,
+    version integer not null,
+    primary key (tenant_id, project_id, environment_id, service_id)
   );
 
   create table if not exists source_map_sets (
@@ -107,7 +109,9 @@ export const POSTGRES_MIGRATION_SQL = `
     commit_sha text not null,
     complete boolean not null default false,
     updated_at timestamptz not null,
-    primary key (service_id, commit_sha)
+    primary key (
+      tenant_id, project_id, environment_id, service_id, commit_sha
+    )
   );
 
   create table if not exists source_maps (
@@ -119,9 +123,14 @@ export const POSTGRES_MIGRATION_SQL = `
     map_path text not null,
     source_map jsonb not null,
     uploaded_at timestamptz not null,
-    primary key (service_id, commit_sha, map_path),
-    foreign key (service_id, commit_sha)
-      references source_map_sets(service_id, commit_sha) on delete cascade
+    primary key (
+      tenant_id, project_id, environment_id, service_id, commit_sha, map_path
+    ),
+    foreign key (
+      tenant_id, project_id, environment_id, service_id, commit_sha
+    ) references source_map_sets(
+      tenant_id, project_id, environment_id, service_id, commit_sha
+    ) on delete cascade
   );
 
   create table if not exists service_credentials (
@@ -165,6 +174,85 @@ export const POSTGRES_MIGRATION_SQL = `
     add column if not exists tenant_id text not null default '${DEFAULT_TENANT_ID}',
     add column if not exists project_id text not null default '${DEFAULT_PROJECT_ID}',
     add column if not exists environment_id text not null default '${DEFAULT_ENVIRONMENT_ID}';
+
+  do $tenant_keys$
+  declare
+    legacy_fk text;
+  begin
+    select constraint_name into legacy_fk
+    from information_schema.referential_constraints
+    where constraint_schema = current_schema()
+      and unique_constraint_name = 'source_map_sets_pkey'
+      and constraint_name in (
+        select conname from pg_constraint
+        where conrelid = 'source_maps'::regclass
+          and contype = 'f'
+          and position('tenant_id' in pg_get_constraintdef(oid)) = 0
+      )
+    limit 1;
+    if legacy_fk is not null then
+      execute format(
+        'alter table source_maps drop constraint %I',
+        legacy_fk
+      );
+    end if;
+
+    if exists (
+      select 1 from pg_constraint
+      where conrelid = 'services'::regclass and contype = 'p'
+        and position('tenant_id' in pg_get_constraintdef(oid)) = 0
+    ) then
+      alter table services drop constraint services_pkey;
+      alter table services add primary key (
+        tenant_id, project_id, environment_id, service_id
+      );
+    end if;
+    if exists (
+      select 1 from pg_constraint
+      where conrelid = 'service_versions'::regclass and contype = 'p'
+        and position('tenant_id' in pg_get_constraintdef(oid)) = 0
+    ) then
+      alter table service_versions drop constraint service_versions_pkey;
+      alter table service_versions add primary key (
+        tenant_id, project_id, environment_id, service_id
+      );
+    end if;
+    if exists (
+      select 1 from pg_constraint
+      where conrelid = 'source_map_sets'::regclass and contype = 'p'
+        and position('tenant_id' in pg_get_constraintdef(oid)) = 0
+    ) then
+      alter table source_map_sets drop constraint source_map_sets_pkey;
+      alter table source_map_sets add primary key (
+        tenant_id, project_id, environment_id, service_id, commit_sha
+      );
+    end if;
+    if exists (
+      select 1 from pg_constraint
+      where conrelid = 'source_maps'::regclass and contype = 'p'
+        and position('tenant_id' in pg_get_constraintdef(oid)) = 0
+    ) then
+      alter table source_maps drop constraint source_maps_pkey;
+      alter table source_maps add primary key (
+        tenant_id, project_id, environment_id, service_id, commit_sha,
+        map_path
+      );
+    end if;
+    if not exists (
+      select 1 from pg_constraint
+      where conrelid = 'source_maps'::regclass and contype = 'f'
+        and confrelid = 'source_map_sets'::regclass
+        and position('tenant_id' in pg_get_constraintdef(oid)) > 0
+    ) then
+      alter table source_maps add constraint source_maps_scoped_set_fk
+        foreign key (
+          tenant_id, project_id, environment_id, service_id, commit_sha
+        ) references source_map_sets (
+          tenant_id, project_id, environment_id, service_id, commit_sha
+        ) on delete cascade;
+    end if;
+  end
+  $tenant_keys$;
 
   do $migration$
   begin

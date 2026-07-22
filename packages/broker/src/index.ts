@@ -12,11 +12,13 @@ import { z, ZodError } from "zod";
 
 import {
   SERVICE_API_KEY_PREFIX,
+  DEFAULT_RESOURCE_SCOPE,
   createServiceCredentialMaterial,
   hashBearerToken,
   servicePrincipal,
   sharedPrincipal,
   type BrokerPrincipal,
+  type BearerAuthenticator,
   type ResourceScope,
   type ServiceCredentialRecord,
   type StoredServiceCredential,
@@ -36,6 +38,7 @@ export {
   hashBearerToken,
 } from "./auth.js";
 export type {
+  BearerAuthenticator,
   BrokerPrincipal,
   ResourceScope,
   ServiceCredentialRecord,
@@ -389,6 +392,7 @@ export interface ServiceRecord {
 }
 
 interface StoredProbe {
+  scope: ResourceScope;
   probe: ProbeDefinition;
   expiresAt: number;
   expired: boolean;
@@ -414,13 +418,26 @@ export interface BrokerStore {
   healthCheck?(): Promise<void>;
   restore(state: BrokerState): Promise<void>;
   persist(state: BrokerState): Promise<void>;
-  persistProbe?(state: BrokerState, probeId: string): Promise<void>;
-  deleteProbe?(state: BrokerState, probeId: string): Promise<void>;
-  persistIngest?(state: BrokerState, input: IngestInput): Promise<void>;
+  persistProbe?(
+    state: BrokerState,
+    probeId: string,
+    scope: ResourceScope,
+  ): Promise<void>;
+  deleteProbe?(
+    state: BrokerState,
+    probeId: string,
+    scope: ResourceScope,
+  ): Promise<void>;
+  persistIngest?(
+    state: BrokerState,
+    input: IngestInput,
+    scope: ResourceScope,
+  ): Promise<void>;
   persistSourceMapSet?(
     state: BrokerState,
     serviceId: string,
     commitSha: string,
+    scope: ResourceScope,
   ): Promise<void>;
   createServiceCredential?(
     credential: StoredServiceCredential,
@@ -442,6 +459,7 @@ export interface BuildBrokerOptions {
   state?: BrokerState;
   apiKey?: string;
   apiKeys?: readonly string[];
+  authenticateBearer?: BearerAuthenticator;
   store?: BrokerStore | false;
   clock?: () => number;
   idGenerator?: (now: number) => string;
@@ -561,8 +579,15 @@ const persistedStatusSchema = z
   })
   .strict();
 
+const resourceScopeShape = {
+  tenantId: z.string().min(1).max(200),
+  projectId: z.string().min(1).max(200),
+  environmentId: z.string().min(1).max(200),
+} as const;
+
 const persistedServiceSchema = z
   .object({
+    ...resourceScopeShape,
     serviceId: serviceIdSchema,
     lastSeen: timestampSchema,
     sdk: z.enum(["node", "python", "jvm"]).optional(),
@@ -574,6 +599,7 @@ const persistedServiceSchema = z
 
 const persistedSourceMapSetSchema = z
   .object({
+    ...resourceScopeShape,
     serviceId: serviceIdSchema,
     commitSha: commitShaSchema,
     complete: z.boolean(),
@@ -590,7 +616,18 @@ const persistedSourceMapSetSchema = z
   })
   .strict();
 
-const snapshotSchema = z
+const legacyPersistedServiceSchema = persistedServiceSchema.omit({
+  tenantId: true,
+  projectId: true,
+  environmentId: true,
+});
+const legacyPersistedSourceMapSetSchema = persistedSourceMapSetSchema.omit({
+  tenantId: true,
+  projectId: true,
+  environmentId: true,
+});
+
+const legacySnapshotSchema = z
   .object({
     formatVersion: z.literal(1),
     savedAt: timestampSchema,
@@ -614,13 +651,99 @@ const snapshotSchema = z
         })
         .strict(),
     ),
-    services: z.array(persistedServiceSchema),
+    services: z.array(legacyPersistedServiceSchema),
     statuses: z.array(z.tuple([probeIdSchema, persistedStatusSchema])),
+    sourceMapSets: z.array(legacyPersistedSourceMapSetSchema).default([]),
+  })
+  .strict();
+
+const snapshotSchema = z
+  .object({
+    formatVersion: z.literal(2),
+    savedAt: timestampSchema,
+    probes: z.array(
+      z
+        .object({
+          scope: z.object(resourceScopeShape).strict(),
+          probe: ProbeDefinitionSchema,
+          expiresAt: z.number().int().nonnegative(),
+          expired: z.boolean(),
+        })
+        .strict(),
+    ),
+    serviceVersions: z.array(
+      z
+        .object({
+          ...resourceScopeShape,
+          serviceId: serviceIdSchema,
+          version: z.number().int().nonnegative(),
+        })
+        .strict(),
+    ),
+    events: z.array(
+      z
+        .object({
+          scope: z.object(resourceScopeShape).strict(),
+          probeId: probeIdSchema,
+          values: z.array(ProbeEventSchema),
+        })
+        .strict(),
+    ),
+    services: z.array(persistedServiceSchema),
+    statuses: z.array(
+      z
+        .object({
+          scope: z.object(resourceScopeShape).strict(),
+          probeId: probeIdSchema,
+          value: persistedStatusSchema,
+        })
+        .strict(),
+    ),
     sourceMapSets: z.array(persistedSourceMapSetSchema).default([]),
   })
   .strict();
 
-interface SourceMapSet {
+type BrokerSnapshot = z.infer<typeof snapshotSchema>;
+
+function parseBrokerSnapshot(value: unknown): BrokerSnapshot {
+  const candidate = value as { formatVersion?: unknown };
+  if (candidate?.formatVersion !== 1) {
+    return snapshotSchema.parse(value);
+  }
+  const legacy = legacySnapshotSchema.parse(value);
+  return snapshotSchema.parse({
+    formatVersion: 2,
+    savedAt: legacy.savedAt,
+    probes: legacy.probes.map((stored) => ({
+      scope: DEFAULT_RESOURCE_SCOPE,
+      ...stored,
+    })),
+    serviceVersions: legacy.serviceVersions.map(([serviceId, version]) => ({
+      ...DEFAULT_RESOURCE_SCOPE,
+      serviceId,
+      version,
+    })),
+    events: legacy.events.map((entry) => ({
+      scope: DEFAULT_RESOURCE_SCOPE,
+      ...entry,
+    })),
+    services: legacy.services.map((service) => ({
+      ...DEFAULT_RESOURCE_SCOPE,
+      ...service,
+    })),
+    statuses: legacy.statuses.map(([probeId, status]) => ({
+      scope: DEFAULT_RESOURCE_SCOPE,
+      probeId,
+      value: status,
+    })),
+    sourceMapSets: legacy.sourceMapSets.map((set) => ({
+      ...DEFAULT_RESOURCE_SCOPE,
+      ...set,
+    })),
+  });
+}
+
+interface SourceMapSet extends ResourceScope {
   serviceId: string;
   commitSha: string;
   complete: boolean;
@@ -633,11 +756,44 @@ interface SourceMapLease {
   expiresAt: number;
 }
 
+type ScopedServiceRecord = ServiceRecord & ResourceScope;
+type ScopedServiceVersion = ResourceScope & {
+  serviceId: string;
+  version: number;
+};
+
+function resourceScope(scope: ResourceScope): ResourceScope {
+  return {
+    tenantId: scope.tenantId,
+    projectId: scope.projectId,
+    environmentId: scope.environmentId,
+  };
+}
+
+function resourceScopeKey(scope: ResourceScope): string {
+  return JSON.stringify([
+    scope.tenantId,
+    scope.projectId,
+    scope.environmentId,
+  ]);
+}
+
+function sameResourceScope(
+  left: ResourceScope,
+  right: ResourceScope,
+): boolean {
+  return (
+    left.tenantId === right.tenantId &&
+    left.projectId === right.projectId &&
+    left.environmentId === right.environmentId
+  );
+}
+
 export class BrokerState {
   private readonly probes = new Map<string, StoredProbe>();
-  private readonly serviceVersions = new Map<string, number>();
+  private readonly serviceVersions = new Map<string, ScopedServiceVersion>();
   private readonly events = new Map<string, ProbeEvent[]>();
-  private readonly services = new Map<string, ServiceRecord>();
+  private readonly services = new Map<string, ScopedServiceRecord>();
   private readonly statuses = new Map<string, ProbeStatus>();
   private readonly sourceMapSets = new Map<string, SourceMapSet>();
   private readonly sourceMapLeases = new Map<string, SourceMapLease>();
@@ -663,7 +819,10 @@ export class BrokerState {
     return new Date(this.now()).toISOString();
   }
 
-  public createProbe(input: CreateProbeInput): ProbeDefinition {
+  public createProbe(
+    input: CreateProbeInput,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): ProbeDefinition {
     const now = this.now();
     let id = this.idGenerator(now);
     for (let attempt = 0; this.probes.has(id); attempt += 1) {
@@ -674,9 +833,10 @@ export class BrokerState {
     }
     probeIdSchema.parse(id);
 
-    const version = this.incrementServiceVersion(input.serviceId);
+    const version = this.incrementServiceVersion(input.serviceId, scope);
     const probe = ProbeDefinitionSchema.parse({ ...input, id, version });
     this.probes.set(id, {
+      scope: resourceScope(scope),
       probe,
       expiresAt: now + probe.ttlSeconds * 1_000,
       expired: false,
@@ -685,13 +845,16 @@ export class BrokerState {
     return probe;
   }
 
-  public deleteProbe(id: string): boolean {
+  public deleteProbe(
+    id: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): boolean {
     const stored = this.probes.get(id);
-    if (stored === undefined) {
+    if (stored === undefined || !sameResourceScope(stored.scope, scope)) {
       return false;
     }
     if (!stored.expired) {
-      this.incrementServiceVersion(stored.probe.serviceId);
+      this.incrementServiceVersion(stored.probe.serviceId, stored.scope);
     }
     this.probes.delete(id);
     this.events.delete(id);
@@ -700,7 +863,10 @@ export class BrokerState {
     return true;
   }
 
-  public listProbes(serviceId?: string): Array<{
+  public listProbes(
+    serviceId?: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): Array<{
     probe: ProbeDefinition;
     status: ProbeStatus | null;
   }> {
@@ -711,8 +877,8 @@ export class BrokerState {
     }> = [];
     for (const stored of this.probes.values()) {
       if (
-        serviceId === undefined ||
-        stored.probe.serviceId === serviceId
+        sameResourceScope(stored.scope, scope) &&
+        (serviceId === undefined || stored.probe.serviceId === serviceId)
       ) {
         result.push({
           probe: stored.probe,
@@ -723,30 +889,42 @@ export class BrokerState {
     return result;
   }
 
-  public getProbe(id: string): ProbeDefinition | undefined {
+  public getProbe(
+    id: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): ProbeDefinition | undefined {
     this.expireDueProbes();
-    return this.probes.get(id)?.probe;
+    const stored = this.probes.get(id);
+    return stored !== undefined && sameResourceScope(stored.scope, scope)
+      ? stored.probe
+      : undefined;
   }
 
   public pollProbes(
     serviceId: string,
     since: number,
     commitSha?: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ):
     | { version: number; unchanged: true }
     | { version: number; probes: ProbeDefinition[] } {
     this.expireDueProbes();
-    this.touchService(serviceId);
-    const version = this.serviceVersions.get(serviceId) ?? 0;
+    this.touchService(serviceId, undefined, undefined, undefined, undefined, scope);
+    const version =
+      this.serviceVersions.get(this.serviceKey(scope, serviceId))?.version ?? 0;
     if (since === version) {
       return { version, unchanged: true };
     }
     const probes = [...this.probes.values()]
       .filter(
         (stored) =>
-          stored.probe.serviceId === serviceId && !stored.expired,
+          sameResourceScope(stored.scope, scope) &&
+          stored.probe.serviceId === serviceId &&
+          !stored.expired,
       )
-      .map((stored) => this.withRuntimeLocation(stored.probe, commitSha));
+      .map((stored) =>
+        this.withRuntimeLocation(stored.probe, commitSha, scope),
+      );
     return { version, probes };
   }
 
@@ -754,8 +932,9 @@ export class BrokerState {
     serviceId: string,
     commitSha: string,
     uploaderId: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): { isUploader: boolean; isComplete: boolean } {
-    const key = this.sourceMapKey(serviceId, commitSha);
+    const key = this.sourceMapKey(scope, serviceId, commitSha);
     const set = this.sourceMapSets.get(key);
     if (set?.complete === true) {
       return { isUploader: false, isComplete: true };
@@ -790,13 +969,19 @@ export class BrokerState {
     uploaderId: string;
     mapPath: string;
     map: Record<string, unknown>;
-  }): void {
-    this.assertSourceMapUploader(input.serviceId, input.commitSha, input.uploaderId);
+  }, scope: ResourceScope = DEFAULT_RESOURCE_SCOPE): void {
+    this.assertSourceMapUploader(
+      input.serviceId,
+      input.commitSha,
+      input.uploaderId,
+      scope,
+    );
     const cleanMap = stripSourcesContent(input.map);
     validateSourceMap(input.mapPath, cleanMap);
-    const key = this.sourceMapKey(input.serviceId, input.commitSha);
+    const key = this.sourceMapKey(scope, input.serviceId, input.commitSha);
     const existing = this.sourceMapSets.get(key);
     const set: SourceMapSet = existing ?? {
+      ...resourceScope(scope),
       serviceId: input.serviceId,
       commitSha: input.commitSha,
       complete: false,
@@ -818,11 +1003,13 @@ export class BrokerState {
     serviceId: string,
     commitSha: string,
     uploaderId: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): void {
-    this.assertSourceMapUploader(serviceId, commitSha, uploaderId);
-    const key = this.sourceMapKey(serviceId, commitSha);
+    this.assertSourceMapUploader(serviceId, commitSha, uploaderId, scope);
+    const key = this.sourceMapKey(scope, serviceId, commitSha);
     const existing = this.sourceMapSets.get(key);
     const set: SourceMapSet = existing ?? {
+      ...resourceScope(scope),
       serviceId,
       commitSha,
       complete: false,
@@ -833,9 +1020,13 @@ export class BrokerState {
     set.updatedAt = this.timestamp();
     this.sourceMapSets.set(key, set);
     this.sourceMapLeases.delete(key);
-    this.incrementServiceVersion(serviceId);
+    this.incrementServiceVersion(serviceId, scope);
     const retained = [...this.sourceMapSets.entries()]
-      .filter(([, candidate]) => candidate.serviceId === serviceId)
+      .filter(
+        ([, candidate]) =>
+          sameResourceScope(candidate, scope) &&
+          candidate.serviceId === serviceId,
+      )
       .sort(
         ([leftKey, left], [rightKey, right]) =>
           Date.parse(right.updatedAt) - Date.parse(left.updatedAt) ||
@@ -850,16 +1041,23 @@ export class BrokerState {
   public getSourceMapSet(
     serviceId: string,
     commitSha: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): {
+    tenantId: string;
+    projectId: string;
+    environmentId: string;
     serviceId: string;
     commitSha: string;
     complete: boolean;
     updatedAt: string;
     maps: StoredSourceMap[];
   } | undefined {
-    const set = this.sourceMapSets.get(this.sourceMapKey(serviceId, commitSha));
+    const set = this.sourceMapSets.get(
+      this.sourceMapKey(scope, serviceId, commitSha),
+    );
     if (set === undefined) return undefined;
     return {
+      ...resourceScope(set),
       serviceId: set.serviceId,
       commitSha: set.commitSha,
       complete: set.complete,
@@ -868,11 +1066,17 @@ export class BrokerState {
     };
   }
 
-  public ingest(input: z.infer<typeof IngestSchema>): number {
+  public ingest(
+    input: z.infer<typeof IngestSchema>,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): number {
     this.expireDueProbes();
     for (const event of input.events) {
       const stored = this.probes.get(event.probeId);
-      if (stored === undefined) {
+      if (
+        stored === undefined ||
+        !sameResourceScope(stored.scope, scope)
+      ) {
         throw new BrokerHttpError(
           400,
           "invalid_request",
@@ -912,6 +1116,7 @@ export class BrokerState {
       input.agentStatus,
       input.commitSha,
       input.commitSource,
+      scope,
     );
     for (const event of input.events) {
       this.appendEvent(event);
@@ -927,13 +1132,27 @@ export class BrokerState {
     return input.events.length;
   }
 
-  public listServices(): ServiceRecord[] {
-    return [...this.services.values()].sort((left, right) =>
-      left.serviceId.localeCompare(right.serviceId),
-    );
+  public listServices(
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): ServiceRecord[] {
+    return [...this.services.values()]
+      .filter((service) => sameResourceScope(service, scope))
+      .map((service) => {
+        const {
+          tenantId: _tenantId,
+          projectId: _projectId,
+          environmentId: _environmentId,
+          ...record
+        } = service;
+        return record;
+      })
+      .sort((left, right) => left.serviceId.localeCompare(right.serviceId));
   }
 
-  public safetyOverview(staleAfterMs = 45_000): {
+  public safetyOverview(
+    staleAfterMs = 45_000,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): {
     services: Array<{
       serviceId: string;
       sdk?: AgentSdk;
@@ -948,7 +1167,7 @@ export class BrokerState {
     this.expireDueProbes();
     const now = this.now();
     return {
-      services: this.listServices().map((service) => {
+      services: this.listServices(scope).map((service) => {
         const summary: Record<ProbeStatusName | "unknown", number> = {
           armed: 0,
           error: 0,
@@ -957,7 +1176,10 @@ export class BrokerState {
           expired: 0,
           unknown: 0,
         };
-        for (const { probe, status } of this.listProbes(service.serviceId)) {
+        for (const { probe, status } of this.listProbes(
+          service.serviceId,
+          scope,
+        )) {
           summary[status?.status ?? "unknown"] += 1;
           if (status === null && !this.probes.get(probe.id)?.expired) {
             summary.armed += 1;
@@ -1005,12 +1227,22 @@ export class BrokerState {
     };
   }
 
-  public getEvents(id: string): ProbeEvent[] {
-    return [...(this.events.get(id) ?? [])];
+  public getEvents(
+    id: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): ProbeEvent[] {
+    return this.getProbe(id, scope) === undefined
+      ? []
+      : [...(this.events.get(id) ?? [])];
   }
 
-  public getStatus(id: string): ProbeStatus | null {
-    return this.statuses.get(id) ?? null;
+  public getStatus(
+    id: string,
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+  ): ProbeStatus | null {
+    return this.getProbe(id, scope) === undefined
+      ? null
+      : (this.statuses.get(id) ?? null);
   }
 
   /**
@@ -1106,7 +1338,7 @@ export class BrokerState {
       if (!stored.expired && stored.expiresAt <= now) {
         stored.expired = true;
         expired += 1;
-        this.incrementServiceVersion(stored.probe.serviceId);
+        this.incrementServiceVersion(stored.probe.serviceId, stored.scope);
         const status: ProbeStatus = {
           status: "expired",
           updatedAt: new Date(now).toISOString(),
@@ -1146,40 +1378,14 @@ export class BrokerState {
         cause: error,
       });
     }
-    const snapshot = snapshotSchema.parse(decoded);
-
-    this.probes.clear();
-    this.serviceVersions.clear();
-    this.events.clear();
-    this.services.clear();
-    this.statuses.clear();
-    this.sourceMapSets.clear();
-    this.sourceMapLeases.clear();
-
-    for (const stored of snapshot.probes) {
-      this.probes.set(stored.probe.id, stored);
-    }
-    for (const [serviceId, version] of snapshot.serviceVersions) {
-      this.serviceVersions.set(serviceId, version);
-    }
-    for (const entry of snapshot.events) {
-      this.events.set(
-        entry.probeId,
-        entry.values.slice(-this.ringCapacity),
-      );
-    }
-    for (const service of snapshot.services) {
-      this.services.set(service.serviceId, service);
-    }
-    for (const [probeId, status] of snapshot.statuses) {
-      this.statuses.set(probeId, status);
-    }
-    this.loadSourceMapSets(snapshot.sourceMapSets);
-    this.expireDueProbes();
+    this.replaceWithSnapshot(parseBrokerSnapshot(decoded));
   }
 
   public loadSnapshot(snapshot: unknown): void {
-    const parsed = snapshotSchema.parse(snapshot);
+    this.replaceWithSnapshot(parseBrokerSnapshot(snapshot));
+  }
+
+  private replaceWithSnapshot(parsed: BrokerSnapshot): void {
 
     this.probes.clear();
     this.serviceVersions.clear();
@@ -1192,8 +1398,11 @@ export class BrokerState {
     for (const stored of parsed.probes) {
       this.probes.set(stored.probe.id, stored);
     }
-    for (const [serviceId, version] of parsed.serviceVersions) {
-      this.serviceVersions.set(serviceId, version);
+    for (const version of parsed.serviceVersions) {
+      this.serviceVersions.set(
+        this.serviceKey(version, version.serviceId),
+        version,
+      );
     }
     for (const entry of parsed.events) {
       this.events.set(
@@ -1202,10 +1411,10 @@ export class BrokerState {
       );
     }
     for (const service of parsed.services) {
-      this.services.set(service.serviceId, service);
+      this.services.set(this.serviceKey(service, service.serviceId), service);
     }
-    for (const [probeId, status] of parsed.statuses) {
-      this.statuses.set(probeId, status);
+    for (const status of parsed.statuses) {
+      this.statuses.set(status.probeId, status.value);
     }
     this.loadSourceMapSets(parsed.sourceMapSets);
     this.expireDueProbes();
@@ -1213,17 +1422,25 @@ export class BrokerState {
 
   public snapshot(): z.infer<typeof snapshotSchema> {
     return snapshotSchema.parse({
-      formatVersion: 1,
+      formatVersion: 2,
       savedAt: this.timestamp(),
       probes: [...this.probes.values()],
-      serviceVersions: [...this.serviceVersions.entries()],
-      events: [...this.events.entries()].map(([probeId, values]) => ({
-        probeId,
-        values,
-      })),
+      serviceVersions: [...this.serviceVersions.values()],
+      events: [...this.events.entries()].flatMap(([probeId, values]) => {
+        const stored = this.probes.get(probeId);
+        return stored === undefined
+          ? []
+          : [{ scope: stored.scope, probeId, values }];
+      }),
       services: [...this.services.values()],
-      statuses: [...this.statuses.entries()],
+      statuses: [...this.statuses.entries()].flatMap(([probeId, value]) => {
+        const stored = this.probes.get(probeId);
+        return stored === undefined
+          ? []
+          : [{ scope: stored.scope, probeId, value }];
+      }),
       sourceMapSets: [...this.sourceMapSets.values()].map((set) => ({
+        ...resourceScope(set),
         serviceId: set.serviceId,
         commitSha: set.commitSha,
         complete: set.complete,
@@ -1254,22 +1471,39 @@ export class BrokerState {
     this.listeners.clear();
   }
 
-  private incrementServiceVersion(serviceId: string): number {
-    const version = (this.serviceVersions.get(serviceId) ?? 0) + 1;
-    this.serviceVersions.set(serviceId, version);
+  private incrementServiceVersion(
+    serviceId: string,
+    scope: ResourceScope,
+  ): number {
+    const key = this.serviceKey(scope, serviceId);
+    const version = (this.serviceVersions.get(key)?.version ?? 0) + 1;
+    this.serviceVersions.set(key, {
+      ...resourceScope(scope),
+      serviceId,
+      version,
+    });
     return version;
   }
 
-  private sourceMapKey(serviceId: string, commitSha: string): string {
-    return `${serviceId}\u0000${commitSha}`;
+  private serviceKey(scope: ResourceScope, serviceId: string): string {
+    return `${resourceScopeKey(scope)}\u0000${serviceId}`;
+  }
+
+  private sourceMapKey(
+    scope: ResourceScope,
+    serviceId: string,
+    commitSha: string,
+  ): string {
+    return `${this.serviceKey(scope, serviceId)}\u0000${commitSha}`;
   }
 
   private assertSourceMapUploader(
     serviceId: string,
     commitSha: string,
     uploaderId: string,
+    scope: ResourceScope,
   ): void {
-    const key = this.sourceMapKey(serviceId, commitSha);
+    const key = this.sourceMapKey(scope, serviceId, commitSha);
     const lease = this.sourceMapLeases.get(key);
     if (
       lease === undefined ||
@@ -1288,9 +1522,12 @@ export class BrokerState {
   private withRuntimeLocation(
     probe: ProbeDefinition,
     commitSha: string | undefined,
+    scope: ResourceScope,
   ): ProbeDefinition {
     if (commitSha === undefined) return probe;
-    const set = this.sourceMapSets.get(this.sourceMapKey(probe.serviceId, commitSha));
+    const set = this.sourceMapSets.get(
+      this.sourceMapKey(scope, probe.serviceId, commitSha),
+    );
     if (set?.complete !== true) return probe;
     const runtime = resolveSourceLocation([...set.maps.values()], probe.file, probe.line);
     return runtime === undefined
@@ -1302,7 +1539,8 @@ export class BrokerState {
     sourceMapSets: Array<z.infer<typeof persistedSourceMapSetSchema>>,
   ): void {
     for (const set of sourceMapSets) {
-      this.sourceMapSets.set(this.sourceMapKey(set.serviceId, set.commitSha), {
+      this.sourceMapSets.set(this.sourceMapKey(set, set.serviceId, set.commitSha), {
+        ...resourceScope(set),
         serviceId: set.serviceId,
         commitSha: set.commitSha,
         complete: set.complete,
@@ -1318,9 +1556,12 @@ export class BrokerState {
     agentStatus?: AgentStatus,
     commitSha?: string,
     commitSource?: "env" | "config",
+    scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): void {
-    const previous = this.services.get(serviceId);
-    const service: ServiceRecord = {
+    const key = this.serviceKey(scope, serviceId);
+    const previous = this.services.get(key);
+    const service: ScopedServiceRecord = {
+      ...resourceScope(scope),
       serviceId,
       lastSeen: this.timestamp(),
       ...(sdk === undefined
@@ -1344,7 +1585,7 @@ export class BrokerState {
           : { commitSource: previous.commitSource }
         : { commitSource }),
     };
-    this.services.set(serviceId, service);
+    this.services.set(key, service);
   }
 
   private appendEvent(event: ProbeEvent): void {
@@ -1493,7 +1734,7 @@ export async function buildBroker(
     if (!request.url.startsWith("/v1/")) {
       return;
     }
-    if (apiKeys.length === 0) {
+    if (apiKeys.length === 0 && options.authenticateBearer === undefined) {
       request.liveprobePrincipal = sharedPrincipal("development");
       return;
     }
@@ -1512,6 +1753,13 @@ export async function buildBroker(
       );
       if (credential !== undefined) {
         request.liveprobePrincipal = servicePrincipal(credential);
+        return;
+      }
+    }
+    if (token !== undefined && options.authenticateBearer !== undefined) {
+      const principal = await options.authenticateBearer(token);
+      if (principal !== undefined) {
+        request.liveprobePrincipal = principal;
         return;
       }
     }
@@ -1595,55 +1843,56 @@ export async function buildBroker(
   const persistSourceMapSet = async (
     serviceId: string,
     commitSha: string,
+    scope: ResourceScope,
   ): Promise<void> => {
     if (store === false) return;
     await (store.persistSourceMapSet === undefined
       ? store.persist(state)
-      : store.persistSourceMapSet(state, serviceId, commitSha));
+      : store.persistSourceMapSet(state, serviceId, commitSha, scope));
   };
 
   app.post("/v1/probes", async (request, reply) => {
-    requireOperator(request);
+    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
     const input = CreateProbeSchema.parse(request.body);
     const probe = await mutateDurably(
-      () => state.createProbe(input),
+      () => state.createProbe(input, principal),
       async (created) => {
         if (store === false) return;
         await (store.persistProbe === undefined
           ? store.persist(state)
-          : store.persistProbe(state, created.id));
+          : store.persistProbe(state, created.id, principal));
       },
     );
     return reply.status(201).send({ probe });
   });
 
   app.delete("/v1/probes/:id", async (request, reply) => {
-    requireOperator(request);
+    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
     const { id } = probeParamsSchema.parse(request.params);
     await mutateDurably(
-      () => state.deleteProbe(id),
+      () => state.deleteProbe(id, principal),
       async () => {
         if (store === false) return;
         await (store.deleteProbe === undefined
           ? store.persist(state)
-          : store.deleteProbe(state, id));
+          : store.deleteProbe(state, id, principal));
       },
     );
     return reply.status(204).send();
   });
 
   app.get("/v1/probes", async (request) => {
-    requireOperator(request);
+    const principal = requireOperator(request);
     const { serviceId } = listProbeQuerySchema.parse(request.query);
-    return { probes: state.listProbes(serviceId) };
+    return { probes: state.listProbes(serviceId, principal) };
   });
 
   app.get("/v1/services", async (request) => {
-    requireOperator(request);
+    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
-    return { services: state.listServices() };
+    return { services: state.listServices(principal) };
   });
 
   app.get("/v1/ping", async (request) => {
@@ -1652,9 +1901,9 @@ export async function buildBroker(
   });
 
   app.get("/v1/safety", async (request) => {
-    requireOperator(request);
+    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
-    return state.safetyOverview();
+    return state.safetyOverview(45_000, principal);
   });
 
   app.post("/v1/service-credentials", async (request, reply) => {
@@ -1730,29 +1979,32 @@ export async function buildBroker(
     "/v1/services/:serviceId/probes",
     async (request) => {
       const { serviceId } = pollParamsSchema.parse(request.params);
-      requireServiceAccess(request, serviceId);
+      const principal = requireServiceAccess(request, serviceId);
       const { since, commitSha } = pollQuerySchema.parse(request.query);
-      return state.pollProbes(serviceId, since, commitSha);
+      return state.pollProbes(serviceId, since, commitSha, principal);
     },
   );
 
   app.post("/v1/source-maps/status", async (request) => {
     emptyQuerySchema.parse(request.query);
     const input = sourceMapStatusSchema.parse(request.body);
-    requireServiceAccess(request, input.serviceId);
+    const principal = requireServiceAccess(request, input.serviceId);
     const previousMapCount =
-      state.getSourceMapSet(input.serviceId, input.commitSha)?.maps.length ?? 0;
+      state.getSourceMapSet(input.serviceId, input.commitSha, principal)?.maps
+        .length ?? 0;
     const status = state.sourceMapStatus(
       input.serviceId,
       input.commitSha,
       input.uploaderId,
+      principal,
     );
     if (
       previousMapCount > 0 &&
       status.isUploader &&
-      state.getSourceMapSet(input.serviceId, input.commitSha)?.maps.length === 0
+      state.getSourceMapSet(input.serviceId, input.commitSha, principal)?.maps
+        .length === 0
     ) {
-      await persistSourceMapSet(input.serviceId, input.commitSha);
+      await persistSourceMapSet(input.serviceId, input.commitSha, principal);
     }
     return status;
   });
@@ -1760,10 +2012,11 @@ export async function buildBroker(
   app.post("/v1/source-maps/upload", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = sourceMapUploadSchema.parse(request.body);
-    requireServiceAccess(request, input.serviceId);
+    const principal = requireServiceAccess(request, input.serviceId);
     await mutateDurably(
-      () => state.uploadSourceMap(input),
-      async () => persistSourceMapSet(input.serviceId, input.commitSha),
+      () => state.uploadSourceMap(input, principal),
+      async () =>
+        persistSourceMapSet(input.serviceId, input.commitSha, principal),
     );
     return reply.status(202).send({ accepted: true });
   });
@@ -1771,15 +2024,17 @@ export async function buildBroker(
   app.post("/v1/source-maps/complete", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = sourceMapStatusSchema.parse(request.body);
-    requireServiceAccess(request, input.serviceId);
+    const principal = requireServiceAccess(request, input.serviceId);
     await mutateDurably(
       () =>
         state.completeSourceMaps(
           input.serviceId,
           input.commitSha,
           input.uploaderId,
+          principal,
         ),
-      async () => persistSourceMapSet(input.serviceId, input.commitSha),
+      async () =>
+        persistSourceMapSet(input.serviceId, input.commitSha, principal),
     );
     return reply.status(202).send({ complete: true });
   });
@@ -1787,25 +2042,25 @@ export async function buildBroker(
   app.post("/v1/ingest", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = IngestSchema.parse(request.body);
-    requireServiceAccess(request, input.serviceId);
+    const principal = requireServiceAccess(request, input.serviceId);
     const accepted = await mutateDurably(
-      () => state.ingest(input),
+      () => state.ingest(input, principal),
       async () => {
         if (store === false) return;
         await (store.persistIngest === undefined
           ? store.persist(state)
-          : store.persistIngest(state, input));
+          : store.persistIngest(state, input, principal));
       },
     );
     return reply.status(202).send({ accepted });
   });
 
   app.get("/v1/probes/:id/data", async (request, reply) => {
-    requireOperator(request);
+    const principal = requireOperator(request);
     const { id } = probeParamsSchema.parse(request.params);
     const query = dataQuerySchema.parse(request.query);
     const waitSeconds = Math.min(30, Math.max(0, query.waitSeconds));
-    let probe = state.getProbe(id);
+    let probe = state.getProbe(id, principal);
     if (probe === undefined) {
       throw new BrokerHttpError(404, "not_found", `probe ${id} was not found`);
     }
@@ -1827,7 +2082,7 @@ export async function buildBroker(
         request.raw.off("aborted", abort);
         request.raw.socket.off("close", abort);
       }
-      probe = state.getProbe(id);
+      probe = state.getProbe(id, principal);
       if (probe === undefined) {
         throw new BrokerHttpError(
           404,
@@ -1839,8 +2094,8 @@ export async function buildBroker(
 
     return reply.send({
       probe,
-      status: state.getStatus(id),
-      events: state.getEvents(id),
+      status: state.getStatus(id, principal),
+      events: state.getEvents(id, principal),
     });
   });
 

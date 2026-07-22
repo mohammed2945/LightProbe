@@ -14,10 +14,16 @@ import {
   PostgresStore,
   buildBroker,
   createServiceCredentialMaterial,
+  type BrokerPrincipal,
   type ProbeDefinition,
 } from "../src/index.js";
 
 const openBrokers: Awaited<ReturnType<typeof buildBroker>>[] = [];
+const DEFAULT_SCOPE = {
+  tenantId: DEFAULT_TENANT_ID,
+  projectId: DEFAULT_PROJECT_ID,
+  environmentId: DEFAULT_ENVIRONMENT_ID,
+};
 
 afterEach(async () => {
   await Promise.all(openBrokers.splice(0).map((broker) => broker.close()));
@@ -186,6 +192,241 @@ describe("broker validation and storage", () => {
       headers: { authorization: "Bearer retired-fixture-key" },
     });
     expect(rejected.statusCode).toBe(401);
+  });
+
+  it("requires a valid token when external bearer authentication is configured", async () => {
+    const principal: BrokerPrincipal = {
+      type: "user",
+      role: "operator",
+      principalId: "user-alpha",
+      tenantId: "tenant-alpha",
+      projectId: "project-alpha",
+      environmentId: "production",
+    };
+    const broker = await buildBroker({
+      authenticateBearer: async (token) =>
+        token === "alpha-token" ? principal : undefined,
+    });
+    openBrokers.push(broker);
+
+    const anonymous = await broker.inject({ method: "GET", url: "/v1/ping" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const invalid = await broker.inject({
+      method: "GET",
+      url: "/v1/ping",
+      headers: { authorization: "Bearer invalid-token" },
+    });
+    expect(invalid.statusCode).toBe(401);
+
+    const valid = await broker.inject({
+      method: "GET",
+      url: "/v1/ping",
+      headers: { authorization: "Bearer alpha-token" },
+    });
+    expect(valid.statusCode).toBe(200);
+  });
+
+  it("isolates broker resources between external user principals", async () => {
+    const principals: Record<string, BrokerPrincipal> = {
+      "alpha-token": {
+        type: "user",
+        role: "operator",
+        principalId: "user-alpha",
+        tenantId: "tenant-alpha",
+        projectId: "shared-project",
+        environmentId: "production",
+      },
+      "beta-token": {
+        type: "user",
+        role: "operator",
+        principalId: "user-beta",
+        tenantId: "tenant-beta",
+        projectId: "shared-project",
+        environmentId: "production",
+      },
+    };
+    const broker = await buildBroker({
+      authenticateBearer: async (token) => principals[token],
+    });
+    openBrokers.push(broker);
+    const alphaHeaders = { authorization: "Bearer alpha-token" };
+    const betaHeaders = { authorization: "Bearer beta-token" };
+    const probePayload = {
+      serviceId: "orders",
+      type: "counter",
+      file: "src/orders.ts",
+      line: 19,
+      createdBy: "test",
+    };
+
+    const alphaCreated = await broker.inject({
+      method: "POST",
+      url: "/v1/probes",
+      headers: alphaHeaders,
+      payload: probePayload,
+    });
+    const betaCreated = await broker.inject({
+      method: "POST",
+      url: "/v1/probes",
+      headers: betaHeaders,
+      payload: probePayload,
+    });
+    expect(alphaCreated.statusCode).toBe(201);
+    expect(betaCreated.statusCode).toBe(201);
+    const alphaProbe = alphaCreated.json<{ probe: ProbeDefinition }>().probe;
+    const betaProbe = betaCreated.json<{ probe: ProbeDefinition }>().probe;
+
+    const alphaListed = await broker.inject({
+      method: "GET",
+      url: "/v1/probes?serviceId=orders",
+      headers: alphaHeaders,
+    });
+    const betaListed = await broker.inject({
+      method: "GET",
+      url: "/v1/probes?serviceId=orders",
+      headers: betaHeaders,
+    });
+    expect(alphaListed.json()).toMatchObject({
+      probes: [{ probe: { id: alphaProbe.id, version: 1 } }],
+    });
+    expect(betaListed.json()).toMatchObject({
+      probes: [{ probe: { id: betaProbe.id, version: 1 } }],
+    });
+
+    const crossTenantIngest = await broker.inject({
+      method: "POST",
+      url: "/v1/ingest",
+      headers: alphaHeaders,
+      payload: {
+        serviceId: "orders",
+        sdk: "node",
+        commitSha: "aaaaaaaaaaaaaaa1",
+        commitSource: "config",
+        agentStatus: { state: "green" },
+        events: [
+          {
+            probeId: betaProbe.id,
+            type: "counter",
+            ts: "2026-07-22T20:00:00.000Z",
+            delta: 1,
+          },
+        ],
+      },
+    });
+    expect(crossTenantIngest.statusCode).toBe(400);
+    expect(crossTenantIngest.json()).toMatchObject({
+      error: { code: "invalid_request" },
+    });
+
+    for (const [headers, probe, commitSha] of [
+      [alphaHeaders, alphaProbe, "aaaaaaaaaaaaaaa1"],
+      [betaHeaders, betaProbe, "bbbbbbbbbbbbbbb2"],
+    ] as const) {
+      const ingested = await broker.inject({
+        method: "POST",
+        url: "/v1/ingest",
+        headers,
+        payload: {
+          serviceId: "orders",
+          sdk: "node",
+          commitSha,
+          commitSource: "config",
+          agentStatus: { state: "green" },
+          events: [
+            {
+              probeId: probe.id,
+              type: "counter",
+              ts: "2026-07-22T20:00:01.000Z",
+              delta: 1,
+            },
+          ],
+        },
+      });
+      expect(ingested.statusCode).toBe(202);
+    }
+
+    const alphaServices = await broker.inject({
+      method: "GET",
+      url: "/v1/services",
+      headers: alphaHeaders,
+    });
+    const betaServices = await broker.inject({
+      method: "GET",
+      url: "/v1/services",
+      headers: betaHeaders,
+    });
+    expect(alphaServices.json()).toMatchObject({
+      services: [{ serviceId: "orders", commitSha: "aaaaaaaaaaaaaaa1" }],
+    });
+    expect(betaServices.json()).toMatchObject({
+      services: [{ serviceId: "orders", commitSha: "bbbbbbbbbbbbbbb2" }],
+    });
+
+    const hiddenData = await broker.inject({
+      method: "GET",
+      url: `/v1/probes/${betaProbe.id}/data`,
+      headers: alphaHeaders,
+    });
+    expect(hiddenData.statusCode).toBe(404);
+
+    const sourceMapIdentity = {
+      serviceId: "orders",
+      commitSha: "aaaaaaaaaaaaaaa1",
+      uploaderId: "shared-uploader-id",
+    };
+    await broker.inject({
+      method: "POST",
+      url: "/v1/source-maps/status",
+      headers: alphaHeaders,
+      payload: sourceMapIdentity,
+    });
+    const uploaded = await broker.inject({
+      method: "POST",
+      url: "/v1/source-maps/upload",
+      headers: alphaHeaders,
+      payload: {
+        ...sourceMapIdentity,
+        mapPath: "dist/orders.js.map",
+        map: {
+          version: 3,
+          file: "orders.js",
+          sources: ["../src/orders.ts"],
+          names: [],
+          mappings: ";;;AACA",
+        },
+      },
+    });
+    expect(uploaded.statusCode).toBe(202);
+    await broker.inject({
+      method: "POST",
+      url: "/v1/source-maps/complete",
+      headers: alphaHeaders,
+      payload: sourceMapIdentity,
+    });
+    const betaMapStatus = await broker.inject({
+      method: "POST",
+      url: "/v1/source-maps/status",
+      headers: betaHeaders,
+      payload: sourceMapIdentity,
+    });
+    expect(betaMapStatus.json()).toEqual({
+      isUploader: true,
+      isComplete: false,
+    });
+
+    const removed = await broker.inject({
+      method: "DELETE",
+      url: `/v1/probes/${alphaProbe.id}`,
+      headers: alphaHeaders,
+    });
+    expect(removed.statusCode).toBe(204);
+    const betaUnchanged = await broker.inject({
+      method: "GET",
+      url: "/v1/services/orders/probes?since=1",
+      headers: betaHeaders,
+    });
+    expect(betaUnchanged.json()).toEqual({ version: 1, unchanged: true });
   });
 
   it("rejects more than two configured bearer keys", async () => {
@@ -866,6 +1107,74 @@ describe("TTL and configurable persistence", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("loads legacy snapshots into the default resource scope", () => {
+    const now = Date.parse("2026-07-22T20:00:00.000Z");
+    const probe = createCounter(new BrokerState());
+    const state = new BrokerState({ clock: () => now });
+    state.loadSnapshot({
+      formatVersion: 1,
+      savedAt: "2026-07-22T19:59:00.000Z",
+      probes: [
+        {
+          probe,
+          expiresAt: now + 1_800_000,
+          expired: false,
+        },
+      ],
+      serviceVersions: [["orders", 1]],
+      events: [
+        {
+          probeId: probe.id,
+          values: [
+            {
+              probeId: probe.id,
+              type: "counter",
+              ts: "2026-07-22T19:59:30.000Z",
+              delta: 2,
+            },
+          ],
+        },
+      ],
+      services: [
+        {
+          serviceId: "orders",
+          lastSeen: "2026-07-22T19:59:45.000Z",
+          sdk: "node",
+          commitSha: "abcdef1234567890",
+          commitSource: "config",
+          agentStatus: { state: "green" },
+        },
+      ],
+      statuses: [
+        [
+          probe.id,
+          {
+            status: "armed",
+            updatedAt: "2026-07-22T19:59:30.000Z",
+          },
+        ],
+      ],
+      sourceMapSets: [],
+    });
+
+    expect(state.snapshot()).toMatchObject({
+      formatVersion: 2,
+      probes: [{ scope: DEFAULT_SCOPE, probe: { id: probe.id } }],
+      serviceVersions: [
+        {
+          ...DEFAULT_SCOPE,
+          serviceId: "orders",
+          version: 1,
+        },
+      ],
+      events: [{ scope: DEFAULT_SCOPE, probeId: probe.id }],
+      services: [{ ...DEFAULT_SCOPE, serviceId: "orders" }],
+      statuses: [{ scope: DEFAULT_SCOPE, probeId: probe.id }],
+    });
+    expect(state.getEvents(probe.id)).toHaveLength(1);
+    expect(state.getStatus(probe.id)).toMatchObject({ status: "armed" });
+  });
 });
 
 const postgresIt =
@@ -1083,7 +1392,7 @@ describe("Postgres persistence", () => {
     await inspection.end();
   });
 
-  postgresIt("backfills ownership while upgrading an existing schema", async () => {
+  postgresIt("upgrades retained scoped records to composite tenant keys", async () => {
     const databaseUrl = process.env["TEST_DATABASE_URL"] as string;
     await resetPostgresSchema(databaseUrl);
 
@@ -1094,37 +1403,53 @@ describe("Postgres persistence", () => {
     const legacy = new Client({ connectionString: databaseUrl });
     await legacy.connect();
     try {
-      await legacy.query(
-        `insert into services (service_id, last_seen, sdk)
-         values ('legacy-service', now(), 'node')`,
-      );
       await legacy.query(`
-        drop table service_credentials;
-        drop table environments, projects, tenants cascade;
-        alter table services
-          drop column tenant_id,
-          drop column project_id,
-          drop column environment_id;
-        alter table probes
-          drop column tenant_id,
-          drop column project_id,
-          drop column environment_id;
-        alter table probe_events drop column tenant_id;
-        alter table probe_statuses drop column tenant_id;
-        alter table service_versions
-          drop column tenant_id,
-          drop column project_id,
-          drop column environment_id;
-        alter table source_map_sets
-          drop column tenant_id,
-          drop column project_id,
-          drop column environment_id;
-        alter table source_maps
-          drop column tenant_id,
-          drop column project_id,
-          drop column environment_id;
+        do $drop_source_map_fks$
+        declare
+          source_map_fk record;
+        begin
+          for source_map_fk in
+            select conname from pg_constraint
+            where conrelid = 'source_maps'::regclass
+              and confrelid = 'source_map_sets'::regclass
+              and contype = 'f'
+          loop
+            execute format(
+              'alter table source_maps drop constraint %I',
+              source_map_fk.conname
+            );
+          end loop;
+        end
+        $drop_source_map_fks$;
+        alter table services drop constraint services_pkey;
+        alter table services add primary key (service_id);
+        alter table service_versions drop constraint service_versions_pkey;
+        alter table service_versions add primary key (service_id);
+        alter table source_map_sets drop constraint source_map_sets_pkey;
+        alter table source_map_sets add primary key (service_id, commit_sha);
+        alter table source_maps drop constraint source_maps_pkey;
+        alter table source_maps add primary key (
+          service_id, commit_sha, map_path
+        );
+        alter table source_maps add foreign key (service_id, commit_sha)
+          references source_map_sets(service_id, commit_sha) on delete cascade;
+
+        insert into services (service_id, last_seen, sdk)
+        values ('legacy-service', now(), 'node');
+        insert into service_versions (service_id, version)
+        values ('legacy-service', 3);
+        insert into source_map_sets (
+          service_id, commit_sha, complete, updated_at
+        ) values ('legacy-service', 'abcdef1234567890', true, now());
+        insert into source_maps (
+          service_id, commit_sha, map_path, source_map, uploaded_at
+        ) values (
+          'legacy-service', 'abcdef1234567890', 'dist/legacy.js.map',
+          '{"version":3,"sources":[],"names":[],"mappings":""}', now()
+        );
+
         delete from liveprobe_schema_migrations;
-        insert into liveprobe_schema_migrations (version) values (2);
+        insert into liveprobe_schema_migrations (version) values (4);
       `);
     } finally {
       await legacy.end();
@@ -1175,10 +1500,196 @@ describe("Postgres persistence", () => {
       const versions = await inspection.query<{ version: number }>(
         `select version from liveprobe_schema_migrations order by version`,
       );
-      expect(versions.rows.map(({ version }) => version)).toEqual([2, 4]);
+      expect(versions.rows.map(({ version }) => version)).toEqual([4, 5]);
+
+      await inspection.query(`
+        insert into tenants (tenant_id, display_name)
+        values ('second-tenant', 'Second tenant');
+        insert into projects (tenant_id, project_id, display_name)
+        values ('second-tenant', 'default', 'Default');
+        insert into environments (
+          tenant_id, project_id, environment_id, display_name
+        ) values ('second-tenant', 'default', 'default', 'Default');
+        insert into services (
+          tenant_id, project_id, environment_id, service_id, last_seen, sdk
+        ) values (
+          'second-tenant', 'default', 'default', 'legacy-service', now(), 'node'
+        );
+        insert into service_versions (
+          tenant_id, project_id, environment_id, service_id, version
+        ) values (
+          'second-tenant', 'default', 'default', 'legacy-service', 1
+        );
+        insert into source_map_sets (
+          tenant_id, project_id, environment_id, service_id, commit_sha,
+          complete, updated_at
+        ) values (
+          'second-tenant', 'default', 'default', 'legacy-service',
+          'abcdef1234567890', true, now()
+        );
+        insert into source_maps (
+          tenant_id, project_id, environment_id, service_id, commit_sha,
+          map_path, source_map, uploaded_at
+        ) values (
+          'second-tenant', 'default', 'default', 'legacy-service',
+          'abcdef1234567890', 'dist/legacy.js.map',
+          '{"version":3,"sources":[],"names":[],"mappings":""}', now()
+        );
+      `);
+      const duplicateServices = await inspection.query<{ count: string }>(
+        `select count(*) from services where service_id = 'legacy-service'`,
+      );
+      expect(duplicateServices.rows[0]?.count).toBe("2");
+      const duplicateMapSets = await inspection.query<{ count: string }>(
+        `select count(*) from source_map_sets
+         where service_id = 'legacy-service'
+           and commit_sha = 'abcdef1234567890'`,
+      );
+      expect(duplicateMapSets.rows[0]?.count).toBe("2");
     } finally {
       await inspection.end();
     }
+  });
+
+  postgresIt("persists and restores isolated tenant resources", async () => {
+    const databaseUrl = process.env["TEST_DATABASE_URL"] as string;
+    await resetPostgresSchema(databaseUrl);
+
+    const bootstrap = new PostgresStore(databaseUrl);
+    await bootstrap.restore(new BrokerState());
+    await bootstrap.close();
+
+    const catalog = new Client({ connectionString: databaseUrl });
+    await catalog.connect();
+    try {
+      await catalog.query(`
+        insert into tenants (tenant_id, display_name)
+        values ('tenant-beta', 'Tenant beta');
+        insert into projects (tenant_id, project_id, display_name)
+        values ('tenant-beta', 'default', 'Default');
+        insert into environments (
+          tenant_id, project_id, environment_id, display_name
+        ) values ('tenant-beta', 'default', 'default', 'Default');
+      `);
+    } finally {
+      await catalog.end();
+    }
+
+    const principals: Record<string, BrokerPrincipal> = {
+      "alpha-token": {
+        type: "user",
+        role: "operator",
+        principalId: "user-alpha",
+        ...DEFAULT_SCOPE,
+      },
+      "beta-token": {
+        type: "user",
+        role: "operator",
+        principalId: "user-beta",
+        tenantId: "tenant-beta",
+        projectId: "default",
+        environmentId: "default",
+      },
+    };
+    const authenticateBearer = async (
+      token: string,
+    ): Promise<BrokerPrincipal | undefined> => principals[token];
+    const first = await buildBroker({
+      store: new PostgresStore(databaseUrl),
+      authenticateBearer,
+    });
+    openBrokers.push(first);
+    const alphaHeaders = { authorization: "Bearer alpha-token" };
+    const betaHeaders = { authorization: "Bearer beta-token" };
+
+    const created: Array<{
+      headers: typeof alphaHeaders;
+      probe: ProbeDefinition;
+      commitSha: string;
+    }> = [];
+    for (const [headers, commitSha] of [
+      [alphaHeaders, "aaaaaaaaaaaaaaa1"],
+      [betaHeaders, "bbbbbbbbbbbbbbb2"],
+    ] as const) {
+      const response = await first.inject({
+        method: "POST",
+        url: "/v1/probes",
+        headers,
+        payload: {
+          serviceId: "orders",
+          type: "counter",
+          file: "src/orders.ts",
+          line: 19,
+          createdBy: "test",
+        },
+      });
+      expect(response.statusCode).toBe(201);
+      const probe = response.json<{ probe: ProbeDefinition }>().probe;
+      const ingest = await first.inject({
+        method: "POST",
+        url: "/v1/ingest",
+        headers,
+        payload: {
+          serviceId: "orders",
+          sdk: "node",
+          commitSha,
+          commitSource: "config",
+          agentStatus: { state: "green" },
+          events: [
+            {
+              probeId: probe.id,
+              type: "counter",
+              ts: "2026-07-22T20:00:01.000Z",
+              delta: 1,
+            },
+          ],
+        },
+      });
+      expect(ingest.statusCode).toBe(202);
+      created.push({ headers, probe, commitSha });
+    }
+
+    await first.close();
+    openBrokers.splice(openBrokers.indexOf(first), 1);
+
+    const restored = await buildBroker({
+      store: new PostgresStore(databaseUrl),
+      authenticateBearer,
+    });
+    openBrokers.push(restored);
+    for (const entry of created) {
+      const probes = await restored.inject({
+        method: "GET",
+        url: "/v1/probes?serviceId=orders",
+        headers: entry.headers,
+      });
+      expect(probes.json()).toMatchObject({
+        probes: [{ probe: { id: entry.probe.id } }],
+      });
+      const services = await restored.inject({
+        method: "GET",
+        url: "/v1/services",
+        headers: entry.headers,
+      });
+      expect(services.json()).toMatchObject({
+        services: [{ serviceId: "orders", commitSha: entry.commitSha }],
+      });
+      const data = await restored.inject({
+        method: "GET",
+        url: `/v1/probes/${entry.probe.id}/data`,
+        headers: entry.headers,
+      });
+      expect(data.json()).toMatchObject({
+        probe: { id: entry.probe.id },
+        events: [{ probeId: entry.probe.id, delta: 1 }],
+      });
+    }
+    const hidden = await restored.inject({
+      method: "GET",
+      url: `/v1/probes/${created[1]?.probe.id}/data`,
+      headers: alphaHeaders,
+    });
+    expect(hidden.statusCode).toBe(404);
   });
 
   postgresIt("creates, scopes, and revokes hashed service credentials", async () => {

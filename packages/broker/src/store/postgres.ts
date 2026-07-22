@@ -12,6 +12,9 @@ import {
 } from "./migrations.js";
 
 interface ServiceRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
   service_id: string;
   last_seen: Date;
   sdk: "node" | "python" | "jvm" | null;
@@ -21,22 +24,30 @@ interface ServiceRow extends QueryResultRow {
 }
 
 interface ProbeRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
   definition: unknown;
   expires_at: Date;
   expired: boolean;
 }
 
 interface VersionRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
   service_id: string;
   version: number;
 }
 
 interface EventRow extends QueryResultRow {
+  tenant_id: string;
   probe_id: string;
   event: unknown;
 }
 
 interface StatusRow extends QueryResultRow {
+  tenant_id: string;
   probe_id: string;
   status: string;
   updated_at: Date;
@@ -44,6 +55,9 @@ interface StatusRow extends QueryResultRow {
 }
 
 interface SourceMapSetRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
   service_id: string;
   commit_sha: string;
   complete: boolean;
@@ -51,6 +65,9 @@ interface SourceMapSetRow extends QueryResultRow {
 }
 
 interface SourceMapRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
   service_id: string;
   commit_sha: string;
   map_path: string;
@@ -132,31 +149,35 @@ export class PostgresStore {
     let restoredLegacySnapshot = false;
     try {
       const services = await client.query<ServiceRow>(
-        `select service_id, last_seen, sdk, commit_sha, commit_source, agent_status
+        `select tenant_id, project_id, environment_id, service_id, last_seen,
+           sdk, commit_sha, commit_source, agent_status
          from services order by service_id`,
       );
       const probes = await client.query<ProbeRow>(
-        `select definition, expires_at, expired
+        `select tenant_id, project_id, environment_id, definition,
+           expires_at, expired
          from probes order by probe_id`,
       );
       const versions = await client.query<VersionRow>(
-        `select service_id, version
+        `select tenant_id, project_id, environment_id, service_id, version
          from service_versions order by service_id`,
       );
       const events = await client.query<EventRow>(
-        `select probe_id, event
+        `select tenant_id, probe_id, event
          from probe_events order by probe_id, sequence`,
       );
       const statuses = await client.query<StatusRow>(
-        `select probe_id, status, updated_at, detail
+        `select tenant_id, probe_id, status, updated_at, detail
          from probe_statuses order by probe_id`,
       );
       const sourceMapSets = await client.query<SourceMapSetRow>(
-        `select service_id, commit_sha, complete, updated_at
+        `select tenant_id, project_id, environment_id, service_id,
+           commit_sha, complete, updated_at
          from source_map_sets order by service_id, commit_sha`,
       );
       const sourceMaps = await client.query<SourceMapRow>(
-        `select service_id, commit_sha, map_path, source_map, uploaded_at
+        `select tenant_id, project_id, environment_id, service_id, commit_sha,
+           map_path, source_map, uploaded_at
          from source_maps order by service_id, commit_sha, map_path`,
       );
 
@@ -185,29 +206,59 @@ export class PostgresStore {
         eventsByProbe.set(row.probe_id, values);
       }
 
+      const scopeByProbe = new Map(
+        probes.rows.map((row) => [
+          (row.definition as { id?: unknown }).id,
+          {
+            tenantId: row.tenant_id,
+            projectId: row.project_id,
+            environmentId: row.environment_id,
+          },
+        ]),
+      );
+
       const mapsBySet = new Map<string, SourceMapRow[]>();
       for (const row of sourceMaps.rows) {
-        const key = `${row.service_id}\u0000${row.commit_sha}`;
+        const key = JSON.stringify([
+          row.tenant_id,
+          row.project_id,
+          row.environment_id,
+          row.service_id,
+          row.commit_sha,
+        ]);
         const maps = mapsBySet.get(key) ?? [];
         maps.push(row);
         mapsBySet.set(key, maps);
       }
 
       state.loadSnapshot({
-        formatVersion: 1,
+        formatVersion: 2,
         savedAt: new Date().toISOString(),
         probes: probes.rows.map((row) => ({
+          scope: {
+            tenantId: row.tenant_id,
+            projectId: row.project_id,
+            environmentId: row.environment_id,
+          },
           probe: row.definition,
           expiresAt: row.expires_at.getTime(),
           expired: row.expired,
         })),
-        serviceVersions: versions.rows.map((row) => [
-          row.service_id,
-          row.version,
-        ]),
+        serviceVersions: versions.rows.map((row) => ({
+          tenantId: row.tenant_id,
+          projectId: row.project_id,
+          environmentId: row.environment_id,
+          serviceId: row.service_id,
+          version: row.version,
+        })),
         events: probes.rows.map((row) => {
           const definition = row.definition as { id?: unknown };
           return {
+            scope: {
+              tenantId: row.tenant_id,
+              projectId: row.project_id,
+              environmentId: row.environment_id,
+            },
             probeId: definition.id,
             values:
               typeof definition.id === "string"
@@ -216,6 +267,9 @@ export class PostgresStore {
           };
         }),
         services: services.rows.map((row) => ({
+          tenantId: row.tenant_id,
+          projectId: row.project_id,
+          environmentId: row.environment_id,
           serviceId: row.service_id,
           lastSeen: row.last_seen.toISOString(),
           ...(row.sdk === null ? {} : { sdk: row.sdk }),
@@ -229,20 +283,30 @@ export class PostgresStore {
             ? {}
             : { agentStatus: row.agent_status }),
         })),
-        statuses: statuses.rows.map((row) => [
-          row.probe_id,
-          {
+        statuses: statuses.rows.map((row) => ({
+          scope: scopeByProbe.get(row.probe_id),
+          probeId: row.probe_id,
+          value: {
             status: row.status,
             updatedAt: row.updated_at.toISOString(),
             ...(row.detail === null ? {} : { detail: row.detail }),
           },
-        ]),
+        })),
         sourceMapSets: sourceMapSets.rows.map((row) => ({
+          tenantId: row.tenant_id,
+          projectId: row.project_id,
+          environmentId: row.environment_id,
           serviceId: row.service_id,
           commitSha: row.commit_sha,
           complete: row.complete,
           updatedAt: row.updated_at.toISOString(),
-          maps: (mapsBySet.get(`${row.service_id}\u0000${row.commit_sha}`) ?? [])
+          maps: (mapsBySet.get(JSON.stringify([
+            row.tenant_id,
+            row.project_id,
+            row.environment_id,
+            row.service_id,
+            row.commit_sha,
+          ])) ?? [])
             .map((map) => ({
               mapPath: map.map_path,
               map: map.source_map,
@@ -281,13 +345,27 @@ export class PostgresStore {
     }
   }
 
-  public async persistProbe(state: BrokerState, probeId: string): Promise<void> {
+  public async persistProbe(
+    state: BrokerState,
+    probeId: string,
+    scope: ResourceScope,
+  ): Promise<void> {
     const snapshot = state.snapshot();
-    const probes = snapshot.probes.filter(({ probe }) => probe.id === probeId);
+    const probes = snapshot.probes.filter(
+      (stored) =>
+        stored.probe.id === probeId &&
+        stored.scope.tenantId === scope.tenantId &&
+        stored.scope.projectId === scope.projectId &&
+        stored.scope.environmentId === scope.environmentId,
+    );
     if (probes.length === 0) return;
     const serviceId = probes[0]?.probe.serviceId;
     const versions = snapshot.serviceVersions.filter(
-      ([candidate]) => candidate === serviceId,
+      (candidate) =>
+        candidate.serviceId === serviceId &&
+        candidate.tenantId === scope.tenantId &&
+        candidate.projectId === scope.projectId &&
+        candidate.environmentId === scope.environmentId,
     );
     await this.withTransaction(async (client) => {
       await this.insertProbes(client, probes);
@@ -295,10 +373,18 @@ export class PostgresStore {
     });
   }
 
-  public async deleteProbe(state: BrokerState, probeId: string): Promise<void> {
+  public async deleteProbe(
+    state: BrokerState,
+    probeId: string,
+    scope: ResourceScope,
+  ): Promise<void> {
     const snapshot = state.snapshot();
     await this.withTransaction(async (client) => {
-      await client.query("delete from probes where probe_id = $1", [probeId]);
+      await client.query(
+        `delete from probes where probe_id = $1 and tenant_id = $2
+           and project_id = $3 and environment_id = $4`,
+        [probeId, scope.tenantId, scope.projectId, scope.environmentId],
+      );
       await this.insertVersions(client, snapshot.serviceVersions);
     });
   }
@@ -306,24 +392,39 @@ export class PostgresStore {
   public async persistIngest(
     state: BrokerState,
     input: IngestInput,
+    scope: ResourceScope,
   ): Promise<void> {
     const snapshot = state.snapshot();
     const services = snapshot.services.filter(
-      ({ serviceId }) => serviceId === input.serviceId,
+      (service) =>
+        service.serviceId === input.serviceId &&
+        service.tenantId === scope.tenantId &&
+        service.projectId === scope.projectId &&
+        service.environmentId === scope.environmentId,
     );
     const probeIds = [...new Set(input.events.map(({ probeId }) => probeId))];
-    const events = snapshot.events.filter(({ probeId }) =>
-      probeIds.includes(probeId),
+    const events = snapshot.events.filter(
+      (entry) =>
+        probeIds.includes(entry.probeId) &&
+        entry.scope.tenantId === scope.tenantId &&
+        entry.scope.projectId === scope.projectId &&
+        entry.scope.environmentId === scope.environmentId,
     );
-    const statuses = snapshot.statuses.filter(([probeId]) =>
-      probeIds.includes(probeId),
+    const statuses = snapshot.statuses.filter(
+      (entry) =>
+        probeIds.includes(entry.probeId) &&
+        entry.scope.tenantId === scope.tenantId &&
+        entry.scope.projectId === scope.projectId &&
+        entry.scope.environmentId === scope.environmentId,
     );
     await this.withTransaction(async (client) => {
       await this.insertServices(client, services);
       if (probeIds.length > 0) {
-        await client.query("delete from probe_events where probe_id = any($1::text[])", [
-          probeIds,
-        ]);
+        await client.query(
+          `delete from probe_events where probe_id = any($1::text[])
+             and tenant_id = $2`,
+          [probeIds, scope.tenantId],
+        );
       }
       await this.insertEvents(client, events);
       await this.insertStatuses(client, statuses);
@@ -334,8 +435,9 @@ export class PostgresStore {
     state: BrokerState,
     serviceId: string,
     commitSha: string,
+    scope: ResourceScope,
   ): Promise<void> {
-    const set = state.getSourceMapSet(serviceId, commitSha);
+    const set = state.getSourceMapSet(serviceId, commitSha, scope);
     if (set === undefined) return;
     await this.ensureMigrated();
     const client = await this.pool.connect();
@@ -344,31 +446,54 @@ export class PostgresStore {
       await client.query("select pg_advisory_xact_lock($1)", [1_276_638_214]);
       await client.query(
         `insert into source_map_sets (
-           service_id, commit_sha, complete, updated_at
-         ) values ($1, $2, $3, $4::timestamptz)
-         on conflict (service_id, commit_sha) do update set
+           tenant_id, project_id, environment_id, service_id, commit_sha,
+           complete, updated_at
+         ) values ($1, $2, $3, $4, $5, $6, $7::timestamptz)
+         on conflict (
+           tenant_id, project_id, environment_id, service_id, commit_sha
+         ) do update set
            complete = excluded.complete,
            updated_at = excluded.updated_at`,
-        [set.serviceId, set.commitSha, set.complete, set.updatedAt],
+        [
+          set.tenantId,
+          set.projectId,
+          set.environmentId,
+          set.serviceId,
+          set.commitSha,
+          set.complete,
+          set.updatedAt,
+        ],
       );
       await client.query(
-        `delete from source_maps where service_id = $1 and commit_sha = $2`,
-        [set.serviceId, set.commitSha],
+        `delete from source_maps where tenant_id = $1 and project_id = $2
+           and environment_id = $3 and service_id = $4 and commit_sha = $5`,
+        [
+          set.tenantId,
+          set.projectId,
+          set.environmentId,
+          set.serviceId,
+          set.commitSha,
+        ],
       );
       if (set.maps.length > 0) {
         await client.query(
           `insert into source_maps (
-             service_id, commit_sha, map_path, source_map, uploaded_at
+             tenant_id, project_id, environment_id, service_id, commit_sha,
+             map_path, source_map, uploaded_at
            )
-           select service_id, commit_sha, map_path, source_map,
-             uploaded_at::timestamptz
+           select tenant_id, project_id, environment_id, service_id,
+             commit_sha, map_path, source_map, uploaded_at::timestamptz
            from jsonb_to_recordset($1::jsonb) as source_map(
-             service_id text, commit_sha text, map_path text,
-             source_map jsonb, uploaded_at text
+             tenant_id text, project_id text, environment_id text,
+             service_id text, commit_sha text, map_path text, source_map jsonb,
+             uploaded_at text
            )`,
           [
             JSON.stringify(
               set.maps.map((map) => ({
+                tenant_id: set.tenantId,
+                project_id: set.projectId,
+                environment_id: set.environmentId,
                 service_id: set.serviceId,
                 commit_sha: set.commitSha,
                 map_path: map.mapPath,
@@ -381,12 +506,25 @@ export class PostgresStore {
       }
       const retainedCommits = state
         .snapshot()
-        .sourceMapSets.filter((candidate) => candidate.serviceId === serviceId)
+        .sourceMapSets.filter(
+          (candidate) =>
+            candidate.tenantId === scope.tenantId &&
+            candidate.projectId === scope.projectId &&
+            candidate.environmentId === scope.environmentId &&
+            candidate.serviceId === serviceId,
+        )
         .map((candidate) => candidate.commitSha);
       await client.query(
         `delete from source_map_sets
-         where service_id = $1 and not (commit_sha = any($2::text[]))`,
-        [serviceId, retainedCommits],
+         where tenant_id = $1 and project_id = $2 and environment_id = $3
+           and service_id = $4 and not (commit_sha = any($5::text[]))`,
+        [
+          scope.tenantId,
+          scope.projectId,
+          scope.environmentId,
+          serviceId,
+          retainedCommits,
+        ],
       );
       await client.query("commit");
     } catch (error: unknown) {
@@ -500,15 +638,19 @@ export class PostgresStore {
     if (services.length === 0) return;
     await client.query(
       `insert into services (
-         service_id, last_seen, sdk, commit_sha, commit_source, agent_status
+         tenant_id, project_id, environment_id, service_id, last_seen, sdk,
+         commit_sha, commit_source, agent_status
        )
-       select service_id, last_seen::timestamptz, sdk, commit_sha,
-         commit_source, agent_status
+       select tenant_id, project_id, environment_id, service_id,
+         last_seen::timestamptz, sdk, commit_sha, commit_source, agent_status
        from jsonb_to_recordset($1::jsonb) as service(
-         service_id text, last_seen text, sdk text, commit_sha text,
-         commit_source text, agent_status jsonb
+         tenant_id text, project_id text, environment_id text, service_id text,
+         last_seen text, sdk text, commit_sha text, commit_source text,
+         agent_status jsonb
        )
-       on conflict (service_id) do update set
+       on conflict (
+         tenant_id, project_id, environment_id, service_id
+       ) do update set
          last_seen = excluded.last_seen,
          sdk = excluded.sdk,
          commit_sha = excluded.commit_sha,
@@ -517,6 +659,9 @@ export class PostgresStore {
       [
         JSON.stringify(
           services.map((service) => ({
+            tenant_id: service.tenantId,
+            project_id: service.projectId,
+            environment_id: service.environmentId,
             service_id: service.serviceId,
             last_seen: service.lastSeen,
             sdk: service.sdk ?? null,
@@ -536,15 +681,19 @@ export class PostgresStore {
     if (probes.length === 0) return;
     await client.query(
       `insert into probes (
-         probe_id, service_id, definition, expires_at, expired
+         tenant_id, project_id, environment_id, probe_id, service_id,
+         definition, expires_at, expired
        )
-       select probe_id, service_id, definition, expires_at::timestamptz,
-         expired
+       select tenant_id, project_id, environment_id, probe_id, service_id,
+         definition, expires_at::timestamptz, expired
        from jsonb_to_recordset($1::jsonb) as probe(
-         probe_id text, service_id text, definition jsonb,
-         expires_at text, expired boolean
+         tenant_id text, project_id text, environment_id text, probe_id text,
+         service_id text, definition jsonb, expires_at text, expired boolean
        )
        on conflict (probe_id) do update set
+         tenant_id = excluded.tenant_id,
+         project_id = excluded.project_id,
+         environment_id = excluded.environment_id,
          service_id = excluded.service_id,
          definition = excluded.definition,
          expires_at = excluded.expires_at,
@@ -552,6 +701,9 @@ export class PostgresStore {
       [
         JSON.stringify(
           probes.map((stored) => ({
+            tenant_id: stored.scope.tenantId,
+            project_id: stored.scope.projectId,
+            environment_id: stored.scope.environmentId,
             probe_id: stored.probe.id,
             service_id: stored.probe.serviceId,
             definition: stored.probe,
@@ -569,6 +721,7 @@ export class PostgresStore {
   ): Promise<void> {
     const rows = events.flatMap((entry) =>
       entry.values.slice(-500).map((event, sequence) => ({
+        tenant_id: entry.scope.tenantId,
         probe_id: entry.probeId,
         sequence,
         event_ts: event.ts,
@@ -577,12 +730,16 @@ export class PostgresStore {
     );
     if (rows.length === 0) return;
     await client.query(
-      `insert into probe_events (probe_id, sequence, event_ts, event)
-       select probe_id, sequence, event_ts::timestamptz, event
+      `insert into probe_events (
+         tenant_id, probe_id, sequence, event_ts, event
+       )
+       select tenant_id, probe_id, sequence, event_ts::timestamptz, event
        from jsonb_to_recordset($1::jsonb) as probe_event(
-         probe_id text, sequence integer, event_ts text, event jsonb
+         tenant_id text, probe_id text, sequence integer, event_ts text,
+         event jsonb
        )
        on conflict (probe_id, sequence) do update set
+         tenant_id = excluded.tenant_id,
          event_ts = excluded.event_ts,
          event = excluded.event`,
       [JSON.stringify(rows)],
@@ -596,23 +753,26 @@ export class PostgresStore {
     if (statuses.length === 0) return;
     await client.query(
       `insert into probe_statuses (
-         probe_id, status, updated_at, detail
+         tenant_id, probe_id, status, updated_at, detail
        )
-       select probe_id, status, updated_at::timestamptz, detail
+       select tenant_id, probe_id, status, updated_at::timestamptz, detail
        from jsonb_to_recordset($1::jsonb) as probe_status(
-         probe_id text, status text, updated_at text, detail text
+         tenant_id text, probe_id text, status text, updated_at text,
+         detail text
        )
        on conflict (probe_id) do update set
+         tenant_id = excluded.tenant_id,
          status = excluded.status,
          updated_at = excluded.updated_at,
          detail = excluded.detail`,
       [
         JSON.stringify(
-          statuses.map(([probeId, status]) => ({
-            probe_id: probeId,
-            status: status.status,
-            updated_at: status.updatedAt,
-            detail: status.detail ?? null,
+          statuses.map((entry) => ({
+            tenant_id: entry.scope.tenantId,
+            probe_id: entry.probeId,
+            status: entry.value.status,
+            updated_at: entry.value.updatedAt,
+            detail: entry.value.detail ?? null,
           })),
         ),
       ],
@@ -625,17 +785,25 @@ export class PostgresStore {
   ): Promise<void> {
     if (versions.length === 0) return;
     await client.query(
-      `insert into service_versions (service_id, version)
-       select service_id, version
+      `insert into service_versions (
+         tenant_id, project_id, environment_id, service_id, version
+       )
+       select tenant_id, project_id, environment_id, service_id, version
        from jsonb_to_recordset($1::jsonb) as service_version(
+         tenant_id text, project_id text, environment_id text,
          service_id text, version integer
        )
-       on conflict (service_id) do update set version = excluded.version`,
+       on conflict (
+         tenant_id, project_id, environment_id, service_id
+       ) do update set version = excluded.version`,
       [
         JSON.stringify(
-          versions.map(([serviceId, version]) => ({
-            service_id: serviceId,
-            version,
+          versions.map((entry) => ({
+            tenant_id: entry.tenantId,
+            project_id: entry.projectId,
+            environment_id: entry.environmentId,
+            service_id: entry.serviceId,
+            version: entry.version,
           })),
         ),
       ],
