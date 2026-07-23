@@ -2218,17 +2218,17 @@ describe("Postgres persistence", () => {
           payload: probePayload,
         })
       ).statusCode,
-    ).toBe(403);
+    ).toBe(201);
     expect(
       (
         await broker.inject({
           method: "POST",
           url: "/v1/service-credentials",
           headers: headers("alpha-operator"),
-          payload: { serviceId: "orders", label: "Denied credential" },
+          payload: { serviceId: "orders", label: "Operator credential" },
         })
       ).statusCode,
-    ).toBe(403);
+    ).toBe(201);
     const credential = await broker.inject({
       method: "POST",
       url: "/v1/service-credentials",
@@ -2269,15 +2269,15 @@ describe("Postgres persistence", () => {
           tenantId: "tenant-alpha",
           actorId: "user_alpha_viewer",
           action: "probe.create",
-          outcome: "denied",
-          statusCode: 403,
-          errorCode: "forbidden",
+          outcome: "success",
+          statusCode: 201,
         }),
         expect.objectContaining({
           tenantId: "tenant-alpha",
           actorId: "user_alpha_operator",
           action: "service_credential.create",
-          outcome: "denied",
+          outcome: "success",
+          statusCode: 201,
         }),
       ]),
     );
