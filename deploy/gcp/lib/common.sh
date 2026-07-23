@@ -128,6 +128,14 @@ validate_clerk_audience() {
   done
 }
 
+validate_alert_email() {
+  local value="$1"
+
+  [[ ${#value} -le 254 &&
+    "$value" =~ ^[A-Za-z0-9.!#$%\&\'*+/=?^_\`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] ||
+    die "ALERT_EMAIL must be a valid email address"
+}
+
 primary_api_key() {
   local key_ring="$1"
 

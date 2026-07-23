@@ -21,7 +21,8 @@ GCP_LOGS_ARGS ?= --tail=200
 	redaction-audit readonly-audit bench \
 	e2e-node e2e-python e2e-jvm \
 	demo-prerequisites demo demo-down \
-	gcp-demo-prerequisites gcp-demo-up gcp-demo-status gcp-demo-logs gcp-demo-down
+	gcp-demo-prerequisites gcp-demo-up gcp-demo-status gcp-demo-logs gcp-demo-down \
+	gcp-monitoring
 
 test: fixtures-test typescript-test python-test java-test demo-unit-test
 
@@ -64,6 +65,9 @@ demo-unit-test: payment-test inventory-test
 
 gcp-deploy-test:
 	deploy/gcp/test.sh
+
+gcp-monitoring:
+	deploy/gcp/provision-monitoring.sh
 
 typescript-build:
 	pnpm run build

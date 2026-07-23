@@ -3,17 +3,17 @@
 This is the supported hosted MVP topology. It deploys one GCE VM containing
 the broker, the Node/Python/JVM demo services, their traffic generators, and
 the private JVM bridge. The database can be either VM-local Postgres for the
-least expensive demo or Cloud SQL for a durable pilot. The MCP server runs on
-the operator's computer. An optional global HTTPS load balancer provides a
-Google-managed certificate and redirects public HTTP to HTTPS.
+least expensive demo or Cloud SQL for a durable pilot. MCP clients can use the
+hosted OAuth endpoint or run the package locally with a break-glass key. An
+optional global HTTPS load balancer provides a Google-managed certificate and
+redirects public HTTP to HTTPS.
 
 This remains a pilot deployment. Every `/v1/*` request requires a bearer
 credential. Operators can authenticate through Clerk Organizations when Clerk
 is configured; the rotatable shared key remains a break-glass path. Cloud SQL
 deployments can issue individually revocable keys restricted to one agent
-service. Clerk organizations are isolated as broker tenants, but all members
-currently have operator rights inside their tenant. The broker remains a
-single instance.
+service. Clerk organizations are isolated as broker tenants with admin,
+operator, and viewer authorization. The broker remains a single instance.
 
 ## Topology
 
@@ -315,6 +315,38 @@ PROJECT_ID="<PROJECT_ID>" CLIENT_IP="<operator-public-ip>" \
   deploy/gcp/refresh-firewall.sh
 ```
 
+### Monitoring and alerts
+
+For the Cloud SQL and HTTPS topology, provision the production monitoring
+baseline with one or more operations email addresses:
+
+```sh
+PROJECT_ID="<PROJECT_ID>" \
+DATABASE_BACKEND=cloud-sql \
+ALERT_EMAILS="oncall@example.com,platform@example.com" \
+  deploy/gcp/provision-monitoring.sh
+```
+
+`ALERT_EMAILS` accepts one to five comma-separated addresses; whitespace is
+trimmed and duplicate addresses are rejected. `ALERT_EMAIL` remains a
+single-address compatibility fallback. The command is idempotent. It installs
+and verifies the Google Cloud Ops Agent,
+grants the VM's dedicated runtime service account only log-writer and
+metric-writer permissions, and creates or updates:
+
+- a global HTTPS uptime check for `/readyz`, including response-content and TLS
+  validation;
+- email notification channels for every configured recipient;
+- a load-balancer 5xx logs-based metric;
+- alerts for readiness failures from at least two checker regions, HTTPS 5xx
+  responses, sustained VM CPU and filesystem pressure, Cloud SQL storage, and
+  PostgreSQL connections above 80% of the live `max_connections` value.
+
+Rerun the command after changing the VM, Cloud SQL tier, HTTPS backend, or
+notification recipient. Alert policies notify on incident open and close and
+auto-close stale incidents after seven days. Use a group mailbox rather than a
+personal address once an operations rotation exists.
+
 Before HTTPS activation, if outbound port 80 is blocked, create an SSH tunnel:
 
 ```sh
@@ -368,8 +400,9 @@ opening access beyond a narrow operator network, complete these items in order:
    direct broker ingress has been removed.
 3. Rotate the initial shared key, distribute it outside source control, and
    periodically disable obsolete Secret Manager versions.
-4. Install the Google Cloud Ops Agent and configure log-based alerts, an uptime
-   check on `/readyz`, CPU/disk alerts, and database storage/connection alerts.
+4. Run `provision-monitoring.sh` and verify the Ops Agent, `/readyz` uptime
+   check, load-balancer 5xx alert, VM CPU/disk alerts, and Cloud SQL
+   storage/connection alerts deliver to the intended notification channel.
 5. Build immutable images in CI, scan them, push them to Artifact Registry, and
    deploy pinned digests with a tested rollback procedure.
 6. Define retention for probe events, expired probes, source maps, and backups.

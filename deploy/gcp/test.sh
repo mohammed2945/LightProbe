@@ -286,6 +286,52 @@ if [[ "${1:-} ${2:-} ${3:-}" == "compute instances describe" &&
   done
 fi
 
+if [[ "${MOCK_PROVISION_MONITORING:-false}" == true ]]; then
+  case "${1:-} ${2:-} ${3:-}" in
+    "auth print-access-token")
+      printf 'fixture-monitoring-access-token\n'
+      exit 0
+      ;;
+    "compute instances describe")
+      for argument in "$@"; do
+        if [[ "$argument" == "--format=value(id)" ]]; then
+          printf '1234567890123456789\n'
+          exit 0
+        fi
+      done
+      ;;
+    "compute ssh lp-test")
+      for argument in "$@"; do
+        if [[ "$argument" == *"show max_connections"* ]]; then
+          printf '400\n'
+          exit 0
+        fi
+      done
+      exit 0
+      ;;
+    "monitoring uptime list-configs")
+      if [[ "${MOCK_MONITORING_EXISTS:-false}" == true ]]; then
+        printf 'projects/lightprobe-test/uptimeCheckConfigs/liveprobe-ready\n'
+      fi
+      exit 0
+      ;;
+    "monitoring uptime create")
+      printf 'projects/lightprobe-test/uptimeCheckConfigs/liveprobe-ready\n'
+      exit 0
+      ;;
+    "monitoring policies list")
+      if [[ "${MOCK_MONITORING_EXISTS:-false}" == true ]]; then
+        printf 'projects/lightprobe-test/alertPolicies/liveprobe-policy\n'
+      fi
+      exit 0
+      ;;
+    "logging metrics describe")
+      [[ "${MOCK_MONITORING_EXISTS:-false}" == true ]] && exit 0
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ "${MOCK_PROVISION_HTTPS:-false}" == true ||
   "${MOCK_ACTIVATE_HTTPS:-false}" == true ]]; then
   case "${1:-} ${2:-} ${3:-}" in
@@ -412,6 +458,26 @@ for argument in "$@"; do
   printf ' <%s>' "$argument" >>"${MOCK_CURL_LOG:?}"
 done
 printf '\n' >>"${MOCK_CURL_LOG:?}"
+if [[ "${MOCK_PROVISION_MONITORING:-false}" == true ]]; then
+  for argument in "$@"; do
+    if [[ "$argument" == *'/notificationChannels'* ]]; then
+      if [[ " $* " == *' -X POST '* ]]; then
+        if [[ " $* " == *'secondary@example.com'* ]]; then
+          printf '{"name":"projects/lightprobe-test/notificationChannels/liveprobe-email-secondary"}\n'
+        else
+          printf '{"name":"projects/lightprobe-test/notificationChannels/liveprobe-email-ops"}\n'
+        fi
+      elif [[ "${MOCK_MONITORING_EXISTS:-false}" == true ]]; then
+        printf '{"notificationChannels":['
+        printf '{"name":"projects/lightprobe-test/notificationChannels/liveprobe-email-ops","type":"email","labels":{"email_address":"ops@example.com"}},'
+        printf '{"name":"projects/lightprobe-test/notificationChannels/liveprobe-email-secondary","type":"email","labels":{"email_address":"secondary@example.com"}}]}\n'
+      else
+        printf '{"notificationChannels":[]}\n'
+      fi
+      exit 0
+    fi
+  done
+fi
 printf '{"ok":true}\n'
 MOCK
 chmod +x "${tmp_dir}/dig" "${tmp_dir}/curl"
@@ -573,6 +639,117 @@ grep -F '<sql> <users> <set-password> <liveprobe>' \
 if grep -F '<sql> <instances> <create> <lp-test-postgres>' \
   "$mock_log" >/dev/null; then
   fail "existing Cloud SQL instance was recreated"
+fi
+
+: >"$mock_log"
+: >"$mock_curl_log"
+monitoring_output="$(
+  PATH="${tmp_dir}:$PATH" \
+  PROJECT_ID=lightprobe-test \
+  REGION=us-central1 \
+  ZONE=us-central1-a \
+  VM_NAME=lp-test \
+  DATABASE_BACKEND=cloud-sql \
+  CLOUD_SQL_INSTANCE=lp-test-postgres \
+  HTTPS_DOMAIN=probe.example.com \
+  ALERT_EMAILS='ops@example.com, secondary@example.com' \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_CURL_LOG="$mock_curl_log" \
+  MOCK_PROVISION_MONITORING=true \
+    "${SCRIPT_DIR}/provision-monitoring.sh"
+)"
+grep -F 'Ops Agent: active on lp-test' <<<"$monitoring_output" >/dev/null ||
+  fail "monitoring provisioner did not verify the Ops Agent"
+grep -F 'Uptime check: https://probe.example.com/readyz' \
+  <<<"$monitoring_output" >/dev/null ||
+  fail "monitoring provisioner did not report the readiness check"
+for expected_call in \
+  '<services> <enable> <logging.googleapis.com> <monitoring.googleapis.com>' \
+  '<--role=roles/logging.logWriter>' \
+  '<--role=roles/monitoring.metricWriter>' \
+  '<monitoring> <uptime> <create> <LiveProbe broker readiness>' \
+  '<--path=/readyz>' \
+  '<--period=1>' \
+  '<--regions=usa-oregon,europe,asia-pacific>' \
+  '<--validate-ssl=true>' \
+  '<logging> <metrics> <create> <liveprobe_lb_5xx>' \
+  '<monitoring> <policies> <create>'; do
+  grep -F "$expected_call" "$mock_log" >/dev/null ||
+    fail "monitoring provisioner omitted command: ${expected_call}"
+done
+[[ "$(grep -F -c '<monitoring> <policies> <create>' "$mock_log")" -eq 6 ]] ||
+  fail "monitoring provisioner did not create all six alert policies"
+# The metric variable is intentionally matched as source text.
+# shellcheck disable=SC2016
+grep -F 'resource.type = \"l7_lb_rule\" AND metric.type = \"logging.googleapis.com/user/${LB_ERROR_METRIC}\"' \
+  "${SCRIPT_DIR}/provision-monitoring.sh" >/dev/null ||
+  fail "HTTPS 5xx policy does not use the logs-based metric resource type"
+grep -F 'notificationChannels' "$mock_curl_log" >/dev/null ||
+  fail "monitoring provisioner did not create an email notification channel"
+[[ "$(grep -F -c '<-X> <POST>' "$mock_curl_log")" -eq 2 ]] ||
+  fail "monitoring provisioner did not create both email notification channels"
+
+: >"$mock_log"
+: >"$mock_curl_log"
+PATH="${tmp_dir}:$PATH" \
+PROJECT_ID=lightprobe-test \
+REGION=us-central1 \
+ZONE=us-central1-a \
+VM_NAME=lp-test \
+DATABASE_BACKEND=cloud-sql \
+CLOUD_SQL_INSTANCE=lp-test-postgres \
+HTTPS_DOMAIN=probe.example.com \
+ALERT_EMAILS='ops@example.com, secondary@example.com' \
+GCLOUD_BIN="$mock_gcloud" \
+MOCK_GCLOUD_LOG="$mock_log" \
+MOCK_CURL_LOG="$mock_curl_log" \
+MOCK_PROVISION_MONITORING=true \
+MOCK_MONITORING_EXISTS=true \
+  "${SCRIPT_DIR}/provision-monitoring.sh" >/dev/null
+grep -F '<monitoring> <uptime> <update>' "$mock_log" >/dev/null ||
+  fail "monitoring rerun did not update the existing uptime check"
+[[ "$(grep -F -c '<monitoring> <policies> <update>' "$mock_log")" -eq 6 ]] ||
+  fail "monitoring rerun did not update all existing alert policies"
+grep -F '<logging> <metrics> <update> <liveprobe_lb_5xx>' \
+  "$mock_log" >/dev/null ||
+  fail "monitoring rerun did not update the existing log metric"
+if grep -F '<monitoring> <uptime> <create>' "$mock_log" >/dev/null ||
+  grep -F '<monitoring> <policies> <create>' "$mock_log" >/dev/null ||
+  grep -F '<-X> <POST>' "$mock_curl_log" >/dev/null; then
+  fail "monitoring rerun duplicated an existing managed resource"
+fi
+
+: >"$mock_log"
+if PATH="${tmp_dir}:$PATH" \
+  PROJECT_ID=lightprobe-test \
+  DATABASE_BACKEND=cloud-sql \
+  HTTPS_DOMAIN=probe.example.com \
+  ALERT_EMAIL=not-an-email \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_PROVISION_MONITORING=true \
+  "${SCRIPT_DIR}/provision-monitoring.sh" >/dev/null 2>&1; then
+  fail "monitoring provisioner accepted an invalid alert email"
+fi
+if grep -F '<services> <enable>' "$mock_log" >/dev/null; then
+  fail "invalid monitoring configuration mutated GCP resources"
+fi
+
+: >"$mock_log"
+if PATH="${tmp_dir}:$PATH" \
+  PROJECT_ID=lightprobe-test \
+  DATABASE_BACKEND=cloud-sql \
+  HTTPS_DOMAIN=probe.example.com \
+  ALERT_EMAILS='ops@example.com,ops@example.com' \
+  GCLOUD_BIN="$mock_gcloud" \
+  MOCK_GCLOUD_LOG="$mock_log" \
+  MOCK_PROVISION_MONITORING=true \
+  "${SCRIPT_DIR}/provision-monitoring.sh" >/dev/null 2>&1; then
+  fail "monitoring provisioner accepted duplicate alert emails"
+fi
+if grep -F '<services> <enable>' "$mock_log" >/dev/null; then
+  fail "duplicate monitoring recipients mutated GCP resources"
 fi
 
 : >"$mock_log"
