@@ -8,6 +8,8 @@ import {
 
 export const SERVICE_API_KEY_PREFIX = "lp_service_";
 
+export type HumanRole = "admin" | "operator" | "viewer";
+
 export interface ResourceScope {
   tenantId: string;
   projectId: string;
@@ -44,12 +46,12 @@ export type BrokerPrincipal =
   | (ResourceScope & {
       type: "shared";
       principalId: "shared-key" | "development";
-      role: "operator";
+      role: "admin";
     })
   | (ResourceScope & {
       type: "user";
       principalId: string;
-      role: "operator";
+      role: HumanRole;
       organizationId?: string | undefined;
       organizationRole?: string | undefined;
       tenantDisplayName?: string | undefined;
@@ -72,7 +74,7 @@ export type BearerAuthenticator = (
 
 export class BearerAuthenticationError extends Error {
   public constructor(
-    public readonly statusCode: 401 | 403,
+    public readonly statusCode: 401 | 403 | 503,
     public readonly code: string,
     message: string,
   ) {
@@ -127,7 +129,7 @@ export function sharedPrincipal(
 ): BrokerPrincipal {
   return {
     type: "shared",
-    role: "operator",
+    role: "admin",
     principalId,
     ...DEFAULT_RESOURCE_SCOPE,
   };

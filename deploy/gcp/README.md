@@ -375,8 +375,11 @@ opening access beyond a narrow operator network, complete these items in order:
 6. Define retention for probe events, expired probes, source maps, and backups.
    Keep one broker replica until cross-instance long-poll notification and
    shared coordination are implemented.
-7. Add per-operator identities, key rotation, audit retention, and tenant
-   isolation before treating the broker as a multi-user service.
+7. Verify Clerk role assignments, remove routine use of the shared break-glass
+   key, and issue a separate service credential per deployed service. Human
+   identity, tenant isolation, and append-only control-plane audit events are
+   implemented; define audit/event retention and external export before
+   regulated use.
 
 ## Destroy and cost control
 
@@ -397,14 +400,16 @@ administrative action.
 ## Security boundaries
 
 - The demo contains deterministic fake data only.
-- The bearer key is shared by operators and all agents; compromise requires a
-  coordinated key rotation and redeployment.
+- The shared bearer key is a break-glass admin credential for the internal
+  tenant. Routine human access should use Clerk, and each agent should use a
+  separately revocable service credential.
 - Secret Manager is the source of truth, but Docker Compose still requires
   secret payloads in root-readable `/etc/liveprobe/deployment.env` on the VM.
 - Before HTTPS activation, HTTP is unencrypted. Use a trusted path or an SSH
   tunnel and do not carry non-demo data.
-- TLS protects network transport after activation; the shared bearer key still
-  provides no per-user authorization or tenant boundary.
+- TLS protects network transport after activation. Clerk tokens provide human
+  identity, role authorization, and organization tenant scope; the shared key
+  intentionally bypasses those human boundaries for break-glass operation.
 - Node and JVM breakpoints can briefly pause an executing thread. Python line
   callbacks add target-process work. Read-only does not mean zero impact.
 - Redaction and bounded serialization are defense in depth, not proof that an

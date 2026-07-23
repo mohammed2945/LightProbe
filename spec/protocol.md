@@ -26,16 +26,19 @@ behavior from another implementation.
 - Probe IDs are broker-assigned ULIDs prefixed with `prb_`.
 - `serviceId` is a non-empty, deployment-stable identifier supplied by the
   user.
-- All `/v1/*` routes use `Authorization: Bearer <credential>`. Shared operator
-  keys can access every v1 route in the `internal/default/default` scope.
-  Verified Clerk session JWTs provide operator access only inside the active
-  Clerk Organization's tenant scope. Clerk sessions without an active
-  Organization return HTTP 403 `organization_required`; pending enrollment
-  returns HTTP 403 `clerk_session_pending`. Per-service keys begin with
-  `lp_service_` and can access only
+- All `/v1/*` routes use `Authorization: Bearer <credential>`. Shared keys are
+  break-glass admins in the `internal/default/default` scope. Verified Clerk
+  tokens are checked against current Organization membership and map
+  `org:admin` to `admin`, `org:member`/`org:operator` to `operator`, and
+  `org:viewer` to `viewer`. Unknown roles and removed memberships receive HTTP
+  403. Clerk sessions without an active Organization return HTTP 403
+  `organization_required`; pending enrollment returns HTTP 403
+  `clerk_session_pending`. Per-service keys begin with `lp_service_` and can
+  access only
   `GET /v1/ping` plus agent poll, ingest, and source-map routes for their exact
-  `serviceId`. A service key receives HTTP 403 `forbidden` when it attempts an
-  operator route or names another service. `GET /healthz` is unauthenticated
+  `serviceId`. Human credentials cannot call agent routes. A service key
+  receives HTTP 403 `forbidden` when it attempts a human route or names another
+  service. `GET /healthz` is unauthenticated
   process liveness. `GET /readyz` is also unauthenticated and returns 200 only
   when the configured durable store is reachable. Neither endpoint exposes
   configuration or secrets. Invalid, revoked, or missing credentials return
@@ -49,6 +52,15 @@ behavior from another implementation.
   }
 }
 ```
+
+Human permissions are:
+
+| Role | Read diagnostics | Create/delete probes | Manage service credentials | Read audit events |
+| --- | --- | --- | --- | --- |
+| `admin` | yes | yes | yes | yes |
+| `operator` | yes | yes | no | no |
+| `viewer` | yes | no | no | no |
+| `agent` | no | no | no | no |
 
 Service credentials are random bearer secrets stored in PostgreSQL as SHA-256
 hashes. The plaintext value is returned only by the create operation. Their
@@ -363,8 +375,10 @@ Status event:
 
 ## 5. Client-facing broker API
 
-Every route in this section requires a shared operator credential. Service
-credentials are rejected with HTTP 403.
+Every route in this section requires a human credential or the shared
+break-glass admin key. Service credentials are rejected with HTTP 403. Probe
+mutations require `admin` or `operator`; service-credential and audit routes
+require `admin`; diagnostic reads permit `admin`, `operator`, and `viewer`.
 
 ### 5.1 Create a probe
 
@@ -489,7 +503,27 @@ active credential and returns HTTP 204. A revoked credential immediately
 receives HTTP 401. Credential management returns HTTP 503
 `credential_store_unavailable` when PostgreSQL is not configured.
 
-### 5.7 MCP set-probe commit metadata
+### 5.7 Audit events
+
+`GET /v1/audit-events?limit=50&before={timestamp}` requires `admin` and
+PostgreSQL. `limit` is bounded to `1..100`; `before` is an optional RFC 3339
+timestamp. Results are restricted to the authenticated tenant, project, and
+environment and are ordered newest first.
+
+Probe create/delete and service-credential create/revoke operations append an
+`attempt` event followed by `success`, `denied`, or `error` with the same
+request ID. Records contain actor identity and role, action, resource identity,
+outcome, status/error code, and bounded non-secret metadata. They do not contain
+bearer tokens, plaintext service keys, captured probe values, or full request
+bodies.
+
+PostgreSQL rejects `UPDATE`, `DELETE`, and `TRUNCATE` on `audit_events`. This is
+an append-only application control, not cryptographic WORM storage: a database
+owner can alter the trigger or drop the table. `audit_store_unavailable` is
+returned when PostgreSQL audit storage is unavailable. MCP exposes the same
+admin-only data through `list_audit_events`.
+
+### 5.8 MCP set-probe commit metadata
 
 The `set_snapshot_probe`, `set_log_probe`, `set_counter_probe`, and
 `set_metric_probe` MCP tools require `commit_hash`, using snake_case at the MCP

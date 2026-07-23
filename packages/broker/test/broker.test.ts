@@ -15,6 +15,7 @@ import {
   buildBroker,
   createClerkAuthenticator,
   createServiceCredentialMaterial,
+  type AuditEventRecord,
   type BrokerPrincipal,
   type ProbeDefinition,
 } from "../src/index.js";
@@ -340,6 +341,24 @@ describe("broker validation and storage", () => {
         projectId: "shared-project",
         environmentId: "production",
       },
+      "alpha-agent-token": {
+        type: "service",
+        role: "agent",
+        principalId: "svc_alpha",
+        tenantId: "tenant-alpha",
+        projectId: "shared-project",
+        environmentId: "production",
+        serviceId: "orders",
+      },
+      "beta-agent-token": {
+        type: "service",
+        role: "agent",
+        principalId: "svc_beta",
+        tenantId: "tenant-beta",
+        projectId: "shared-project",
+        environmentId: "production",
+        serviceId: "orders",
+      },
     };
     const broker = await buildBroker({
       authenticateBearer: async (token) => principals[token],
@@ -409,14 +428,20 @@ describe("broker validation and storage", () => {
         ],
       },
     });
-    expect(crossTenantIngest.statusCode).toBe(400);
+    expect(crossTenantIngest.statusCode).toBe(403);
     expect(crossTenantIngest.json()).toMatchObject({
-      error: { code: "invalid_request" },
+      error: { code: "forbidden" },
     });
 
+    const alphaAgentHeaders = {
+      authorization: "Bearer alpha-agent-token",
+    };
+    const betaAgentHeaders = {
+      authorization: "Bearer beta-agent-token",
+    };
     for (const [headers, probe, commitSha] of [
-      [alphaHeaders, alphaProbe, "aaaaaaaaaaaaaaa1"],
-      [betaHeaders, betaProbe, "bbbbbbbbbbbbbbb2"],
+      [alphaAgentHeaders, alphaProbe, "aaaaaaaaaaaaaaa1"],
+      [betaAgentHeaders, betaProbe, "bbbbbbbbbbbbbbb2"],
     ] as const) {
       const ingested = await broker.inject({
         method: "POST",
@@ -473,13 +498,13 @@ describe("broker validation and storage", () => {
     await broker.inject({
       method: "POST",
       url: "/v1/source-maps/status",
-      headers: alphaHeaders,
+      headers: alphaAgentHeaders,
       payload: sourceMapIdentity,
     });
     const uploaded = await broker.inject({
       method: "POST",
       url: "/v1/source-maps/upload",
-      headers: alphaHeaders,
+      headers: alphaAgentHeaders,
       payload: {
         ...sourceMapIdentity,
         mapPath: "dist/orders.js.map",
@@ -496,13 +521,13 @@ describe("broker validation and storage", () => {
     await broker.inject({
       method: "POST",
       url: "/v1/source-maps/complete",
-      headers: alphaHeaders,
+      headers: alphaAgentHeaders,
       payload: sourceMapIdentity,
     });
     const betaMapStatus = await broker.inject({
       method: "POST",
       url: "/v1/source-maps/status",
-      headers: betaHeaders,
+      headers: betaAgentHeaders,
       payload: sourceMapIdentity,
     });
     expect(betaMapStatus.json()).toEqual({
@@ -519,7 +544,7 @@ describe("broker validation and storage", () => {
     const betaUnchanged = await broker.inject({
       method: "GET",
       url: "/v1/services/orders/probes?since=1",
-      headers: betaHeaders,
+      headers: betaAgentHeaders,
     });
     expect(betaUnchanged.json()).toEqual({ version: 1, unchanged: true });
   });
@@ -604,6 +629,187 @@ describe("broker validation and storage", () => {
       headers: { authorization: "Bearer operator-fixture-key" },
     });
     expect(sharedOperator.statusCode).toBe(200);
+  });
+
+  it("enforces admin, operator, viewer, and agent route boundaries", async () => {
+    const auditEvents: AuditEventRecord[] = [];
+    const principals: Record<string, BrokerPrincipal> = {
+      admin: {
+        type: "user",
+        role: "admin",
+        principalId: "user_admin",
+        ...DEFAULT_SCOPE,
+      },
+      operator: {
+        type: "user",
+        role: "operator",
+        principalId: "user_operator",
+        ...DEFAULT_SCOPE,
+      },
+      viewer: {
+        type: "user",
+        role: "viewer",
+        principalId: "user_viewer",
+        ...DEFAULT_SCOPE,
+      },
+      agent: {
+        type: "service",
+        role: "agent",
+        principalId: "svc_orders",
+        serviceId: "orders",
+        ...DEFAULT_SCOPE,
+      },
+    };
+    const broker = await buildBroker({
+      authenticateBearer: async (token) => principals[token],
+      store: {
+        async restore() {},
+        async persist() {},
+        async createServiceCredential(credential) {
+          const { secretHash: _secretHash, ...record } = credential;
+          return record;
+        },
+        async listServiceCredentials() {
+          return [];
+        },
+        async revokeServiceCredential() {
+          return true;
+        },
+        async appendAuditEvent(event) {
+          auditEvents.push(event);
+        },
+        async listAuditEvents(scope, options) {
+          return auditEvents
+            .filter(
+              (event) =>
+                event.tenantId === scope.tenantId &&
+                event.projectId === scope.projectId &&
+                event.environmentId === scope.environmentId,
+            )
+            .slice(-options.limit)
+            .reverse();
+        },
+      },
+    });
+    openBrokers.push(broker);
+    const headers = (token: string) => ({ authorization: `Bearer ${token}` });
+    const probePayload = {
+      serviceId: "orders",
+      type: "counter",
+      file: "src/orders.ts",
+      line: 19,
+      createdBy: "rbac-test",
+    };
+
+    const operatorCreate = await broker.inject({
+      method: "POST",
+      url: "/v1/probes",
+      headers: headers("operator"),
+      payload: probePayload,
+    });
+    expect(operatorCreate.statusCode).toBe(201);
+
+    for (const token of ["admin", "operator", "viewer"]) {
+      const read = await broker.inject({
+        method: "GET",
+        url: "/v1/probes?serviceId=orders",
+        headers: headers(token),
+      });
+      expect(read.statusCode).toBe(200);
+    }
+
+    const viewerCreate = await broker.inject({
+      method: "POST",
+      url: "/v1/probes",
+      headers: headers("viewer"),
+      payload: probePayload,
+    });
+    expect(viewerCreate.statusCode).toBe(403);
+
+    const operatorCredential = await broker.inject({
+      method: "POST",
+      url: "/v1/service-credentials",
+      headers: headers("operator"),
+      payload: { serviceId: "orders", label: "Orders production" },
+    });
+    expect(operatorCredential.statusCode).toBe(403);
+    const adminCredential = await broker.inject({
+      method: "POST",
+      url: "/v1/service-credentials",
+      headers: headers("admin"),
+      payload: { serviceId: "orders", label: "Orders production" },
+    });
+    expect(adminCredential.statusCode).toBe(201);
+
+    const humanIngest = await broker.inject({
+      method: "POST",
+      url: "/v1/ingest",
+      headers: headers("admin"),
+      payload: {
+        serviceId: "orders",
+        sdk: "node",
+        commitSha: "abcdef1234567890",
+        commitSource: "config",
+        agentStatus: { state: "green" },
+        events: [],
+      },
+    });
+    expect(humanIngest.statusCode).toBe(403);
+    const agentIngest = await broker.inject({
+      method: "POST",
+      url: "/v1/ingest",
+      headers: headers("agent"),
+      payload: {
+        serviceId: "orders",
+        sdk: "node",
+        commitSha: "abcdef1234567890",
+        commitSource: "config",
+        agentStatus: { state: "green" },
+        events: [],
+      },
+    });
+    expect(agentIngest.statusCode).toBe(202);
+    const agentControlPlane = await broker.inject({
+      method: "GET",
+      url: "/v1/services",
+      headers: headers("agent"),
+    });
+    expect(agentControlPlane.statusCode).toBe(403);
+
+    for (const token of ["operator", "viewer", "agent"]) {
+      const denied = await broker.inject({
+        method: "GET",
+        url: "/v1/audit-events",
+        headers: headers(token),
+      });
+      expect(denied.statusCode).toBe(403);
+    }
+    const audit = await broker.inject({
+      method: "GET",
+      url: "/v1/audit-events?limit=20",
+      headers: headers("admin"),
+    });
+    expect(audit.statusCode).toBe(200);
+    expect(audit.json<{ events: AuditEventRecord[] }>().events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "user_viewer",
+          actorRole: "viewer",
+          action: "probe.create",
+          outcome: "denied",
+          statusCode: 403,
+          errorCode: "forbidden",
+        }),
+        expect.objectContaining({
+          actorId: "user_admin",
+          actorRole: "admin",
+          action: "service_credential.create",
+          outcome: "success",
+          statusCode: 201,
+        }),
+      ]),
+    );
+    expect(JSON.stringify(auditEvents)).not.toContain("lp_service_");
   });
 
   it("reports unavailable when the durable store fails its readiness check", async () => {
@@ -1280,7 +1486,7 @@ async function resetPostgresSchema(databaseUrl: string): Promise<void> {
   await cleanup.connect();
   try {
     await cleanup.query(`
-      drop table if exists service_credentials, source_maps, source_map_sets,
+      drop table if exists audit_events, service_credentials, source_maps, source_map_sets,
         probe_events, probe_statuses, probes, services, service_versions,
         environments, projects, tenants, liveprobe_schema_migrations,
         broker_snapshots cascade
@@ -1433,6 +1639,7 @@ describe("Postgres persistence", () => {
         "probe_events",
         "probe_statuses",
         "probes",
+        "audit_events",
         "environments",
         "projects",
         "service_credentials",
@@ -1444,6 +1651,7 @@ describe("Postgres persistence", () => {
       ]],
     );
     expect(tables.rows.map((row) => row.table_name)).toEqual([
+      "audit_events",
       "environments",
       "probe_events",
       "probe_statuses",
@@ -1595,7 +1803,7 @@ describe("Postgres persistence", () => {
       const versions = await inspection.query<{ version: number }>(
         `select version from liveprobe_schema_migrations order by version`,
       );
-      expect(versions.rows.map(({ version }) => version)).toEqual([4, 5]);
+      expect(versions.rows.map(({ version }) => version)).toEqual([4, 6]);
 
       await inspection.query(`
         insert into tenants (tenant_id, display_name)
@@ -1670,6 +1878,22 @@ describe("Postgres persistence", () => {
         environmentId: "default",
         tenantDisplayName: "Beta Platform",
       },
+      "alpha-agent-token": {
+        type: "service",
+        role: "agent",
+        principalId: "svc_alpha",
+        serviceId: "orders",
+        ...DEFAULT_SCOPE,
+      },
+      "beta-agent-token": {
+        type: "service",
+        role: "agent",
+        principalId: "svc_beta",
+        serviceId: "orders",
+        tenantId: "tenant-beta",
+        projectId: "default",
+        environmentId: "default",
+      },
     };
     const authenticateBearer = async (
       token: string,
@@ -1681,15 +1905,22 @@ describe("Postgres persistence", () => {
     openBrokers.push(first);
     const alphaHeaders = { authorization: "Bearer alpha-token" };
     const betaHeaders = { authorization: "Bearer beta-token" };
+    const alphaAgentHeaders = {
+      authorization: "Bearer alpha-agent-token",
+    };
+    const betaAgentHeaders = {
+      authorization: "Bearer beta-agent-token",
+    };
 
     const created: Array<{
       headers: typeof alphaHeaders;
+      agentHeaders: typeof alphaAgentHeaders;
       probe: ProbeDefinition;
       commitSha: string;
     }> = [];
-    for (const [headers, commitSha] of [
-      [alphaHeaders, "aaaaaaaaaaaaaaa1"],
-      [betaHeaders, "bbbbbbbbbbbbbbb2"],
+    for (const [headers, agentHeaders, commitSha] of [
+      [alphaHeaders, alphaAgentHeaders, "aaaaaaaaaaaaaaa1"],
+      [betaHeaders, betaAgentHeaders, "bbbbbbbbbbbbbbb2"],
     ] as const) {
       const response = await first.inject({
         method: "POST",
@@ -1708,7 +1939,7 @@ describe("Postgres persistence", () => {
       const ingest = await first.inject({
         method: "POST",
         url: "/v1/ingest",
-        headers,
+        headers: agentHeaders,
         payload: {
           serviceId: "orders",
           sdk: "node",
@@ -1726,7 +1957,7 @@ describe("Postgres persistence", () => {
         },
       });
       expect(ingest.statusCode).toBe(202);
-      created.push({ headers, probe, commitSha });
+      created.push({ headers, agentHeaders, probe, commitSha });
     }
 
     await first.close();
@@ -1923,5 +2154,174 @@ describe("Postgres persistence", () => {
       headers: serviceHeaders,
     });
     expect(rejected.statusCode).toBe(401);
+  });
+
+  postgresIt("persists tenant-scoped append-only audit events", async () => {
+    const databaseUrl = process.env["TEST_DATABASE_URL"] as string;
+    await resetPostgresSchema(databaseUrl);
+    const principals: Record<string, BrokerPrincipal> = {
+      "alpha-admin": {
+        type: "user",
+        role: "admin",
+        principalId: "user_alpha_admin",
+        tenantId: "tenant-alpha",
+        projectId: "default",
+        environmentId: "production",
+      },
+      "alpha-operator": {
+        type: "user",
+        role: "operator",
+        principalId: "user_alpha_operator",
+        tenantId: "tenant-alpha",
+        projectId: "default",
+        environmentId: "production",
+      },
+      "alpha-viewer": {
+        type: "user",
+        role: "viewer",
+        principalId: "user_alpha_viewer",
+        tenantId: "tenant-alpha",
+        projectId: "default",
+        environmentId: "production",
+      },
+      "beta-admin": {
+        type: "user",
+        role: "admin",
+        principalId: "user_beta_admin",
+        tenantId: "tenant-beta",
+        projectId: "default",
+        environmentId: "production",
+      },
+    };
+    const broker = await buildBroker({
+      store: new PostgresStore(databaseUrl),
+      authenticateBearer: async (token) => principals[token],
+    });
+    openBrokers.push(broker);
+    const headers = (token: string) => ({ authorization: `Bearer ${token}` });
+    const probePayload = {
+      serviceId: "orders",
+      type: "counter",
+      file: "src/orders.ts",
+      line: 19,
+      createdBy: "audit-test",
+    };
+
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/probes",
+          headers: headers("alpha-admin"),
+          payload: probePayload,
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/probes",
+          headers: headers("alpha-viewer"),
+          payload: probePayload,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/service-credentials",
+          headers: headers("alpha-operator"),
+          payload: { serviceId: "orders", label: "Denied credential" },
+        })
+      ).statusCode,
+    ).toBe(403);
+    const credential = await broker.inject({
+      method: "POST",
+      url: "/v1/service-credentials",
+      headers: headers("alpha-admin"),
+      payload: { serviceId: "orders", label: "Orders production" },
+    });
+    expect(credential.statusCode).toBe(201);
+    const issuedApiKey = credential.json<{ apiKey: string }>().apiKey;
+
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/probes",
+          headers: headers("beta-admin"),
+          payload: probePayload,
+        })
+      ).statusCode,
+    ).toBe(201);
+
+    const alphaAudit = await broker.inject({
+      method: "GET",
+      url: "/v1/audit-events?limit=100",
+      headers: headers("alpha-admin"),
+    });
+    expect(alphaAudit.statusCode).toBe(200);
+    const events = alphaAudit.json<{ events: AuditEventRecord[] }>().events;
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tenantId: "tenant-alpha",
+          actorId: "user_alpha_admin",
+          action: "probe.create",
+          outcome: "success",
+          statusCode: 201,
+        }),
+        expect.objectContaining({
+          tenantId: "tenant-alpha",
+          actorId: "user_alpha_viewer",
+          action: "probe.create",
+          outcome: "denied",
+          statusCode: 403,
+          errorCode: "forbidden",
+        }),
+        expect.objectContaining({
+          tenantId: "tenant-alpha",
+          actorId: "user_alpha_operator",
+          action: "service_credential.create",
+          outcome: "denied",
+        }),
+      ]),
+    );
+    expect(events.every((event) => event.tenantId === "tenant-alpha")).toBe(
+      true,
+    );
+    expect(JSON.stringify(events)).not.toContain(issuedApiKey);
+    expect(JSON.stringify(events)).not.toContain("secretHash");
+
+    const inspection = new Client({ connectionString: databaseUrl });
+    await inspection.connect();
+    try {
+      const counts = await inspection.query<{
+        tenant_id: string;
+        count: string;
+      }>(
+        `select tenant_id, count(*)::text as count from audit_events
+         group by tenant_id order by tenant_id`,
+      );
+      expect(counts.rows).toEqual([
+        { tenant_id: "tenant-alpha", count: "8" },
+        { tenant_id: "tenant-beta", count: "2" },
+      ]);
+      await expect(
+        inspection.query(
+          "update audit_events set action = 'tampered' where tenant_id = 'tenant-alpha'",
+        ),
+      ).rejects.toThrow("audit_events is append-only");
+      await expect(
+        inspection.query("delete from audit_events where tenant_id = 'tenant-alpha'"),
+      ).rejects.toThrow("audit_events is append-only");
+      await expect(inspection.query("truncate audit_events")).rejects.toThrow(
+        "audit_events is append-only",
+      );
+    } finally {
+      await inspection.end();
+    }
   });
 });

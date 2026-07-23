@@ -5,6 +5,7 @@ import {
   BearerAuthenticationError,
   type BearerAuthenticator,
   type BrokerPrincipal,
+  type HumanRole,
 } from "./auth.js";
 import {
   DEFAULT_ENVIRONMENT_ID,
@@ -60,7 +61,18 @@ export interface CreateClerkAuthenticatorOptions
   projectId?: string | undefined;
   environmentId?: string | undefined;
   verifier?: ClerkTokenVerifier | undefined;
+  membershipResolver?: ClerkMembershipResolver | undefined;
 }
+
+export interface ClerkMembership {
+  role: string;
+  permissions: readonly string[];
+}
+
+export type ClerkMembershipResolver = (
+  userId: string,
+  organizationId: string,
+) => Promise<ClerkMembership | undefined>;
 
 export interface ClerkOAuthVerificationResult {
   userId: string;
@@ -80,6 +92,7 @@ export interface CreateClerkOAuthAuthenticatorOptions {
   projectId?: string | undefined;
   environmentId?: string | undefined;
   verifier?: ClerkOAuthTokenVerifier | undefined;
+  membershipResolver?: ClerkMembershipResolver | undefined;
 }
 
 function requiredNonEmpty(value: string | undefined, name: string): string {
@@ -92,6 +105,107 @@ function requiredNonEmpty(value: string | undefined, name: string): string {
 function normalizedRole(role: string | undefined): string | undefined {
   if (role === undefined) return undefined;
   return role.startsWith("org:") ? role : `org:${role}`;
+}
+
+export function liveProbeRoleForClerkRole(role: string): HumanRole {
+  switch (normalizedRole(role)) {
+    case "org:admin":
+      return "admin";
+    case "org:member":
+    case "org:operator":
+    case "org:liveprobe_operator":
+      return "operator";
+    case "org:viewer":
+    case "org:liveprobe_viewer":
+      return "viewer";
+    default:
+      throw new BearerAuthenticationError(
+        403,
+        "unsupported_organization_role",
+        `Clerk organization role ${role} is not mapped to a LiveProbe role`,
+      );
+  }
+}
+
+export function createClerkMembershipResolver(
+  secretKey: string,
+  cacheTtlMs = 30_000,
+): ClerkMembershipResolver {
+  if (!Number.isSafeInteger(cacheTtlMs) || cacheTtlMs < 0) {
+    throw new RangeError("Clerk membership cacheTtlMs must be non-negative");
+  }
+  const clerk = createClerkClient({
+    secretKey: requiredNonEmpty(secretKey, "CLERK_SECRET_KEY"),
+  });
+  const cache = new Map<
+    string,
+    { expiresAt: number; membership: ClerkMembership | undefined }
+  >();
+  return async (userId, organizationId) => {
+    const cacheKey = `${organizationId}:${userId}`;
+    const cached = cache.get(cacheKey);
+    if (cached !== undefined && cached.expiresAt > Date.now()) {
+      return cached.membership;
+    }
+    let response: Awaited<
+      ReturnType<typeof clerk.organizations.getOrganizationMembershipList>
+    >;
+    try {
+      response = await clerk.organizations.getOrganizationMembershipList({
+        organizationId,
+        userId: [userId],
+        limit: 1,
+      });
+    } catch (error: unknown) {
+      throw new BearerAuthenticationError(
+        503,
+        "clerk_membership_unavailable",
+        "Clerk organization membership could not be verified",
+      );
+    }
+    const resolved = response.data[0];
+    const membership =
+      resolved === undefined
+        ? undefined
+        : { role: resolved.role, permissions: resolved.permissions };
+    if (cache.size >= 1_000) cache.clear();
+    cache.set(cacheKey, {
+      expiresAt: Date.now() + cacheTtlMs,
+      membership,
+    });
+    return membership;
+  };
+}
+
+async function resolveHumanRole(
+  userId: string,
+  organizationId: string,
+  tokenRole: string | undefined,
+  resolver: ClerkMembershipResolver | undefined,
+): Promise<{ role: HumanRole; organizationRole: string }> {
+  let organizationRole = normalizedRole(tokenRole);
+  if (resolver !== undefined) {
+    const membership = await resolver(userId, organizationId);
+    if (membership === undefined) {
+      throw new BearerAuthenticationError(
+        403,
+        "organization_membership_required",
+        "the Clerk user is no longer a member of the selected organization",
+      );
+    }
+    organizationRole = normalizedRole(membership.role);
+  }
+  if (organizationRole === undefined) {
+    throw new BearerAuthenticationError(
+      403,
+      "organization_role_required",
+      "the Clerk organization membership has no role",
+    );
+  }
+  return {
+    role: liveProbeRoleForClerkRole(organizationRole),
+    organizationRole,
+  };
 }
 
 export function createClerkAuthenticator(
@@ -157,17 +271,22 @@ export function createClerkAuthenticator(
       );
     }
     const organizationSlug = claims.o?.slg ?? claims.org_slug;
-    const organizationRole = normalizedRole(claims.o?.rol ?? claims.org_role);
+    const { role, organizationRole } = await resolveHumanRole(
+      claims.sub,
+      organizationId,
+      claims.o?.rol ?? claims.org_role,
+      options.membershipResolver,
+    );
 
     return {
       type: "user",
-      role: "operator",
+      role,
       principalId: claims.sub,
       tenantId: organizationId,
       projectId,
       environmentId,
       organizationId,
-      ...(organizationRole === undefined ? {} : { organizationRole }),
+      organizationRole,
       tenantDisplayName: organizationSlug ?? organizationId,
     };
   };
@@ -230,6 +349,8 @@ export function createClerkOAuthAuthenticator(
         claims: decodeJwtPayload(token),
       };
     });
+  const membershipResolver =
+    options.membershipResolver ?? createClerkMembershipResolver(secretKey);
 
   return async (token): Promise<BrokerPrincipal | undefined> => {
     let verified: ClerkOAuthVerificationResult | undefined;
@@ -262,14 +383,21 @@ export function createClerkOAuthAuthenticator(
     }
     const displayName =
       parsed.data.org_slug ?? parsed.data.org_name ?? parsed.data.org_id;
+    const { role, organizationRole } = await resolveHumanRole(
+      verified.userId,
+      parsed.data.org_id,
+      undefined,
+      membershipResolver,
+    );
     return {
       type: "user",
-      role: "operator",
+      role,
       principalId: verified.userId,
       tenantId: parsed.data.org_id,
       projectId,
       environmentId,
       organizationId: parsed.data.org_id,
+      organizationRole,
       tenantDisplayName: displayName,
     };
   };
@@ -308,11 +436,16 @@ export function clerkAuthenticatorFromEnv(
     .split(",")
     .map((value) => value.trim())
     .filter((value) => value.length > 0);
+  const membershipResolver =
+    secretKey === undefined
+      ? undefined
+      : createClerkMembershipResolver(secretKey);
   return createClerkAuthenticator({
     ...(secretKey === undefined ? {} : { secretKey }),
     ...(jwtKey === undefined ? {} : { jwtKey }),
     authorizedParties,
     ...(audience.length === 0 ? {} : { audience }),
+    ...(membershipResolver === undefined ? {} : { membershipResolver }),
   });
 }
 

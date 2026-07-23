@@ -61,9 +61,10 @@ Add this server to your Cursor MCP configuration:
 }
 ```
 
-The package exposes ten tools: four probe setters, `list_services`,
+The package exposes eleven tools: four probe setters, `list_services`,
 `list_probes`, `get_probe_data`, `remove_probe`, `ping_broker`, and
-`get_safety_overview`. Tool failures return structured JSON guidance for bad
-credentials, unknown services, missing probes, and an unreachable broker.
+`get_safety_overview`, plus admin-only `list_audit_events`. Tool failures return
+structured JSON guidance for bad credentials, insufficient roles, unknown
+services, missing probes, and an unreachable broker.
 
 Run `npx -y @doomslayer2945/liveprobe-mcp@0.1.1 --help` for CLI options.

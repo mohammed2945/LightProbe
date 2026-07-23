@@ -158,10 +158,11 @@ MCP client (replace `/absolute/path/to/LightProbe`):
 }
 ```
 
-The server exposes ten tools: service/probe listing, four probe setters,
-retained-data retrieval, removal, authenticated connectivity, and a safety
-overview. Creating or removing a probe changes diagnostic instrumentation even
-though it does not intentionally change application variables.
+The server exposes eleven tools: service/probe listing, four probe setters,
+retained-data retrieval, removal, authenticated connectivity, a safety
+overview, and admin-only audit-event listing. Creating or removing a probe
+changes diagnostic instrumentation even though it does not intentionally
+change application variables.
 
 ### Diagnostic workflow
 
@@ -189,8 +190,8 @@ cryptographic proof that the target bytecode exactly matches that revision.
 
 | Variable | Used by | Purpose |
 | --- | --- | --- |
-| `LIVEPROBE_API_KEY` | broker, MCP, agents | Broker/MCP operator key, or an agent's per-service key in that agent process. |
-| `LIVEPROBE_API_KEYS` | broker | One or two comma-separated shared operator keys during rotation; the first is primary. |
+| `LIVEPROBE_API_KEY` | broker, MCP, agents | Shared break-glass admin key, or an agent's per-service key in that agent process. |
+| `LIVEPROBE_API_KEYS` | broker | One or two comma-separated shared admin keys during rotation; the first is primary. |
 | `CLERK_SECRET_KEY` | broker | Optional Clerk backend secret used to retrieve cached JWKS and verify human session tokens. |
 | `CLERK_PUBLISHABLE_KEY` | broker | Clerk `pk_live_...` key used to validate OAuth access tokens for the remote MCP endpoint. |
 | `CLERK_FRONTEND_API_URL` | broker | Clerk production authorization-server origin, for example `https://clerk.liveprobe.tryastrea.tech`. |
@@ -232,11 +233,13 @@ and `default` environment. Users without an active organization receive
 `organization_required`; incomplete organization enrollment receives
 `clerk_session_pending`.
 
-All Clerk organization members currently receive LiveProbe operator access
-inside their own tenant. Fine-grained human RBAC is a separate production
-increment. Shared operator keys remain available as a migration and
-break-glass path and operate only in `internal/default/default`. Agents should
-use their tenant's individually revocable `lp_service_...` key.
+LiveProbe resolves the user's current organization membership through Clerk
+and maps `org:admin` to `admin`, `org:member`/`org:operator` to `operator`, and
+`org:viewer` to `viewer`. Admins manage service credentials and probes;
+operators manage probes; viewers have read-only diagnostic access. Unknown or
+removed memberships fail closed. Shared keys remain an admin break-glass path
+in `internal/default/default`. Agents use individually revocable
+`lp_service_...` credentials and cannot call human control-plane routes.
 
 When `CLERK_PUBLISHABLE_KEY`, `CLERK_FRONTEND_API_URL`, and
 `LIVEPROBE_PUBLIC_URL` are set, the broker also exposes a stateless Streamable
@@ -260,7 +263,8 @@ and refresh tokens. A hosted Cursor entry therefore contains only:
 > sessions or the transitional shared key, while agents use per-service
 > credentials. The operator guide provides optional Cloud SQL plus a global
 > HTTPS load balancer. Clerk organization isolation and MCP browser login are
-> included; fine-grained roles and immutable audit retention remain later work.
+> included. Clerk-backed roles, tenant-scoped control-plane audit events, and
+> per-service agent credentials are enforced by the broker.
 
 The accepted GCE path places the broker, three intentionally buggy services,
 their traffic generators, and the JVM bridge on one VM. Only the broker and SSH
@@ -430,12 +434,13 @@ the deployment hardware for current numbers.
 
 ## Known production limitations
 
-- Clerk organization sessions provide human identity and tenant isolation when
-  configured, but all organization members currently have operator rights.
-  MCP browser login, fine-grained human RBAC, and immutable audit-log retention
-  are not implemented. Shared operator keys remain a transitional break-glass
-  path. Managed TLS is available only on the GCP deployment path after
-  explicit activation.
+- Clerk organization sessions provide human identity, current-membership role
+  checks, and tenant isolation when configured. Remote MCP browser login and
+  admin/operator/viewer RBAC are implemented. Control-plane audit rows reject
+  update, delete, and truncate operations, but this is not cryptographic WORM:
+  a PostgreSQL owner can alter the trigger or drop the table. Define retention
+  and export policy before regulated use. Shared keys remain a transitional
+  admin break-glass path.
 - Postgres mutations are transactional and durable. Cloud SQL mode can provide
   regional database HA, but the broker remains single-instance. JSON snapshots
   are a local/dev fallback.

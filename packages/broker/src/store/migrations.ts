@@ -1,4 +1,4 @@
-export const POSTGRES_SCHEMA_VERSION = 5;
+export const POSTGRES_SCHEMA_VERSION = 6;
 
 export const DEFAULT_TENANT_ID = "internal";
 export const DEFAULT_PROJECT_ID = "default";
@@ -149,6 +149,51 @@ export const POSTGRES_MIGRATION_SQL = `
       foreign key (tenant_id, project_id, environment_id)
       references environments(tenant_id, project_id, environment_id)
   );
+
+  create table if not exists audit_events (
+    audit_id text primary key,
+    tenant_id text not null,
+    project_id text not null,
+    environment_id text not null,
+    occurred_at timestamptz not null,
+    request_id text not null,
+    actor_type text not null,
+    actor_id text not null,
+    actor_role text not null,
+    action text not null,
+    resource_type text not null,
+    resource_id text,
+    outcome text not null check (
+      outcome in ('attempt', 'success', 'denied', 'error')
+    ),
+    status_code integer,
+    error_code text,
+    metadata jsonb not null default '{}'::jsonb,
+    constraint audit_events_scope_fk
+      foreign key (tenant_id, project_id, environment_id)
+      references environments(tenant_id, project_id, environment_id)
+  );
+
+  create or replace function liveprobe_reject_audit_mutation()
+  returns trigger language plpgsql as $audit_immutable$
+  begin
+    raise exception 'audit_events is append-only';
+  end
+  $audit_immutable$;
+
+  do $audit_trigger$
+  begin
+    if not exists (
+      select 1 from pg_trigger
+      where tgname = 'audit_events_immutable'
+        and tgrelid = 'audit_events'::regclass
+    ) then
+      create trigger audit_events_immutable
+        before update or delete or truncate on audit_events
+        for each statement execute function liveprobe_reject_audit_mutation();
+    end if;
+  end
+  $audit_trigger$;
 
   alter table services
     add column if not exists tenant_id text not null default '${DEFAULT_TENANT_ID}',
@@ -327,5 +372,9 @@ export const POSTGRES_MIGRATION_SQL = `
   create index if not exists service_credentials_scope_idx
     on service_credentials (
       tenant_id, project_id, environment_id, service_id, created_at
+    );
+  create index if not exists audit_events_scope_time_idx
+    on audit_events (
+      tenant_id, project_id, environment_id, occurred_at desc, audit_id desc
     );
 `;

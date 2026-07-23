@@ -34,7 +34,7 @@ describe("Clerk authentication", () => {
 
     await expect(authenticate("session-token")).resolves.toEqual({
       type: "user",
-      role: "operator",
+      role: "admin",
       principalId: "user_123",
       tenantId: "org_123",
       projectId: "default",
@@ -63,6 +63,7 @@ describe("Clerk authentication", () => {
     });
 
     await expect(authenticate("legacy-token")).resolves.toMatchObject({
+      role: "operator",
       principalId: "user_legacy",
       tenantId: "org_legacy",
       organizationRole: "org:member",
@@ -153,15 +154,73 @@ describe("Clerk authentication", () => {
           org_slug: "oauth-team",
         },
       }),
+      membershipResolver: async () => ({
+        role: "org:member",
+        permissions: [],
+      }),
     });
 
     await expect(authenticate("oauth-token")).resolves.toMatchObject({
       type: "user",
+      role: "operator",
       principalId: "user_oauth",
       tenantId: "org_oauth",
       organizationId: "org_oauth",
       tenantDisplayName: "oauth-team",
     });
+  });
+
+  it("uses current organization membership instead of a stale token role", async () => {
+    const authenticate = createClerkAuthenticator({
+      secretKey: "sk_test_fixture",
+      authorizedParties: ["https://app.example.com"],
+      verifier: async () => ({
+        sub: "user_viewer",
+        sts: "active",
+        o: { id: "org_123", rol: "admin" },
+      }),
+      membershipResolver: async () => ({
+        role: "org:liveprobe_viewer",
+        permissions: [],
+      }),
+    });
+
+    await expect(authenticate("session-token")).resolves.toMatchObject({
+      role: "viewer",
+      organizationRole: "org:liveprobe_viewer",
+    });
+  });
+
+  it("fails closed for removed memberships and unmapped organization roles", async () => {
+    const removed = createClerkOAuthAuthenticator({
+      secretKey: "sk_test_fixture",
+      publishableKey: "pk_test_fixture",
+      resourceUrl: "https://probe.example.com",
+      verifier: async () => ({
+        userId: "user_removed",
+        scopes: ["user:org:read"],
+        claims: { sub: "user_removed", org_id: "org_123" },
+      }),
+      membershipResolver: async () => undefined,
+    });
+    await expect(removed("oauth-token")).rejects.toMatchObject({
+      statusCode: 403,
+      code: "organization_membership_required",
+    } satisfies Partial<BearerAuthenticationError>);
+
+    const unmapped = createClerkAuthenticator({
+      secretKey: "sk_test_fixture",
+      authorizedParties: ["https://app.example.com"],
+      verifier: async () => ({
+        sub: "user_custom",
+        sts: "active",
+        o: { id: "org_123", rol: "billing" },
+      }),
+    });
+    await expect(unmapped("session-token")).rejects.toMatchObject({
+      statusCode: 403,
+      code: "unsupported_organization_role",
+    } satisfies Partial<BearerAuthenticationError>);
   });
 
   it("requires the organization scope and selected organization for OAuth", async () => {

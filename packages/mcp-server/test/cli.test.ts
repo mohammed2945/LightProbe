@@ -19,6 +19,7 @@ const compiledCli = join(packageRoot, "dist", "cli.js");
 const toolNames = [
   "get_probe_data",
   "get_safety_overview",
+  "list_audit_events",
   "list_probes",
   "list_services",
   "ping_broker",

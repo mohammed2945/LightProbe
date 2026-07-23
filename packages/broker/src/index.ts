@@ -11,6 +11,12 @@ import Fastify, {
 import { handleStatelessHttpMcpRequest } from "@doomslayer2945/liveprobe-mcp";
 import { z, ZodError } from "zod";
 
+import type {
+  AuditEventRecord,
+  AuditListOptions,
+  AuditMetadataValue,
+  AuditOutcome,
+} from "./audit.js";
 import {
   BearerAuthenticationError,
   SERVICE_API_KEY_PREFIX,
@@ -52,8 +58,12 @@ export {
   clerkOAuthAuthenticatorFromEnv,
   combineBearerAuthenticators,
   createClerkOAuthAuthenticator,
+  createClerkMembershipResolver,
+  liveProbeRoleForClerkRole,
 } from "./clerk-auth.js";
 export type {
+  ClerkMembership,
+  ClerkMembershipResolver,
   ClerkOAuthTokenVerifier,
   ClerkOAuthVerificationResult,
   ClerkTokenVerifier,
@@ -64,11 +74,18 @@ export type {
 export type {
   BearerAuthenticator,
   BrokerPrincipal,
+  HumanRole,
   ResourceScope,
   ResourceScopeLabels,
   ServiceCredentialRecord,
   StoredServiceCredential,
 } from "./auth.js";
+export type {
+  AuditEventRecord,
+  AuditListOptions,
+  AuditMetadataValue,
+  AuditOutcome,
+} from "./audit.js";
 export {
   DEFAULT_ENVIRONMENT_ID,
   DEFAULT_PROJECT_ID,
@@ -481,6 +498,11 @@ export interface BrokerStore {
   authenticateServiceCredential?(
     secretHash: string,
   ): Promise<ServiceCredentialRecord | undefined>;
+  appendAuditEvent?(event: AuditEventRecord): Promise<void>;
+  listAuditEvents?(
+    scope: ResourceScope,
+    options: AuditListOptions,
+  ): Promise<AuditEventRecord[]>;
 }
 
 export interface BuildBrokerOptions {
@@ -552,13 +574,37 @@ function principalFor(request: FastifyRequest): BrokerPrincipal {
   return request.liveprobePrincipal;
 }
 
-function requireOperator(request: FastifyRequest): BrokerPrincipal {
+function requireHumanRead(request: FastifyRequest): BrokerPrincipal {
   const principal = principalFor(request);
-  if (principal.role !== "operator") {
+  if (principal.role === "agent") {
     throw new BrokerHttpError(
       403,
       "forbidden",
-      "this credential cannot manage probes or broker resources",
+      "service credentials cannot read human control-plane resources",
+    );
+  }
+  return principal;
+}
+
+function requireProbeManager(request: FastifyRequest): BrokerPrincipal {
+  const principal = requireHumanRead(request);
+  if (principal.role === "viewer") {
+    throw new BrokerHttpError(
+      403,
+      "forbidden",
+      "viewer credentials cannot create or remove probes",
+    );
+  }
+  return principal;
+}
+
+function requireAdmin(request: FastifyRequest): BrokerPrincipal {
+  const principal = requireHumanRead(request);
+  if (principal.role !== "admin") {
+    throw new BrokerHttpError(
+      403,
+      "forbidden",
+      "admin access is required for this broker resource",
     );
   }
   return principal;
@@ -569,6 +615,13 @@ function requireServiceAccess(
   serviceId: string,
 ): BrokerPrincipal {
   const principal = principalFor(request);
+  if (principal.type === "user") {
+    throw new BrokerHttpError(
+      403,
+      "forbidden",
+      "human credentials cannot call runtime agent routes",
+    );
+  }
   if (principal.type === "service" && principal.serviceId !== serviceId) {
     throw new BrokerHttpError(
       403,
@@ -1701,6 +1754,20 @@ const serviceCredentialParamsSchema = z
     credentialId: z.string().regex(/^svc_[0-9a-f]{32}$/),
   })
   .strict();
+const auditListQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    before: timestampSchema.optional(),
+  })
+  .strict();
+
+interface AuditMutationContext {
+  action: string;
+  resourceType: string;
+  resourceId?: string | undefined;
+  metadata: Record<string, AuditMetadataValue>;
+  successStatus: number;
+}
 
 export async function buildBroker(
   options: BuildBrokerOptions = {},
@@ -2039,46 +2106,141 @@ export async function buildBroker(
       : store.persistSourceMapSet(state, serviceId, commitSha, scope));
   };
 
+  const appendAuditEvent = async (
+    request: FastifyRequest,
+    principal: BrokerPrincipal,
+    context: AuditMutationContext,
+    outcome: AuditOutcome,
+    statusCode?: number,
+    errorCode?: string,
+  ): Promise<void> => {
+    if (store === false || store.appendAuditEvent === undefined) return;
+    await store.appendAuditEvent({
+      auditId: `aud_${randomBytes(16).toString("hex")}`,
+      tenantId: principal.tenantId,
+      projectId: principal.projectId,
+      environmentId: principal.environmentId,
+      occurredAt: new Date(state.now()).toISOString(),
+      requestId: String(request.id),
+      actorType: principal.type,
+      actorId: principal.principalId,
+      actorRole: principal.role,
+      action: context.action,
+      resourceType: context.resourceType,
+      ...(context.resourceId === undefined
+        ? {}
+        : { resourceId: context.resourceId }),
+      outcome,
+      ...(statusCode === undefined ? {} : { statusCode }),
+      ...(errorCode === undefined ? {} : { errorCode }),
+      metadata: context.metadata,
+    });
+  };
+
+  const runAuditedMutation = async <T>(
+    request: FastifyRequest,
+    context: AuditMutationContext,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const principal = principalFor(request);
+    await appendAuditEvent(request, principal, context, "attempt");
+    try {
+      const result = await operation();
+      await appendAuditEvent(
+        request,
+        principal,
+        context,
+        "success",
+        context.successStatus,
+      );
+      return result;
+    } catch (error: unknown) {
+      const statusCode =
+        error instanceof BrokerHttpError
+          ? error.statusCode
+          : error instanceof ZodError
+            ? 400
+            : 500;
+      const errorCode =
+        error instanceof BrokerHttpError
+          ? error.code
+          : error instanceof ZodError
+            ? "invalid_request"
+            : "internal_error";
+      await appendAuditEvent(
+        request,
+        principal,
+        context,
+        statusCode === 401 || statusCode === 403 ? "denied" : "error",
+        statusCode,
+        errorCode,
+      );
+      throw error;
+    }
+  };
+
   app.post("/v1/probes", async (request, reply) => {
-    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
     const input = CreateProbeSchema.parse(request.body);
-    const probe = await mutateDurably(
-      () => state.createProbe(input, principal),
-      async (created) => {
-        if (store === false) return;
-        await (store.persistProbe === undefined
-          ? store.persist(state)
-          : store.persistProbe(state, created.id, principal));
-      },
-    );
+    const audit: AuditMutationContext = {
+      action: "probe.create",
+      resourceType: "probe",
+      metadata: { serviceId: input.serviceId, probeType: input.type },
+      successStatus: 201,
+    };
+    const probe = await runAuditedMutation(request, audit, async () => {
+      const principal = requireProbeManager(request);
+      const created = await mutateDurably(
+        () => state.createProbe(input, principal),
+        async (persisted) => {
+          if (store === false) return;
+          await (store.persistProbe === undefined
+            ? store.persist(state)
+            : store.persistProbe(state, persisted.id, principal));
+        },
+      );
+      audit.resourceId = created.id;
+      return created;
+    });
     return reply.status(201).send({ probe });
   });
 
   app.delete("/v1/probes/:id", async (request, reply) => {
-    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
     const { id } = probeParamsSchema.parse(request.params);
-    await mutateDurably(
-      () => state.deleteProbe(id, principal),
+    await runAuditedMutation(
+      request,
+      {
+        action: "probe.delete",
+        resourceType: "probe",
+        resourceId: id,
+        metadata: {},
+        successStatus: 204,
+      },
       async () => {
-        if (store === false) return;
-        await (store.deleteProbe === undefined
-          ? store.persist(state)
-          : store.deleteProbe(state, id, principal));
+        const principal = requireProbeManager(request);
+        await mutateDurably(
+          () => state.deleteProbe(id, principal),
+          async () => {
+            if (store === false) return;
+            await (store.deleteProbe === undefined
+              ? store.persist(state)
+              : store.deleteProbe(state, id, principal));
+          },
+        );
       },
     );
     return reply.status(204).send();
   });
 
   app.get("/v1/probes", async (request) => {
-    const principal = requireOperator(request);
+    const principal = requireHumanRead(request);
     const { serviceId } = listProbeQuerySchema.parse(request.query);
     return { probes: state.listProbes(serviceId, principal) };
   });
 
   app.get("/v1/services", async (request) => {
-    const principal = requireOperator(request);
+    const principal = requireHumanRead(request);
     emptyQuerySchema.parse(request.query);
     return { services: state.listServices(principal) };
   });
@@ -2089,37 +2251,51 @@ export async function buildBroker(
   });
 
   app.get("/v1/safety", async (request) => {
-    const principal = requireOperator(request);
+    const principal = requireHumanRead(request);
     emptyQuerySchema.parse(request.query);
     return state.safetyOverview(45_000, principal);
   });
 
   app.post("/v1/service-credentials", async (request, reply) => {
-    const principal = requireOperator(request);
     emptyQuerySchema.parse(request.query);
     const input = serviceCredentialCreateSchema.parse(request.body);
-    if (store === false || store.createServiceCredential === undefined) {
-      throw new BrokerHttpError(
-        503,
-        "credential_store_unavailable",
-        "service credentials require the PostgreSQL durable store",
-      );
-    }
-    const material = createServiceCredentialMaterial({
-      serviceId: input.serviceId,
-      label: input.label,
-      scope: principal,
-      now: new Date(state.now()),
-    });
-    const credential = await store.createServiceCredential(material.record);
+    const audit: AuditMutationContext = {
+      action: "service_credential.create",
+      resourceType: "service_credential",
+      metadata: { serviceId: input.serviceId },
+      successStatus: 201,
+    };
+    const { credential, apiKey } = await runAuditedMutation(
+      request,
+      audit,
+      async () => {
+        const principal = requireAdmin(request);
+        if (store === false || store.createServiceCredential === undefined) {
+          throw new BrokerHttpError(
+            503,
+            "credential_store_unavailable",
+            "service credentials require the PostgreSQL durable store",
+          );
+        }
+        const material = createServiceCredentialMaterial({
+          serviceId: input.serviceId,
+          label: input.label,
+          scope: principal,
+          now: new Date(state.now()),
+        });
+        const created = await store.createServiceCredential(material.record);
+        audit.resourceId = created.credentialId;
+        return { credential: created, apiKey: material.apiKey };
+      },
+    );
     return reply.status(201).send({
       credential,
-      apiKey: material.apiKey,
+      apiKey,
     });
   });
 
   app.get("/v1/service-credentials", async (request) => {
-    const principal = requireOperator(request);
+    const principal = requireAdmin(request);
     emptyQuerySchema.parse(request.query);
     if (store === false || store.listServiceCredentials === undefined) {
       throw new BrokerHttpError(
@@ -2136,32 +2312,59 @@ export async function buildBroker(
   app.delete(
     "/v1/service-credentials/:credentialId",
     async (request, reply) => {
-      const principal = requireOperator(request);
       emptyQuerySchema.parse(request.query);
       const { credentialId } = serviceCredentialParamsSchema.parse(
         request.params,
       );
-      if (store === false || store.revokeServiceCredential === undefined) {
-        throw new BrokerHttpError(
-          503,
-          "credential_store_unavailable",
-          "service credentials require the PostgreSQL durable store",
-        );
-      }
-      const revoked = await store.revokeServiceCredential(
-        credentialId,
-        principal,
+      await runAuditedMutation(
+        request,
+        {
+          action: "service_credential.revoke",
+          resourceType: "service_credential",
+          resourceId: credentialId,
+          metadata: {},
+          successStatus: 204,
+        },
+        async () => {
+          const principal = requireAdmin(request);
+          if (store === false || store.revokeServiceCredential === undefined) {
+            throw new BrokerHttpError(
+              503,
+              "credential_store_unavailable",
+              "service credentials require the PostgreSQL durable store",
+            );
+          }
+          const revoked = await store.revokeServiceCredential(
+            credentialId,
+            principal,
+          );
+          if (!revoked) {
+            throw new BrokerHttpError(
+              404,
+              "not_found",
+              `service credential ${credentialId} was not found or is already revoked`,
+            );
+          }
+        },
       );
-      if (!revoked) {
-        throw new BrokerHttpError(
-          404,
-          "not_found",
-          `service credential ${credentialId} was not found or is already revoked`,
-        );
-      }
       return reply.status(204).send();
     },
   );
+
+  app.get("/v1/audit-events", async (request) => {
+    const principal = requireAdmin(request);
+    const query = auditListQuerySchema.parse(request.query);
+    if (store === false || store.listAuditEvents === undefined) {
+      throw new BrokerHttpError(
+        503,
+        "audit_store_unavailable",
+        "audit events require the PostgreSQL durable store",
+      );
+    }
+    return {
+      events: await store.listAuditEvents(principal, query),
+    };
+  });
 
   app.get(
     "/v1/services/:serviceId/probes",
@@ -2244,7 +2447,7 @@ export async function buildBroker(
   });
 
   app.get("/v1/probes/:id/data", async (request, reply) => {
-    const principal = requireOperator(request);
+    const principal = requireHumanRead(request);
     const { id } = probeParamsSchema.parse(request.params);
     const query = dataQuerySchema.parse(request.query);
     const waitSeconds = Math.min(30, Math.max(0, query.waitSeconds));

@@ -14,7 +14,7 @@ The current internal test deployment uses:
 Do not commit the service key to an application repository or paste it into
 issues, logs, or recordings. A service key cannot list services, manage probes,
 or act as another service. Human MCP access uses Clerk instead of exposing an
-operator key. Public traffic
+shared admin key. Public traffic
 terminates TLS at the Google Cloud load balancer, and HTTP redirects to HTTPS.
 The VM origin accepts broker traffic only from Google's load-balancer and
 health-check ranges. External port `7070` is not published; it is only the
@@ -22,7 +22,7 @@ broker container's internal port.
 
 The public HTTPS endpoint is suitable for internal integration testing. The
 broker uses Clerk organizations for human tenant isolation and browser login.
-Shared operator keys are reserved for local fallback and break-glass use.
+Shared admin keys are reserved for local fallback and break-glass use.
 
 ```sh
 export BROKER_URL="https://liveprobe.tryastrea.tech"
@@ -265,13 +265,14 @@ A useful first prompt is:
 
 ## 4. Use the MCP tools
 
-The server exposes ten tools:
+The server exposes eleven tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `ping_broker` | Check authenticated broker connectivity. |
 | `list_services` | List agents, commits, heartbeat state, and caveats. |
 | `get_safety_overview` | Show per-service safety state and probe counts. |
+| `list_audit_events` | List control-plane changes; requires workspace admin. |
 | `set_snapshot_probe` | Capture bounded locals, watch paths, and stack data. |
 | `set_log_probe` | Add a temporary log with `${dot.path}` placeholders. |
 | `set_counter_probe` | Count executions of a source line. |
@@ -306,7 +307,8 @@ the repository.
 
 | Symptom | Check |
 | --- | --- |
-| MCP returns `unauthorized` | Confirm the MCP has the current operator key; restart the MCP client after changing it. |
+| MCP returns `unauthorized` | Reconnect the hosted MCP account, or confirm the local fallback has the current shared key. |
+| MCP returns `forbidden` | Confirm the active Clerk workspace and role; audit and service-credential management require admin. |
 | Agent returns `unauthorized` | Confirm its service key has not been revoked and was created for that service ID. |
 | Broker is unreachable | Check `BROKER_URL`, `/healthz`, DNS resolution, and the calling service's outbound HTTPS access. |
 | No services are listed | Confirm the agent started, can reach the broker, and has a valid deployed commit. |
@@ -321,9 +323,10 @@ the repository.
 
 ## 6. Test-environment safety
 
-- Runtime agents can use individually revocable service keys. Clerk-enabled
-  broker users are isolated by active organization, but MCP users still share
-  the internal-scope operator key until browser login is implemented.
+- Runtime agents use individually revocable service keys. Hosted MCP users sign
+  in through Clerk and are isolated by active organization with admin,
+  operator, or viewer permissions. The shared internal-scope admin key is only
+  a break-glass fallback.
 - Public traffic enters through the HTTPS load balancer. Direct broker origin
   ingress is restricted to Google's load-balancer and health-check ranges.
 - Use TLS, VPN, or another trusted network path for non-demo data.

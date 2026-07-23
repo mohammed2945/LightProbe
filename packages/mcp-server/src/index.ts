@@ -108,6 +108,16 @@ export const SetMetricProbeInputSchema = z
 export const ListServicesInputSchema = z.object({}).strict();
 export const PingBrokerInputSchema = z.object({}).strict();
 export const GetSafetyOverviewInputSchema = z.object({}).strict();
+export const ListAuditEventsInputSchema = z
+  .object({
+    limit: z.number().int().min(1).max(100).optional().default(50),
+    before: z
+      .string()
+      .datetime({ offset: true })
+      .optional()
+      .describe("Return events strictly before this ISO-8601 timestamp"),
+  })
+  .strict();
 export const ListProbesInputSchema = z
   .object({
     service_id: serviceIdSchema.optional(),
@@ -267,6 +277,29 @@ const probeDataResponseSchema = z
     events: z.array(probeEventResponseSchema),
   })
   .strict();
+const auditEventSchema = z
+  .object({
+    auditId: z.string().min(1),
+    tenantId: z.string().min(1),
+    projectId: z.string().min(1),
+    environmentId: z.string().min(1),
+    occurredAt: z.string().datetime({ offset: true }),
+    requestId: z.string().min(1),
+    actorType: z.enum(["shared", "user", "service"]),
+    actorId: z.string().min(1),
+    actorRole: z.enum(["admin", "operator", "viewer", "agent"]),
+    action: z.string().min(1),
+    resourceType: z.string().min(1),
+    resourceId: z.string().min(1).optional(),
+    outcome: z.enum(["attempt", "success", "denied", "error"]),
+    statusCode: z.number().int().optional(),
+    errorCode: z.string().min(1).optional(),
+    metadata: z.record(z.string(), scalarSchema),
+  })
+  .strict();
+const listAuditEventsResponseSchema = z
+  .object({ events: z.array(auditEventSchema) })
+  .strict();
 
 export type BrokerProbeDefinition = z.infer<
   typeof BrokerProbeDefinitionSchema
@@ -274,6 +307,7 @@ export type BrokerProbeDefinition = z.infer<
 export type BrokerService = z.infer<typeof serviceSchema>;
 export type BrokerProbeStatus = z.infer<typeof probeStatusSchema>;
 export type BrokerProbeData = z.infer<typeof probeDataResponseSchema>;
+export type BrokerAuditEvent = z.infer<typeof auditEventSchema>;
 
 type BrokerCondition = z.infer<typeof McpConditionSchema>;
 
@@ -435,6 +469,19 @@ export class BrokerClient {
     return this.request("GET", "/v1/safety", safetyResponseSchema);
   }
 
+  public async listAuditEvents(input: {
+    limit: number;
+    before?: string | undefined;
+  }): Promise<z.infer<typeof listAuditEventsResponseSchema>> {
+    const search = new URLSearchParams({ limit: String(input.limit) });
+    if (input.before !== undefined) search.set("before", input.before);
+    return this.request(
+      "GET",
+      `/v1/audit-events?${search.toString()}`,
+      listAuditEventsResponseSchema,
+    );
+  }
+
   public async removeProbe(probeId: string): Promise<void> {
     await this.requestNoContent(
       "DELETE",
@@ -548,6 +595,9 @@ export interface ToolHandlers {
   set_metric_probe(input: SetMetricInput): Promise<ProbeCreateResult>;
   ping_broker(input?: unknown): Promise<{ ok: true }>;
   get_safety_overview(input?: unknown): Promise<z.infer<typeof safetyResponseSchema>>;
+  list_audit_events(
+    input?: z.input<typeof ListAuditEventsInputSchema>,
+  ): Promise<z.infer<typeof listAuditEventsResponseSchema>>;
   list_services(input?: unknown): Promise<{ services: EnrichedService[] }>;
   list_probes(
     input: z.input<typeof ListProbesInputSchema>,
@@ -708,6 +758,10 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
       GetSafetyOverviewInputSchema.parse(rawInput);
       return client.getSafetyOverview();
     },
+    async list_audit_events(rawInput = {}) {
+      const input = ListAuditEventsInputSchema.parse(rawInput);
+      return client.listAuditEvents(input);
+    },
     async list_probes(rawInput) {
       const input = ListProbesInputSchema.parse(rawInput);
       return client.listProbes(input.service_id);
@@ -754,6 +808,12 @@ function toolErrorResult(error: unknown): {
       checks = [
         "Call list_services and use a reported serviceId.",
         "Confirm the runtime agent is online and heartbeating.",
+      ];
+    } else if (error.status === 403 || code === "forbidden") {
+      code = "forbidden";
+      checks = [
+        "Use a Clerk organization account with the role required by this tool.",
+        "Ask an organization admin to update your role if access is expected.",
       ];
     } else if (error.status === 404) {
       checks = [
@@ -927,6 +987,17 @@ export function createMcpServer(
     },
     async (input) =>
       executeTool(() => handlers.get_safety_overview(input)),
+  );
+  server.registerTool(
+    "list_audit_events",
+    {
+      title: "List audit events",
+      description:
+        "List tenant-scoped probe and service-credential control events. This read-only tool requires the LiveProbe admin role and never returns bearer secrets or captured probe values.",
+      inputSchema: ListAuditEventsInputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (input) => executeTool(() => handlers.list_audit_events(input)),
   );
   server.registerTool(
     "list_probes",

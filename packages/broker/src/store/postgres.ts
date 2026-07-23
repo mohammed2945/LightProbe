@@ -1,6 +1,12 @@
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 
 import type {
+  AuditEventRecord,
+  AuditListOptions,
+  AuditMetadataValue,
+  AuditOutcome,
+} from "../audit.js";
+import type {
   ResourceScope,
   ResourceScopeLabels,
   ServiceCredentialRecord,
@@ -89,6 +95,25 @@ interface ServiceCredentialRow extends QueryResultRow {
   revoked_at: Date | null;
 }
 
+interface AuditEventRow extends QueryResultRow {
+  audit_id: string;
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
+  occurred_at: Date;
+  request_id: string;
+  actor_type: AuditEventRecord["actorType"];
+  actor_id: string;
+  actor_role: AuditEventRecord["actorRole"];
+  action: string;
+  resource_type: string;
+  resource_id: string | null;
+  outcome: AuditOutcome;
+  status_code: number | null;
+  error_code: string | null;
+  metadata: Record<string, AuditMetadataValue>;
+}
+
 function serviceCredentialRecord(
   row: ServiceCredentialRow,
 ): ServiceCredentialRecord {
@@ -107,6 +132,27 @@ function serviceCredentialRecord(
     ...(row.revoked_at === null
       ? {}
       : { revokedAt: row.revoked_at.toISOString() }),
+  };
+}
+
+function auditEventRecord(row: AuditEventRow): AuditEventRecord {
+  return {
+    auditId: row.audit_id,
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    environmentId: row.environment_id,
+    occurredAt: row.occurred_at.toISOString(),
+    requestId: row.request_id,
+    actorType: row.actor_type,
+    actorId: row.actor_id,
+    actorRole: row.actor_role,
+    action: row.action,
+    resourceType: row.resource_type,
+    ...(row.resource_id === null ? {} : { resourceId: row.resource_id }),
+    outcome: row.outcome,
+    ...(row.status_code === null ? {} : { statusCode: row.status_code }),
+    ...(row.error_code === null ? {} : { errorCode: row.error_code }),
+    metadata: row.metadata,
   };
 }
 
@@ -681,6 +727,63 @@ export class PostgresStore {
       );
     }
     return serviceCredentialRecord(row);
+  }
+
+  public async appendAuditEvent(event: AuditEventRecord): Promise<void> {
+    await this.ensureMigrated();
+    await this.pool.query(
+      `insert into audit_events (
+         audit_id, tenant_id, project_id, environment_id, occurred_at,
+         request_id, actor_type, actor_id, actor_role, action, resource_type,
+         resource_id, outcome, status_code, error_code, metadata
+       ) values (
+         $1, $2, $3, $4, $5::timestamptz, $6, $7, $8, $9, $10, $11,
+         $12, $13, $14, $15, $16::jsonb
+       )`,
+      [
+        event.auditId,
+        event.tenantId,
+        event.projectId,
+        event.environmentId,
+        event.occurredAt,
+        event.requestId,
+        event.actorType,
+        event.actorId,
+        event.actorRole,
+        event.action,
+        event.resourceType,
+        event.resourceId ?? null,
+        event.outcome,
+        event.statusCode ?? null,
+        event.errorCode ?? null,
+        JSON.stringify(event.metadata),
+      ],
+    );
+  }
+
+  public async listAuditEvents(
+    scope: ResourceScope,
+    options: AuditListOptions,
+  ): Promise<AuditEventRecord[]> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<AuditEventRow>(
+      `select audit_id, tenant_id, project_id, environment_id, occurred_at,
+         request_id, actor_type, actor_id, actor_role, action, resource_type,
+         resource_id, outcome, status_code, error_code, metadata
+       from audit_events
+       where tenant_id = $1 and project_id = $2 and environment_id = $3
+         and ($4::timestamptz is null or occurred_at < $4::timestamptz)
+       order by occurred_at desc, audit_id desc
+       limit $5`,
+      [
+        scope.tenantId,
+        scope.projectId,
+        scope.environmentId,
+        options.before ?? null,
+        options.limit,
+      ],
+    );
+    return result.rows.map(auditEventRecord);
   }
 
   public close(): Promise<void> {

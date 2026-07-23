@@ -117,6 +117,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
         "get_probe_data",
         "get_safety_overview",
+        "list_audit_events",
         "list_probes",
         "list_services",
         "ping_broker",
@@ -405,7 +406,98 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     });
   });
 
-  it("publishes exactly the ten official MCP tools", async () => {
+  it("lists bounded audit events and preserves admin authorization errors", async () => {
+    const occurredAt = "2026-07-22T20:00:00.000Z";
+    let requestedUrl = "";
+    let authorization = "";
+    const handlers = createToolHandlers(
+      new BrokerClient("https://probe.example.com", {
+        apiKey: "admin-token",
+        fetchImplementation: async (input, init) => {
+          requestedUrl = String(input);
+          authorization = new Headers(init?.headers).get("authorization") ?? "";
+          return new Response(
+            JSON.stringify({
+              events: [
+                {
+                  auditId: "aud_123",
+                  tenantId: "org_123",
+                  projectId: "default",
+                  environmentId: "default",
+                  occurredAt,
+                  requestId: "req-1",
+                  actorType: "user",
+                  actorId: "user_admin",
+                  actorRole: "admin",
+                  action: "probe.create",
+                  resourceType: "probe",
+                  resourceId: "prb_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  outcome: "success",
+                  statusCode: 201,
+                  metadata: { serviceId: "checkout", probeType: "counter" },
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        },
+      }),
+    );
+
+    await expect(
+      handlers.list_audit_events({ limit: 10, before: occurredAt }),
+    ).resolves.toMatchObject({
+      events: [
+        {
+          actorRole: "admin",
+          action: "probe.create",
+          outcome: "success",
+        },
+      ],
+    });
+    expect(requestedUrl).toBe(
+      `https://probe.example.com/v1/audit-events?limit=10&before=${encodeURIComponent(occurredAt)}`,
+    );
+    expect(authorization).toBe("Bearer admin-token");
+
+    const server = createMcpServer(
+      new BrokerClient("https://probe.example.com", {
+        fetchImplementation: async () =>
+          new Response(
+            JSON.stringify({
+              error: { code: "forbidden", message: "admin access is required" },
+            }),
+            { status: 403, headers: { "content-type": "application/json" } },
+          ),
+      }),
+    );
+    const client = new Client(
+      { name: "liveprobe-audit-error-test", version: "1.0.0" },
+      { capabilities: {} },
+    );
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const denied = await client.callTool({
+        name: "list_audit_events",
+        arguments: {},
+      });
+      expect(denied.isError).toBe(true);
+      expect(denied.content).toEqual([
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining('"code": "forbidden"'),
+        }),
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("publishes exactly the eleven official MCP tools", async () => {
     const { brokerUrl } = await startBroker();
     const server = createMcpServer(new BrokerClient(brokerUrl));
     const client = new Client(
@@ -422,6 +514,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
         "get_probe_data",
         "get_safety_overview",
+        "list_audit_events",
         "list_probes",
         "list_services",
         "ping_broker",
