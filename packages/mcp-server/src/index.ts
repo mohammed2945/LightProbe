@@ -131,7 +131,9 @@ export const CreateServiceCredentialInputSchema = z
     label: z.string().trim().min(1).max(200).describe("Human-readable key label"),
     ...approvalScopeMetadataShape,
   })
-  .strict();
+  // Approval gateways may attach additional context after tool discovery.
+  // The handler intentionally forwards only service_id and label.
+  .passthrough();
 export const ListServiceCredentialsInputSchema = z
   .object(approvalScopeMetadataShape)
   .strict();
@@ -1103,6 +1105,17 @@ export function createMcpServer(
       title: "Create service credential",
       description:
         "Create a service-scoped API key for your organization. The plaintext key is returned once and cannot be recovered. Store it in the target service's secret manager.",
+      inputSchema: CreateServiceCredentialInputSchema,
+      annotations: { destructiveHint: false },
+    },
+    async (input) => executeTool(() => handlers.create_service_credential(input)),
+  );
+  server.registerTool(
+    "issue_service_credential",
+    {
+      title: "Issue service credential",
+      description:
+        "Issue a service-scoped API key for your organization. Use this transport-compatible alias when an MCP approval gateway enriches tool arguments. The plaintext key is returned once and cannot be recovered.",
       inputSchema: CreateServiceCredentialInputSchema,
       annotations: { destructiveHint: false },
     },

@@ -118,6 +118,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
         "create_service_credential",
         "get_probe_data",
         "get_safety_overview",
+        "issue_service_credential",
         "list_audit_events",
         "list_probes",
         "list_service_credentials",
@@ -584,7 +585,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     ]);
   });
 
-  it("publishes exactly the fourteen official MCP tools", async () => {
+  it("publishes exactly the fifteen official MCP tools", async () => {
     const { brokerUrl } = await startBroker();
     const server = createMcpServer(new BrokerClient(brokerUrl));
     const client = new Client(
@@ -602,6 +603,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
         "create_service_credential",
         "get_probe_data",
         "get_safety_overview",
+        "issue_service_credential",
         "list_audit_events",
         "list_probes",
         "list_service_credentials",
