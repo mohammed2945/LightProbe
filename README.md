@@ -204,6 +204,8 @@ cryptographic proof that the target bytecode exactly matches that revision.
 | `LIVEPROBE_DB_POOL_SIZE` | broker | Maximum Postgres connections held by the broker. Defaults to `10`. |
 | `LIVEPROBE_STATE_FILE` | broker | Local/dev JSON fallback state file. |
 | `BROKER_URL` | MCP, agents | HTTP origin for the broker. |
+| `LIVEPROBE_PROJECT_ID` | agents | Stable project/repository ID used for broker routing. |
+| `LIVEPROBE_ENVIRONMENT` | agents | Deployment environment ID, such as `staging` or `production`. |
 | `LIVEPROBE_PUBLIC_URL` | broker | Public HTTPS broker origin used in MCP OAuth protected-resource metadata. |
 | `LIVEPROBE_COMMIT_SHA` / `GIT_COMMIT` | agents | Required deployed commit SHA reported on every ingest. |
 | `LIVEPROBE_SOURCE_MAP_DIR` | Node agent | Directory containing generated `.map` files. |

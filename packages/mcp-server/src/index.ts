@@ -15,6 +15,10 @@ const catalogIdSchema = z
   .max(100)
   .regex(/^[a-z0-9][a-z0-9._-]*$/);
 const displayNameSchema = z.string().trim().min(1).max(200);
+const scopeInputShape = {
+  project_id: catalogIdSchema.optional().default("default"),
+  environment_id: catalogIdSchema.optional().default("default"),
+} as const;
 const sourceFileSchema = z.string().trim().min(1).max(4_096);
 const commitHashSchema = z
   .string()
@@ -174,6 +178,7 @@ export const McpConditionSchema = z
   .strict();
 
 const commonInputShape = {
+  ...scopeInputShape,
   service_id: serviceIdSchema.describe("Target service from list_services"),
   commit_hash: commitHashSchema.describe(
     "User-supplied deployed commit SHA retained as audit metadata; not runtime proof",
@@ -257,11 +262,12 @@ export const SetMetricProbeInputSchema = z
     }
   });
 
-export const ListServicesInputSchema = z.object({}).strict();
-export const PingBrokerInputSchema = z.object({}).strict();
-export const GetSafetyOverviewInputSchema = z.object({}).strict();
+export const ListServicesInputSchema = z.object(scopeInputShape).strict();
+export const PingBrokerInputSchema = z.object(scopeInputShape).strict();
+export const GetSafetyOverviewInputSchema = z.object(scopeInputShape).strict();
 export const ListAuditEventsInputSchema = z
   .object({
+    ...scopeInputShape,
     limit: z.number().int().min(1).max(100).optional().default(50),
     before: z
       .string()
@@ -346,11 +352,13 @@ export const RevokeServiceCredentialInputSchema = z
   .strict();
 export const ListProbesInputSchema = z
   .object({
+    ...scopeInputShape,
     service_id: serviceIdSchema.optional(),
   })
   .strict();
 export const GetProbeDataInputSchema = z
   .object({
+    ...scopeInputShape,
     probe_id: probeIdSchema,
     wait_seconds: z
       .number()
@@ -366,6 +374,7 @@ export const GetProbeDataInputSchema = z
   .strict();
 export const RemoveProbeInputSchema = z
   .object({
+    ...scopeInputShape,
     probe_id: probeIdSchema,
   })
   .strict();
@@ -689,6 +698,11 @@ export interface BrokerClientOptions {
   requestTimeoutMs?: number;
 }
 
+interface RequestScope {
+  projectId: string;
+  environmentId: string;
+}
+
 export class BrokerClient {
   private readonly baseUrl: string;
   private readonly fetchImplementation: typeof fetch;
@@ -725,32 +739,41 @@ export class BrokerClient {
     }
   }
 
-  public async ping(): Promise<{ ok: true }> {
-    return this.request("GET", "/v1/ping", pingResponseSchema);
+  public async ping(
+    scope: RequestScope = { projectId: "default", environmentId: "default" },
+  ): Promise<{ ok: true }> {
+    return this.request("GET", "/v1/ping", pingResponseSchema, undefined, scope);
   }
 
   public async createProbe(
     input: BrokerCreateProbeInput,
+    scope: RequestScope,
   ): Promise<BrokerProbeDefinition> {
     const result = await this.request(
       "POST",
       "/v1/probes",
       createProbeResponseSchema,
       input,
+      scope,
     );
     return result.probe;
   }
 
-  public async listServices(): Promise<{ services: BrokerService[] }> {
+  public async listServices(
+    scope: RequestScope,
+  ): Promise<{ services: BrokerService[] }> {
     return this.request(
       "GET",
       "/v1/services",
       listServicesResponseSchema,
+      undefined,
+      scope,
     );
   }
 
   public async listProbes(
     serviceId?: string,
+    scope: RequestScope = { projectId: "default", environmentId: "default" },
   ): Promise<z.infer<typeof listProbesResponseSchema>> {
     const search =
       serviceId === undefined
@@ -760,12 +783,15 @@ export class BrokerClient {
       "GET",
       `/v1/probes${search}`,
       listProbesResponseSchema,
+      undefined,
+      scope,
     );
   }
 
   public async getProbeData(
     probeId: string,
     waitSeconds = 0,
+    scope: RequestScope = { projectId: "default", environmentId: "default" },
   ): Promise<BrokerProbeData> {
     const search = new URLSearchParams({
       waitSeconds: String(waitSeconds),
@@ -774,14 +800,26 @@ export class BrokerClient {
       "GET",
       `/v1/probes/${encodeURIComponent(probeId)}/data?${search.toString()}`,
       probeDataResponseSchema,
+      undefined,
+      scope,
     );
   }
 
-  public async getSafetyOverview(): Promise<z.infer<typeof safetyResponseSchema>> {
-    return this.request("GET", "/v1/safety", safetyResponseSchema);
+  public async getSafetyOverview(
+    scope: RequestScope,
+  ): Promise<z.infer<typeof safetyResponseSchema>> {
+    return this.request(
+      "GET",
+      "/v1/safety",
+      safetyResponseSchema,
+      undefined,
+      scope,
+    );
   }
 
   public async listAuditEvents(input: {
+    projectId: string;
+    environmentId: string;
     limit: number;
     before?: string | undefined;
   }): Promise<z.infer<typeof listAuditEventsResponseSchema>> {
@@ -791,6 +829,8 @@ export class BrokerClient {
       "GET",
       `/v1/audit-events?${search.toString()}`,
       listAuditEventsResponseSchema,
+      undefined,
+      input,
     );
   }
 
@@ -913,6 +953,7 @@ export class BrokerClient {
       "/v1/service-credentials",
       createServiceCredentialResponseSchema,
       input,
+      input,
     );
   }
 
@@ -934,6 +975,8 @@ export class BrokerClient {
       "GET",
       `/v1/service-credentials?${search.toString()}`,
       listServiceCredentialsResponseSchema,
+      undefined,
+      input,
     );
   }
 
@@ -947,13 +990,18 @@ export class BrokerClient {
       "DELETE",
       `/v1/service-credentials/${encodeURIComponent(credentialId)}?` +
         search.toString(),
+      { projectId, environmentId },
     );
   }
 
-  public async removeProbe(probeId: string): Promise<void> {
+  public async removeProbe(
+    probeId: string,
+    scope: RequestScope,
+  ): Promise<void> {
     await this.requestNoContent(
       "DELETE",
       `/v1/probes/${encodeURIComponent(probeId)}`,
+      scope,
     );
   }
 
@@ -962,6 +1010,7 @@ export class BrokerClient {
     path: string,
     schema: z.ZodType<T>,
     body?: unknown,
+    scope?: RequestScope,
   ): Promise<T> {
     const response = await this.fetchWithTimeout(`${this.baseUrl}${path}`, {
       method,
@@ -973,6 +1022,12 @@ export class BrokerClient {
         ...(body === undefined
           ? {}
           : { "content-type": "application/json" }),
+        ...(scope === undefined
+          ? {}
+          : {
+              "liveprobe-project": scope.projectId,
+              "liveprobe-environment": scope.environmentId,
+            }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -997,6 +1052,7 @@ export class BrokerClient {
   private async requestNoContent(
     method: "DELETE",
     path: string,
+    scope?: RequestScope,
   ): Promise<void> {
     const response = await this.fetchWithTimeout(`${this.baseUrl}${path}`, {
       method,
@@ -1005,6 +1061,12 @@ export class BrokerClient {
         ...(this.apiKey === undefined
           ? {}
           : { authorization: `Bearer ${this.apiKey}` }),
+        ...(scope === undefined
+          ? {}
+          : {
+              "liveprobe-project": scope.projectId,
+              "liveprobe-environment": scope.environmentId,
+            }),
       },
     });
     if (!response.ok) {
@@ -1160,11 +1222,22 @@ function optionalCommonFields(input: {
   };
 }
 
+function requestScope(input: {
+  project_id: string;
+  environment_id: string;
+}): RequestScope {
+  return {
+    projectId: input.project_id,
+    environmentId: input.environment_id,
+  };
+}
+
 export function createToolHandlers(client: BrokerClient): ToolHandlers {
   async function createWithCommitWarning(
     input: BrokerCreateProbeInput,
+    scope: RequestScope,
   ): Promise<ProbeCreateResult> {
-    const services = await client.listServices();
+    const services = await client.listServices(scope);
     const service = services.services.find(
       (candidate) => candidate.serviceId === input.serviceId,
     );
@@ -1175,7 +1248,7 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         "unknown_service",
       );
     }
-    const probe = await client.createProbe(input);
+    const probe = await client.createProbe(input, scope);
     if (
       service?.commitSha !== undefined &&
       service.commitSha !== input.sourceCommit
@@ -1198,24 +1271,27 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
   return {
     async set_snapshot_probe(rawInput) {
       const input = SetSnapshotProbeInputSchema.parse(rawInput);
-      return createWithCommitWarning({
-        serviceId: input.service_id,
-        sourceCommit: input.commit_hash,
-        type: "snapshot",
-        file: input.file,
-        line: input.line,
-        ttlSeconds: input.ttl_seconds,
-        createdBy: input.created_by,
-        ...optionalCommonFields(input),
-        ...(input.watch_paths === undefined
-          ? {}
-          : { watchPaths: input.watch_paths }),
-        ...(input.watch_expressions === undefined
-          ? {}
-          : { watchExpressions: input.watch_expressions }),
-        includeStackLocals: input.include_stack_locals,
-        stackFrameLimit: input.stack_frame_limit,
-      });
+      return createWithCommitWarning(
+        {
+          serviceId: input.service_id,
+          sourceCommit: input.commit_hash,
+          type: "snapshot",
+          file: input.file,
+          line: input.line,
+          ttlSeconds: input.ttl_seconds,
+          createdBy: input.created_by,
+          ...optionalCommonFields(input),
+          ...(input.watch_paths === undefined
+            ? {}
+            : { watchPaths: input.watch_paths }),
+          ...(input.watch_expressions === undefined
+            ? {}
+            : { watchExpressions: input.watch_expressions }),
+          includeStackLocals: input.include_stack_locals,
+          stackFrameLimit: input.stack_frame_limit,
+        },
+        requestScope(input),
+      );
     },
     async set_log_probe(rawInput) {
       const input = SetLogProbeInputSchema.parse(rawInput);
@@ -1230,7 +1306,7 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         ttlSeconds: input.ttl_seconds,
         createdBy: input.created_by,
         ...optionalCommonFields(input),
-      });
+      }, requestScope(input));
     },
     async set_counter_probe(rawInput) {
       const input = SetCounterProbeInputSchema.parse(rawInput);
@@ -1243,7 +1319,7 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         ttlSeconds: input.ttl_seconds,
         createdBy: input.created_by,
         ...optionalCommonFields(input),
-      });
+      }, requestScope(input));
     },
     async set_metric_probe(rawInput) {
       const input = SetMetricProbeInputSchema.parse(rawInput);
@@ -1262,11 +1338,11 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         ttlSeconds: input.ttl_seconds,
         createdBy: input.created_by,
         ...optionalCommonFields(input),
-      });
+      }, requestScope(input));
     },
     async list_services(rawInput = {}) {
-      ListServicesInputSchema.parse(rawInput);
-      const response = await client.listServices();
+      const input = ListServicesInputSchema.parse(rawInput);
+      const response = await client.listServices(requestScope(input));
       const now = Date.now();
       return {
         services: response.services.map((service) => {
@@ -1291,16 +1367,20 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
       };
     },
     async ping_broker(rawInput = {}) {
-      PingBrokerInputSchema.parse(rawInput);
-      return client.ping();
+      const input = PingBrokerInputSchema.parse(rawInput);
+      return client.ping(requestScope(input));
     },
     async get_safety_overview(rawInput = {}) {
-      GetSafetyOverviewInputSchema.parse(rawInput);
-      return client.getSafetyOverview();
+      const input = GetSafetyOverviewInputSchema.parse(rawInput);
+      return client.getSafetyOverview(requestScope(input));
     },
     async list_audit_events(rawInput = {}) {
       const input = ListAuditEventsInputSchema.parse(rawInput);
-      return client.listAuditEvents(input);
+      return client.listAuditEvents({
+        ...requestScope(input),
+        limit: input.limit,
+        ...(input.before === undefined ? {} : { before: input.before }),
+      });
     },
     async list_projects(rawInput = {}) {
       const input = ListProjectsInputSchema.parse(rawInput);
@@ -1399,15 +1479,19 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
     },
     async list_probes(rawInput) {
       const input = ListProbesInputSchema.parse(rawInput);
-      return client.listProbes(input.service_id);
+      return client.listProbes(input.service_id, requestScope(input));
     },
     async get_probe_data(rawInput) {
       const input = GetProbeDataInputSchema.parse(rawInput);
-      return client.getProbeData(input.probe_id, input.wait_seconds);
+      return client.getProbeData(
+        input.probe_id,
+        input.wait_seconds,
+        requestScope(input),
+      );
     },
     async remove_probe(rawInput) {
       const input = RemoveProbeInputSchema.parse(rawInput);
-      await client.removeProbe(input.probe_id);
+      await client.removeProbe(input.probe_id, requestScope(input));
       return { removed: true, probeId: input.probe_id };
     },
   };

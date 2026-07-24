@@ -10,11 +10,16 @@ agent = liveprobe.start(
     broker_url="http://127.0.0.1:7070",
     api_key="dev-key",
     commit_sha="abcdef1234567890",
+    project_id="billing-repo",
+    environment="production",
 )
 ```
 
 `commit_sha` is required unless `LIVEPROBE_COMMIT_SHA` or `GIT_COMMIT` is set.
 `api_key` defaults to `LIVEPROBE_API_KEY`.
+`project_id` and `environment` default to `LIVEPROBE_PROJECT_ID` and
+`LIVEPROBE_ENVIRONMENT`. Configure the same values when issuing the service
+credential; service credentials cannot route to another project or environment.
 
 The agent supports `debug`, `info`, `warn`, and `error` log events,
 broker-compiled safe expressions for conditions, watches, logs, and metrics,

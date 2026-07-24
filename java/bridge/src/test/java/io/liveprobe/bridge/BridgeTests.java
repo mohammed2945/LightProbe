@@ -7,6 +7,8 @@ import com.sun.jdi.StackFrame;
 import java.io.IOException;
 import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
+import java.net.URI;
+import java.net.http.HttpRequest;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -38,6 +40,7 @@ public final class BridgeTests {
         testSafeExpressionValidation();
         testExpressionIntegrations();
         testIngestRetryClassification();
+        testBrokerRoutingHeaders();
         testRateLimiter();
         testFalseThenTrueHitLimit();
         testConcurrentMatchingSlots();
@@ -56,6 +59,33 @@ public final class BridgeTests {
         assertThrows(() -> Json.parse("{\"a\":1,\"a\":2}"), "duplicate keys rejected");
         assertThrows(() -> Json.parse("[01]"), "leading zero rejected");
         assertThrows(() -> Json.stringify(Double.NaN), "non-finite number rejected");
+    }
+
+    private static void testBrokerRoutingHeaders() throws Exception {
+        BrokerClient client = new BrokerClient(
+                URI.create("https://broker.example"),
+                "service",
+                "test-key",
+                "abcdef1234567890",
+                "config",
+                "acquireiq",
+                "production");
+        HttpRequest.Builder builder = HttpRequest.newBuilder(
+                URI.create("https://broker.example/v1/services"));
+        HttpRequest request = client.withAuth(builder).GET().build();
+
+        assertEquals(
+                "Bearer test-key",
+                request.headers().firstValue("Authorization").orElse(null),
+                "broker authorization header");
+        assertEquals(
+                "acquireiq",
+                request.headers().firstValue("LiveProbe-Project").orElse(null),
+                "broker project header");
+        assertEquals(
+                "production",
+                request.headers().firstValue("LiveProbe-Environment").orElse(null),
+                "broker environment header");
     }
 
     private static void testSerializerFixtures() throws IOException {

@@ -71,4 +71,10 @@ same pilot permissions within their organization. Tool failures return
 structured JSON guidance for bad credentials, insufficient roles, unknown
 services, missing probes, and an unreachable broker.
 
+Operational tools accept `project_id` and `environment_id`. Use the same
+project/environment pair as the target runtime agent. This allows the same
+`service_id` to run independently in environments such as `staging` and
+`production`; probes, events, service status, and safety data never cross that
+routing boundary.
+
 Run `npx -y @doomslayer2945/liveprobe-mcp@0.2.0 --help` for CLI options.

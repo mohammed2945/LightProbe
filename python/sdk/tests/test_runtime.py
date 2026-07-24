@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import urllib.error
+import urllib.request
 from typing import Any
 
 import pytest
@@ -943,6 +944,50 @@ def test_ingest_payload_includes_commit_metadata(fake_monitoring: Any) -> None:
         },
         "events": [],
     }
+
+
+def test_broker_requests_include_project_and_environment_headers(
+    fake_monitoring: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LIVEPROBE_PROJECT_ID", "ignored-project")
+    monkeypatch.setenv("LIVEPROBE_ENVIRONMENT", "ignored-environment")
+    agent = LiveProbe(
+        service_id="service",
+        broker_url="https://broker.example",
+        api_key="test-key",
+        commit_sha="abcdef1234567890",
+        project_id="acquireiq",
+        environment="production",
+        monitoring=fake_monitoring,
+    )
+    captured: list[urllib.request.Request] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(
+        request: urllib.request.Request, *, timeout: float
+    ) -> Response:
+        assert timeout == agent.limits.request_timeout
+        captured.append(request)
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    agent._request_json("GET", "/v1/services")
+
+    assert len(captured) == 1
+    headers = {key.lower(): value for key, value in captured[0].header_items()}
+    assert headers["authorization"] == "Bearer test-key"
+    assert headers["liveprobe-project"] == "acquireiq"
+    assert headers["liveprobe-environment"] == "production"
 
 
 def test_commit_sha_is_required(fake_monitoring: Any, monkeypatch: pytest.MonkeyPatch) -> None:

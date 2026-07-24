@@ -18,6 +18,23 @@ const probe: ProbeDefinition = {
 };
 
 describe("BrokerClient", () => {
+  it("sends the configured project and environment on broker requests", async () => {
+    let headers = new Headers();
+    const client = new BrokerClient("http://broker:7070", {
+      projectId: "acquireiq",
+      environment: "production",
+      fetch: (async (_input: URL, init: RequestInit) => {
+        headers = new Headers(init.headers);
+        return new Response(JSON.stringify({ version: 0, probes: [] }));
+      }) as never,
+    });
+
+    await client.poll("api", 0);
+
+    expect(headers.get("liveprobe-project")).toBe("acquireiq");
+    expect(headers.get("liveprobe-environment")).toBe("production");
+  });
+
   it("uses the documented poll URL and parses complete snapshots", async () => {
     let requested = "";
     const client = new BrokerClient("http://broker:7070", {

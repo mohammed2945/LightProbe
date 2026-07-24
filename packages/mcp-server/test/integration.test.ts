@@ -680,12 +680,17 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     const occurredAt = "2026-07-22T20:00:00.000Z";
     let requestedUrl = "";
     let authorization = "";
+    let project = "";
+    let environment = "";
     const handlers = createToolHandlers(
       new BrokerClient("https://probe.example.com", {
         apiKey: "admin-token",
         fetchImplementation: async (input, init) => {
           requestedUrl = String(input);
-          authorization = new Headers(init?.headers).get("authorization") ?? "";
+          const headers = new Headers(init?.headers);
+          authorization = headers.get("authorization") ?? "";
+          project = headers.get("liveprobe-project") ?? "";
+          environment = headers.get("liveprobe-environment") ?? "";
           return new Response(
             JSON.stringify({
               events: [
@@ -715,7 +720,12 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     );
 
     await expect(
-      handlers.list_audit_events({ limit: 10, before: occurredAt }),
+      handlers.list_audit_events({
+        project_id: "acquireiq",
+        environment_id: "production",
+        limit: 10,
+        before: occurredAt,
+      }),
     ).resolves.toMatchObject({
       events: [
         {
@@ -729,6 +739,8 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       `https://probe.example.com/v1/audit-events?limit=10&before=${encodeURIComponent(occurredAt)}`,
     );
     expect(authorization).toBe("Bearer admin-token");
+    expect(project).toBe("acquireiq");
+    expect(environment).toBe("production");
 
     const server = createMcpServer(
       new BrokerClient("https://probe.example.com", {

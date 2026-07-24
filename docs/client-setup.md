@@ -72,7 +72,8 @@ const liveProbe = await LiveProbe.start({
   brokerUrl: process.env.BROKER_URL!,
   apiKey: process.env.LIVEPROBE_API_KEY,
   commitSha: process.env.GIT_COMMIT,
-  environment: process.env.NODE_ENV ?? "development",
+  projectId: process.env.LIVEPROBE_PROJECT_ID,
+  environment: process.env.LIVEPROBE_ENVIRONMENT,
   sourceMapDir: process.env.LIVEPROBE_SOURCE_MAP_DIR,
   distLocation: process.env.LIVEPROBE_DIST_LOCATION ?? "dist",
   appRoot: process.env.LIVEPROBE_APP_ROOT,
@@ -125,7 +126,8 @@ agent = liveprobe.start(
     broker_url=os.environ["BROKER_URL"],
     api_key=os.environ.get("LIVEPROBE_API_KEY"),
     commit_sha=os.environ.get("GIT_COMMIT"),
-    environment=os.environ.get("ENVIRONMENT", "development"),
+    project_id=os.environ.get("LIVEPROBE_PROJECT_ID"),
+    environment=os.environ.get("LIVEPROBE_ENVIRONMENT"),
 )
 
 # Call this from the framework's existing shutdown hook.
@@ -186,6 +188,8 @@ java \
 Run the bridge beside the target:
 
 ```sh
+export LIVEPROBE_PROJECT_ID="inventory"
+export LIVEPROBE_ENVIRONMENT="production"
 java --add-modules jdk.jdi \
   -jar "$HOME/.m2/repository/io/liveprobe/liveprobe-bridge/0.2.0/liveprobe-bridge-0.2.0.jar" \
   --service inventory-service \
@@ -278,12 +282,16 @@ deploying the runtime agent:
    service ID, and a descriptive label.
 5. Store the returned `apiKey` in the service's secret manager or deployment
    environment. The plaintext key is shown only in the create response.
-6. Configure the agent with `LIVEPROBE_API_KEY`, `LIVEPROBE_BROKER_URL`, and
-   the required `LIVEPROBE_COMMIT_SHA`.
+6. Configure the agent with `LIVEPROBE_API_KEY`, `BROKER_URL`,
+   `LIVEPROBE_PROJECT_ID`, `LIVEPROBE_ENVIRONMENT`, and the required
+   `LIVEPROBE_COMMIT_SHA`.
 7. Use `list_service_credentials` later to review key prefixes and status.
 8. Use `revoke_service_credential` to disable a key that is no longer needed.
 
 Credentials are scoped to one organization, project, environment, and service.
+Pass the same `project_id` and `environment_id` to MCP operational tools. The
+broker can therefore keep `inventory/production` and `inventory/staging`
+separate even when both deployments use the same service ID.
 Archiving a project, environment, or service revokes its affected active
 credentials while retaining probe and audit history. Removing a person from
 the Clerk organization removes their human access, but does not otherwise

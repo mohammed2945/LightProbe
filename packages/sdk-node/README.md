@@ -10,6 +10,8 @@ const agent = await LiveProbe.start({
   brokerUrl: process.env.BROKER_URL ?? "http://127.0.0.1:7070",
   apiKey: process.env.LIVEPROBE_API_KEY,
   commitSha: process.env.LIVEPROBE_COMMIT_SHA ?? process.env.GIT_COMMIT,
+  projectId: process.env.LIVEPROBE_PROJECT_ID,
+  environment: process.env.LIVEPROBE_ENVIRONMENT,
   sourceMapDir: process.env.LIVEPROBE_SOURCE_MAP_DIR,
   distLocation: process.env.LIVEPROBE_DIST_LOCATION,
   appRoot: process.env.LIVEPROBE_APP_ROOT,
@@ -18,6 +20,9 @@ const agent = await LiveProbe.start({
 
 `commitSha` is required and must be a 7-64 character hexadecimal Git object ID.
 `apiKey` is sent as `Authorization: Bearer <key>`.
+`projectId` and `environment` select the registered repository and deployment.
+They default to `LIVEPROBE_PROJECT_ID` and `LIVEPROBE_ENVIRONMENT`. Service
+credentials are scoped to those exact values and cannot switch scope.
 
 The agent advertises support for log severities, broker-compiled safe
 expressions, and optional per-frame stack locals. Safe expressions operate

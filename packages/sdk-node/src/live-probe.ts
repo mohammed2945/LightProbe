@@ -35,6 +35,7 @@ export interface LiveProbeOptions {
   sourceMapDir?: string;
   distLocation?: string;
   appRoot?: string;
+  projectId?: string;
   environment?: string;
   redactKeys?: readonly string[];
   redactValues?: readonly string[];
@@ -136,6 +137,7 @@ export class LiveProbe {
   readonly #serviceId: string;
   readonly #commitSha: string;
   readonly #commitSource: "env" | "config";
+  readonly #projectId: string | undefined;
   readonly #environment: string | undefined;
   readonly #limits: ResolvedLimits;
   readonly #inspector: InspectorClient;
@@ -167,13 +169,21 @@ export class LiveProbe {
     this.#serviceId = options.serviceId;
     this.#commitSha = resolvedCommit.commitSha;
     this.#commitSource = resolvedCommit.commitSource;
-    this.#environment = options.environment;
+    this.#projectId = options.projectId ?? envValue("LIVEPROBE_PROJECT_ID");
+    this.#environment =
+      options.environment ?? envValue("LIVEPROBE_ENVIRONMENT");
     this.#limits = resolveLimits(options.limits);
     const serializerConfig = normalizeSerializerConfig(serializerInput(options));
     this.#inspector = new InspectorClient();
     const apiKey = options.apiKey ?? envValue("LIVEPROBE_API_KEY");
     this.#broker = new BrokerClient(options.brokerUrl, {
       ...(apiKey === undefined ? {} : { apiKey }),
+      ...(this.#projectId === undefined
+        ? {}
+        : { projectId: this.#projectId }),
+      ...(this.#environment === undefined
+        ? {}
+        : { environment: this.#environment }),
       requestTimeoutMs: this.#limits.requestTimeoutMs,
     });
     const sourceMapDir =

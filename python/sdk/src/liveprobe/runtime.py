@@ -534,6 +534,7 @@ class LiveProbe:
         broker_url: str,
         api_key: str | None = None,
         commit_sha: str | None = None,
+        project_id: str | None = None,
         environment: str | None = None,
         redact_keys: list[str] | tuple[str, ...] | None = None,
         redact_values: list[str] | tuple[str, ...] | None = None,
@@ -557,7 +558,16 @@ class LiveProbe:
         self.broker_url = broker_url.rstrip("/")
         self.api_key = api_key if api_key is not None else _env("LIVEPROBE_API_KEY")
         self.commit_sha, self.commit_source = _resolve_commit_sha(commit_sha)
-        self.environment = environment
+        self.project_id = (
+            project_id.strip()
+            if isinstance(project_id, str) and project_id.strip()
+            else _env("LIVEPROBE_PROJECT_ID")
+        )
+        self.environment = (
+            environment.strip()
+            if isinstance(environment, str) and environment.strip()
+            else _env("LIVEPROBE_ENVIRONMENT")
+        )
         self.limits = Limits.from_mapping(limits)
         self.serializer_config = SerializerConfig.from_mapping(
             serializer_config,
@@ -1530,6 +1540,10 @@ class LiveProbe:
         headers = {"Accept": "application/json", "User-Agent": "liveprobe-python/0.1"}
         if self.api_key is not None:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.project_id is not None:
+            headers["LiveProbe-Project"] = self.project_id
+        if self.environment is not None:
+            headers["LiveProbe-Environment"] = self.environment
         if body is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(

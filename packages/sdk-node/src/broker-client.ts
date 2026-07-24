@@ -213,6 +213,8 @@ export class BrokerClient {
   readonly #requestTimeoutMs: number;
   readonly #apiKey: string | undefined;
   readonly #agentId: string;
+  readonly #projectId: string | undefined;
+  readonly #environment: string | undefined;
   readonly #controllers = new Set<AbortController>();
   #stopped = false;
 
@@ -221,6 +223,8 @@ export class BrokerClient {
     options: {
       agentId?: string;
       apiKey?: string;
+      projectId?: string;
+      environment?: string;
       fetch?: FetchLike;
       requestTimeoutMs?: number;
     } = {},
@@ -240,6 +244,8 @@ export class BrokerClient {
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 5000;
     this.#apiKey = options.apiKey;
     this.#agentId = options.agentId ?? randomUUID();
+    this.#projectId = options.projectId;
+    this.#environment = options.environment;
   }
 
   async poll(
@@ -355,6 +361,12 @@ export class BrokerClient {
           ...(this.#apiKey === undefined
             ? {}
             : { authorization: `Bearer ${this.#apiKey}` }),
+          ...(this.#projectId === undefined
+            ? {}
+            : { "liveprobe-project": this.#projectId }),
+          ...(this.#environment === undefined
+            ? {}
+            : { "liveprobe-environment": this.#environment }),
           ...(init.headers ?? {}),
         },
         signal: controller.signal,

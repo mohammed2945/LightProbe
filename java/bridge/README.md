@@ -18,6 +18,8 @@ commit SHA:
 
 ```sh
 export LIVEPROBE_API_KEY="your-shared-key"
+export LIVEPROBE_PROJECT_ID="inventory-repo"
+export LIVEPROBE_ENVIRONMENT="production"
 java --add-modules jdk.jdi -jar build/liveprobe-bridge.jar \
   --service inventory-service \
   --attach 127.0.0.1:5005 \
@@ -27,6 +29,9 @@ java --add-modules jdk.jdi -jar build/liveprobe-bridge.jar \
 
 The bridge exits before attaching when no valid 7-64 character hexadecimal
 commit is available from `--commit`, `LIVEPROBE_COMMIT_SHA`, or `GIT_COMMIT`.
+Project and environment routing use `--project` / `--environment` when
+provided, then `LIVEPROBE_PROJECT_ID` / `LIVEPROBE_ENVIRONMENT`. A service
+credential is accepted only in its issued project and environment.
 
 Bind JDWP to loopback unless the deployment has an equivalent private, authenticated network
 boundary. Source line resolution requires `LineNumberTable` metadata, and local capture requires

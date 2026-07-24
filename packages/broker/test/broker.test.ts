@@ -803,6 +803,144 @@ describe("broker validation and storage", () => {
     expect(archived.statusCode).toBe(204);
   });
 
+  it("routes human requests by project and environment without widening agent scope", async () => {
+    const state = new BrokerState();
+    const productionScope = {
+      tenantId: "tenant-routing",
+      projectId: "acquireiq",
+      environmentId: "production",
+    };
+    const stagingScope = {
+      ...productionScope,
+      environmentId: "staging",
+    };
+    state.ingest(
+      {
+        serviceId: "api",
+        sdk: "node",
+        commitSha: "aaaaaaaaaaaaaaa1",
+        commitSource: "config",
+        agentStatus: { state: "green" },
+        events: [],
+      },
+      productionScope,
+    );
+    state.ingest(
+      {
+        serviceId: "api",
+        sdk: "node",
+        commitSha: "bbbbbbbbbbbbbbb2",
+        commitSource: "config",
+        agentStatus: { state: "green" },
+        events: [],
+      },
+      stagingScope,
+    );
+    const principals: Record<string, BrokerPrincipal> = {
+      human: {
+        type: "user",
+        role: "admin",
+        principalId: "user-routing",
+        tenantId: "tenant-routing",
+        projectId: "default",
+        environmentId: "default",
+      },
+      productionAgent: {
+        type: "service",
+        role: "agent",
+        principalId: "credential-production",
+        serviceId: "api",
+        ...productionScope,
+      },
+    };
+    const broker = await buildBroker({
+      state,
+      authenticateBearer: async (token) => principals[token],
+      store: {
+        async restore() {},
+        async persist() {},
+        async listEnvironments(tenantId, projectId) {
+          return [productionScope, stagingScope].map((scope) => ({
+            ...scope,
+            tenantId,
+            projectId,
+            displayName: scope.environmentId,
+            createdAt: "2026-07-24T08:00:00.000Z",
+          }));
+        },
+      },
+    });
+    openBrokers.push(broker);
+
+    const production = await broker.inject({
+      method: "GET",
+      url: "/v1/services",
+      headers: {
+        authorization: "Bearer human",
+        "liveprobe-project": "acquireiq",
+        "liveprobe-environment": "production",
+      },
+    });
+    expect(production.statusCode).toBe(200);
+    expect(production.headers["liveprobe-project"]).toBe("acquireiq");
+    expect(production.headers["liveprobe-environment"]).toBe("production");
+    expect(production.json()).toMatchObject({
+      services: [{ serviceId: "api", commitSha: "aaaaaaaaaaaaaaa1" }],
+    });
+
+    const staging = await broker.inject({
+      method: "GET",
+      url: "/v1/services",
+      headers: {
+        authorization: "Bearer human",
+        "liveprobe-project": "acquireiq",
+        "liveprobe-environment": "staging",
+      },
+    });
+    expect(staging.json()).toMatchObject({
+      services: [{ serviceId: "api", commitSha: "bbbbbbbbbbbbbbb2" }],
+    });
+
+    const unknown = await broker.inject({
+      method: "GET",
+      url: "/v1/services",
+      headers: {
+        authorization: "Bearer human",
+        "liveprobe-project": "acquireiq",
+        "liveprobe-environment": "preview",
+      },
+    });
+    expect(unknown.statusCode).toBe(404);
+    expect(unknown.json()).toMatchObject({
+      error: { code: "environment_not_found" },
+    });
+
+    const matchingAgent = await broker.inject({
+      method: "GET",
+      url: "/v1/ping",
+      headers: {
+        authorization: "Bearer productionAgent",
+        "liveprobe-project": "acquireiq",
+        "liveprobe-environment": "production",
+      },
+    });
+    expect(matchingAgent.statusCode).toBe(200);
+
+    const mismatchedAgent = await broker.inject({
+      method: "GET",
+      url: "/v1/ping",
+      headers: {
+        authorization: "Bearer productionAgent",
+        "liveprobe-project": "acquireiq",
+        "liveprobe-environment": "staging",
+      },
+    });
+    expect(mismatchedAgent.statusCode).toBe(403);
+    expect(mismatchedAgent.json()).toMatchObject({
+      error: { code: "scope_mismatch" },
+    });
+  });
+
   it("allows all human roles while keeping agent route boundaries", async () => {
     const auditEvents: AuditEventRecord[] = [];
     const principals: Record<string, BrokerPrincipal> = {

@@ -105,7 +105,8 @@ public final class Main {
                 Usage: java -jar liveprobe-bridge.jar \\
                   --service <service-id> --attach <host:port> --broker <http(s)://broker> --commit <sha>
 
-                Optional: --hits-per-second <n>, --redact-key <pattern>, --redact-value <literal>
+                Optional: --project <project-id>, --environment <environment-id>,
+                  --hits-per-second <n>, --redact-key <pattern>, --redact-value <literal>
                 The target must expose JDWP (prefer a localhost bind) and include -g debug information.
                 """);
     }
@@ -126,6 +127,8 @@ record BridgeConfig(
         String apiKey,
         String commitSha,
         String commitSource,
+        String projectId,
+        String environment,
         int hitsPerSecond,
         SafeSerializer.Config serializerConfig,
         boolean help) {
@@ -135,6 +138,8 @@ record BridgeConfig(
         URI broker = null;
         String commit = null;
         String commitSource = "config";
+        String projectId = null;
+        String environment = null;
         int hitsPerSecond = 10;
         ArrayList<String> redactKeys = new ArrayList<>();
         ArrayList<String> redactValues = new ArrayList<>();
@@ -161,6 +166,8 @@ record BridgeConfig(
                     }
                 }
                 case "--commit" -> commit = value;
+                case "--project" -> projectId = value;
+                case "--environment" -> environment = value;
                 case "--hits-per-second" -> hitsPerSecond = positiveInt(value, flag);
                 case "--redact-key" -> redactKeys.add(value);
                 case "--redact-value" -> redactValues.add(value);
@@ -171,7 +178,8 @@ record BridgeConfig(
         if (help) {
             return new BridgeConfig(
                     "", new AttachAddress("localhost", 1), URI.create("http://localhost"),
-                    "", "abcdef1", "config", hitsPerSecond, SafeSerializer.Config.defaults(), true);
+                    "", "abcdef1", "config", null, null, hitsPerSecond,
+                    SafeSerializer.Config.defaults(), true);
         }
         if (service == null || service.isBlank()) {
             throw new IllegalArgumentException("--service is required");
@@ -195,6 +203,8 @@ record BridgeConfig(
         if (!commit.matches("(?i)^[0-9a-f]{7,64}$")) {
             throw new IllegalArgumentException("--commit must be a 7-64 character hexadecimal Git object ID");
         }
+        projectId = configuredValue(projectId, "LIVEPROBE_PROJECT_ID");
+        environment = configuredValue(environment, "LIVEPROBE_ENVIRONMENT");
         SafeSerializer.Config serializerConfig = new SafeSerializer.Config(
                 3, 3, 50, 1024, 8, redactKeys, redactValues);
         return new BridgeConfig(
@@ -204,6 +214,8 @@ record BridgeConfig(
                 env("LIVEPROBE_API_KEY"),
                 commit.toLowerCase(),
                 commitSource,
+                projectId,
+                environment,
                 hitsPerSecond,
                 serializerConfig,
                 false);
@@ -212,6 +224,10 @@ record BridgeConfig(
     private static String env(String name) {
         String value = System.getenv(name);
         return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    private static String configuredValue(String value, String envName) {
+        return value == null || value.isBlank() ? env(envName) : value.trim();
     }
 
     private static AttachAddress parseAttach(String value) {
@@ -303,7 +319,9 @@ final class BridgeAgent implements AutoCloseable {
                 config.serviceId(),
                 config.apiKey(),
                 config.commitSha(),
-                config.commitSource());
+                config.commitSource(),
+                config.projectId(),
+                config.environment());
         this.probeManager = new ProbeManager(
                 virtualMachine,
                 new RateLimiter(config.hitsPerSecond()),

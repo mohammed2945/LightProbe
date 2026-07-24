@@ -771,6 +771,13 @@ function principalFor(request: FastifyRequest): BrokerPrincipal {
   return request.liveprobePrincipal;
 }
 
+function scopeFor(request: FastifyRequest): ResourceScope {
+  if (request.liveprobeScope === null) {
+    throw new Error("authenticated request is missing its resource scope");
+  }
+  return request.liveprobeScope;
+}
+
 function requireHumanRead(request: FastifyRequest): BrokerPrincipal {
   const principal = principalFor(request);
   if (principal.role === "agent") {
@@ -793,16 +800,16 @@ function requireAdmin(request: FastifyRequest): BrokerPrincipal {
 }
 
 function selectedResourceScope(
-  principal: BrokerPrincipal,
+  base: ResourceScope,
   selection: {
     projectId?: string | undefined;
     environmentId?: string | undefined;
   },
 ): ResourceScope {
   return {
-    tenantId: principal.tenantId,
-    projectId: selection.projectId ?? principal.projectId,
-    environmentId: selection.environmentId ?? principal.environmentId,
+    tenantId: base.tenantId,
+    projectId: selection.projectId ?? base.projectId,
+    environmentId: selection.environmentId ?? base.environmentId,
   };
 }
 
@@ -2272,6 +2279,7 @@ export async function buildBroker(
   });
   app.decorate("liveprobeState", state);
   app.decorateRequest("liveprobePrincipal", null);
+  app.decorateRequest("liveprobeScope", null);
 
   app.get("/healthz", async () => ({ ok: true }));
   app.get("/readyz", async (request, reply) => {
@@ -2446,20 +2454,19 @@ export async function buildBroker(
     });
   }
 
-  app.addHook("preHandler", async (request) => {
+  app.addHook("preHandler", async (request, reply) => {
     if (!request.url.startsWith("/v1/")) {
       return;
     }
+    let principal: BrokerPrincipal | undefined;
     if (apiKeys.length === 0 && options.authenticateBearer === undefined) {
-      request.liveprobePrincipal = sharedPrincipal("development");
-      return;
-    }
-    if (bearerTokenMatches(request.headers.authorization, apiKeys)) {
-      request.liveprobePrincipal = sharedPrincipal("shared-key");
-      return;
+      principal = sharedPrincipal("development");
+    } else if (bearerTokenMatches(request.headers.authorization, apiKeys)) {
+      principal = sharedPrincipal("shared-key");
     }
     const token = bearerToken(request.headers.authorization);
     if (
+      principal === undefined &&
       token?.startsWith(SERVICE_API_KEY_PREFIX) === true &&
       store !== false &&
       store.authenticateServiceCredential !== undefined
@@ -2468,25 +2475,95 @@ export async function buildBroker(
         hashBearerToken(token),
       );
       if (credential !== undefined) {
-        request.liveprobePrincipal = servicePrincipal(credential);
-        return;
+        principal = servicePrincipal(credential);
       }
     }
-    if (token !== undefined && options.authenticateBearer !== undefined) {
-      const principal = await authenticateExternalBearer(
+    if (
+      principal === undefined &&
+      token !== undefined &&
+      options.authenticateBearer !== undefined
+    ) {
+      principal = await authenticateExternalBearer(
         token,
         options.authenticateBearer,
       );
-      if (principal !== undefined) {
-        request.liveprobePrincipal = principal;
-        return;
+    }
+    if (principal === undefined) {
+      throw new BrokerHttpError(
+        401,
+        "unauthorized",
+        "missing or invalid Authorization bearer token",
+      );
+    }
+
+    const projectHeader = request.headers["liveprobe-project"];
+    const environmentHeader = request.headers["liveprobe-environment"];
+    if (
+      Array.isArray(projectHeader) ||
+      Array.isArray(environmentHeader)
+    ) {
+      throw new BrokerHttpError(
+        400,
+        "invalid_scope",
+        "LiveProbe project and environment headers may only occur once",
+      );
+    }
+    const projectId =
+      projectHeader === undefined
+        ? principal.projectId
+        : catalogIdSchema.parse(projectHeader);
+    const environmentId =
+      environmentHeader === undefined
+        ? principal.environmentId
+        : catalogIdSchema.parse(environmentHeader);
+    const scope = {
+      tenantId: principal.tenantId,
+      projectId,
+      environmentId,
+    };
+    if (
+      principal.type === "service" &&
+      (projectId !== principal.projectId ||
+        environmentId !== principal.environmentId)
+    ) {
+      throw new BrokerHttpError(
+        403,
+        "scope_mismatch",
+        "service credentials cannot switch project or environment",
+      );
+    }
+    if (
+      principal.type !== "service" &&
+      (projectId !== principal.projectId ||
+        environmentId !== principal.environmentId)
+    ) {
+      if (store === false || store.listEnvironments === undefined) {
+        throw new BrokerHttpError(
+          503,
+          "scope_store_unavailable",
+          "non-default environment routing requires the PostgreSQL durable store",
+        );
+      }
+      const environments = await store.listEnvironments(
+        principal.tenantId,
+        projectId,
+      );
+      if (
+        !environments.some(
+          (environment) => environment.environmentId === environmentId,
+        )
+      ) {
+        throw new BrokerHttpError(
+          404,
+          "environment_not_found",
+          `active environment ${projectId}/${environmentId} was not found`,
+        );
       }
     }
-    throw new BrokerHttpError(
-      401,
-      "unauthorized",
-      "missing or invalid Authorization bearer token",
-    );
+    request.liveprobePrincipal = principal;
+    request.liveprobeScope = scope;
+    void reply.header("liveprobe-project", projectId);
+    void reply.header("liveprobe-environment", environmentId);
   });
 
   app.setErrorHandler((error, request, reply) => {
@@ -2579,7 +2656,7 @@ export async function buildBroker(
     errorCode?: string,
   ): Promise<void> => {
     if (store === false || store.appendAuditEvent === undefined) return;
-    const auditScope = context.scope ?? principal;
+    const auditScope = context.scope ?? scopeFor(request);
     await store.appendAuditEvent({
       auditId: `aud_${randomBytes(16).toString("hex")}`,
       tenantId: auditScope.tenantId,
@@ -2971,14 +3048,15 @@ export async function buildBroker(
       successStatus: 201,
     };
     const probe = await runAuditedMutation(request, audit, async () => {
-      const principal = requireProbeManager(request);
+      requireProbeManager(request);
+      const scope = scopeFor(request);
       const created = await mutateDurably(
-        () => state.createProbe(input, principal),
+        () => state.createProbe(input, scope),
         async (persisted) => {
           if (store === false) return;
           await (store.persistProbe === undefined
             ? store.persist(state)
-            : store.persistProbe(state, persisted.id, principal));
+            : store.persistProbe(state, persisted.id, scope));
         },
       );
       audit.resourceId = created.id;
@@ -3000,14 +3078,15 @@ export async function buildBroker(
         successStatus: 204,
       },
       async () => {
-        const principal = requireProbeManager(request);
+        requireProbeManager(request);
+        const scope = scopeFor(request);
         await mutateDurably(
-          () => state.deleteProbe(id, principal),
+          () => state.deleteProbe(id, scope),
           async () => {
             if (store === false) return;
             await (store.deleteProbe === undefined
               ? store.persist(state)
-              : store.deleteProbe(state, id, principal));
+              : store.deleteProbe(state, id, scope));
           },
         );
       },
@@ -3016,15 +3095,15 @@ export async function buildBroker(
   });
 
   app.get("/v1/probes", async (request) => {
-    const principal = requireHumanRead(request);
+    requireHumanRead(request);
     const { serviceId } = listProbeQuerySchema.parse(request.query);
-    return { probes: state.listProbes(serviceId, principal) };
+    return { probes: state.listProbes(serviceId, scopeFor(request)) };
   });
 
   app.get("/v1/services", async (request) => {
-    const principal = requireHumanRead(request);
+    requireHumanRead(request);
     emptyQuerySchema.parse(request.query);
-    return { services: state.listServices(principal) };
+    return { services: state.listServices(scopeFor(request)) };
   });
 
   app.get("/v1/ping", async (request) => {
@@ -3033,16 +3112,16 @@ export async function buildBroker(
   });
 
   app.get("/v1/safety", async (request) => {
-    const principal = requireHumanRead(request);
+    requireHumanRead(request);
     emptyQuerySchema.parse(request.query);
-    return state.safetyOverview(45_000, principal);
+    return state.safetyOverview(45_000, scopeFor(request));
   });
 
   app.post("/v1/service-credentials", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = serviceCredentialCreateSchema.parse(request.body);
     const principal = requireAdmin(request);
-    const scope = selectedResourceScope(principal, input);
+    const scope = selectedResourceScope(scopeFor(request), input);
     const audit: AuditMutationContext = {
       action: "service_credential.create",
       resourceType: "service_credential",
@@ -3138,7 +3217,7 @@ export async function buildBroker(
   app.get("/v1/service-credentials", async (request) => {
     const principal = requireAdmin(request);
     const query = serviceCredentialQuerySchema.parse(request.query);
-    const scope = selectedResourceScope(principal, query);
+    const scope = selectedResourceScope(scopeFor(request), query);
     if (store === false || store.listServiceCredentials === undefined) {
       throw new BrokerHttpError(
         503,
@@ -3165,7 +3244,7 @@ export async function buildBroker(
         request.params,
       );
       const principal = requireAdmin(request);
-      const scope = selectedResourceScope(principal, query);
+      const scope = selectedResourceScope(scopeFor(request), query);
       await runAuditedMutation(
         request,
         {
@@ -3205,7 +3284,7 @@ export async function buildBroker(
   );
 
   app.get("/v1/audit-events", async (request) => {
-    const principal = requireAdmin(request);
+    requireAdmin(request);
     const query = auditListQuerySchema.parse(request.query);
     if (store === false || store.listAuditEvents === undefined) {
       throw new BrokerHttpError(
@@ -3215,7 +3294,7 @@ export async function buildBroker(
       );
     }
     return {
-      events: await store.listAuditEvents(principal, query),
+      events: await store.listAuditEvents(scopeFor(request), query),
     };
   });
 
@@ -3223,32 +3302,38 @@ export async function buildBroker(
     "/v1/services/:serviceId/probes",
     async (request) => {
       const { serviceId } = pollParamsSchema.parse(request.params);
-      const principal = requireServiceAccess(request, serviceId);
+      requireServiceAccess(request, serviceId);
       const { since, commitSha } = pollQuerySchema.parse(request.query);
-      return state.pollProbes(serviceId, since, commitSha, principal);
+      return state.pollProbes(
+        serviceId,
+        since,
+        commitSha,
+        scopeFor(request),
+      );
     },
   );
 
   app.post("/v1/source-maps/status", async (request) => {
     emptyQuerySchema.parse(request.query);
     const input = sourceMapStatusSchema.parse(request.body);
-    const principal = requireServiceAccess(request, input.serviceId);
+    requireServiceAccess(request, input.serviceId);
+    const scope = scopeFor(request);
     const previousMapCount =
-      state.getSourceMapSet(input.serviceId, input.commitSha, principal)?.maps
+      state.getSourceMapSet(input.serviceId, input.commitSha, scope)?.maps
         .length ?? 0;
     const status = state.sourceMapStatus(
       input.serviceId,
       input.commitSha,
       input.uploaderId,
-      principal,
+      scope,
     );
     if (
       previousMapCount > 0 &&
       status.isUploader &&
-      state.getSourceMapSet(input.serviceId, input.commitSha, principal)?.maps
+      state.getSourceMapSet(input.serviceId, input.commitSha, scope)?.maps
         .length === 0
     ) {
-      await persistSourceMapSet(input.serviceId, input.commitSha, principal);
+      await persistSourceMapSet(input.serviceId, input.commitSha, scope);
     }
     return status;
   });
@@ -3256,11 +3341,12 @@ export async function buildBroker(
   app.post("/v1/source-maps/upload", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = sourceMapUploadSchema.parse(request.body);
-    const principal = requireServiceAccess(request, input.serviceId);
+    requireServiceAccess(request, input.serviceId);
+    const scope = scopeFor(request);
     await mutateDurably(
-      () => state.uploadSourceMap(input, principal),
+      () => state.uploadSourceMap(input, scope),
       async () =>
-        persistSourceMapSet(input.serviceId, input.commitSha, principal),
+        persistSourceMapSet(input.serviceId, input.commitSha, scope),
     );
     return reply.status(202).send({ accepted: true });
   });
@@ -3268,17 +3354,18 @@ export async function buildBroker(
   app.post("/v1/source-maps/complete", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = sourceMapStatusSchema.parse(request.body);
-    const principal = requireServiceAccess(request, input.serviceId);
+    requireServiceAccess(request, input.serviceId);
+    const scope = scopeFor(request);
     await mutateDurably(
       () =>
         state.completeSourceMaps(
           input.serviceId,
           input.commitSha,
           input.uploaderId,
-          principal,
+          scope,
         ),
       async () =>
-        persistSourceMapSet(input.serviceId, input.commitSha, principal),
+        persistSourceMapSet(input.serviceId, input.commitSha, scope),
     );
     return reply.status(202).send({ complete: true });
   });
@@ -3286,25 +3373,27 @@ export async function buildBroker(
   app.post("/v1/ingest", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = IngestSchema.parse(request.body);
-    const principal = requireServiceAccess(request, input.serviceId);
+    requireServiceAccess(request, input.serviceId);
+    const scope = scopeFor(request);
     const accepted = await mutateDurably(
-      () => state.ingest(input, principal),
+      () => state.ingest(input, scope),
       async () => {
         if (store === false) return;
         await (store.persistIngest === undefined
           ? store.persist(state)
-          : store.persistIngest(state, input, principal));
+          : store.persistIngest(state, input, scope));
       },
     );
     return reply.status(202).send({ accepted });
   });
 
   app.get("/v1/probes/:id/data", async (request, reply) => {
-    const principal = requireHumanRead(request);
+    requireHumanRead(request);
+    const scope = scopeFor(request);
     const { id } = probeParamsSchema.parse(request.params);
     const query = dataQuerySchema.parse(request.query);
     const waitSeconds = Math.min(30, Math.max(0, query.waitSeconds));
-    let probe = state.getProbe(id, principal);
+    let probe = state.getProbe(id, scope);
     if (probe === undefined) {
       throw new BrokerHttpError(404, "not_found", `probe ${id} was not found`);
     }
@@ -3326,7 +3415,7 @@ export async function buildBroker(
         request.raw.off("aborted", abort);
         request.raw.socket.off("close", abort);
       }
-      probe = state.getProbe(id, principal);
+      probe = state.getProbe(id, scope);
       if (probe === undefined) {
         throw new BrokerHttpError(
           404,
@@ -3338,8 +3427,8 @@ export async function buildBroker(
 
     return reply.send({
       probe,
-      status: state.getStatus(id, principal),
-      events: state.getEvents(id, principal),
+      status: state.getStatus(id, scope),
+      events: state.getEvents(id, scope),
     });
   });
 
@@ -3416,6 +3505,7 @@ declare module "fastify" {
 
   interface FastifyRequest {
     liveprobePrincipal: BrokerPrincipal | null;
+    liveprobeScope: ResourceScope | null;
   }
 }
 

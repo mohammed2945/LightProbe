@@ -46,6 +46,16 @@ behavior from another implementation.
   configuration or secrets. Invalid, revoked, or missing credentials return
   HTTP 401:
 
+- Authenticated requests may select a resource scope with
+  `LiveProbe-Project: <project-id>` and
+  `LiveProbe-Environment: <environment-id>`. Missing headers select the
+  principal's default scope for backward compatibility. Human principals may
+  select any active environment in their tenant. Service credentials are
+  issued for one tenant/project/environment and receive HTTP 403
+  `scope_mismatch` if either header names another scope. Probe definitions,
+  service heartbeats, source maps, captured events, safety state, and audit
+  events are partitioned by the resolved scope.
+
 ```json
 {
   "error": {

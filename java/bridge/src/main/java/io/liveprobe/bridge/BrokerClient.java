@@ -20,6 +20,8 @@ final class BrokerClient {
     private final String apiKey;
     private final String commitSha;
     private final String commitSource;
+    private final String projectId;
+    private final String environment;
     private final HttpClient client;
 
     BrokerClient(
@@ -27,13 +29,17 @@ final class BrokerClient {
             String serviceId,
             String apiKey,
             String commitSha,
-            String commitSource) {
+            String commitSource,
+            String projectId,
+            String environment) {
         this.baseUrl = normalizedBase(brokerUri);
         this.serviceId = serviceId;
         this.agentId = UUID.randomUUID().toString();
         this.apiKey = apiKey;
         this.commitSha = commitSha;
         this.commitSource = commitSource;
+        this.projectId = projectId;
+        this.environment = environment;
         this.client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .followRedirects(HttpClient.Redirect.NEVER)
@@ -73,9 +79,15 @@ final class BrokerClient {
         }
     }
 
-    private HttpRequest.Builder withAuth(HttpRequest.Builder builder) {
+    HttpRequest.Builder withAuth(HttpRequest.Builder builder) {
         if (apiKey != null && !apiKey.isBlank()) {
             builder.header("Authorization", "Bearer " + apiKey);
+        }
+        if (projectId != null && !projectId.isBlank()) {
+            builder.header("LiveProbe-Project", projectId);
+        }
+        if (environment != null && !environment.isBlank()) {
+            builder.header("LiveProbe-Environment", environment);
         }
         return builder;
     }
