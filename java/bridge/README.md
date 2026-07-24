@@ -64,5 +64,5 @@ with an empty serialized variables object. Frame data uses the normal serializer
 and redaction limits. The bridge advertises this support as `frame-locals-v1`.
 
 Maven builds and verifies the publishable artifact with `mvn verify`. The
-package coordinates are `io.liveprobe:liveprobe-bridge:0.2.0`; the first MVP
+package coordinates are `io.liveprobe:liveprobe-bridge:0.3.0`; the first MVP
 publishes to GitHub Packages.

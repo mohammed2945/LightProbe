@@ -28,7 +28,7 @@ the tenant boundary.
 
 ```sh
 LIVEPROBE_API_KEY="your-shared-key" \
-  npx -y @doomslayer2945/liveprobe-mcp@0.2.0 \
+  npx -y @doomslayer2945/liveprobe-mcp@0.3.0 \
   --broker-url http://HOST:7070
 ```
 
@@ -49,7 +49,7 @@ Add this server to your Cursor MCP configuration:
       "command": "npx",
       "args": [
         "-y",
-        "@doomslayer2945/liveprobe-mcp@0.2.0",
+        "@doomslayer2945/liveprobe-mcp@0.3.0",
         "--broker-url",
         "http://HOST:7070"
       ],
@@ -77,4 +77,4 @@ project/environment pair as the target runtime agent. This allows the same
 `production`; probes, events, service status, and safety data never cross that
 routing boundary.
 
-Run `npx -y @doomslayer2945/liveprobe-mcp@0.2.0 --help` for CLI options.
+Run `npx -y @doomslayer2945/liveprobe-mcp@0.3.0 --help` for CLI options.

@@ -7,9 +7,9 @@ or metrics from a running Node.js, Python, or JVM process.
 
 This repository is a development prototype, not a production observability
 service. Published client packages are
-`@doomslayer2945/liveprobe-mcp@0.2.0`,
-`@doomslayer2945/liveprobe-node@0.2.0`, `liveprobe==0.2.0`, and
-`io.liveprobe:liveprobe-bridge:0.2.0`.
+`@doomslayer2945/liveprobe-mcp@0.3.0`,
+`@doomslayer2945/liveprobe-node@0.3.0`, `liveprobe==0.3.0`, and
+`io.liveprobe:liveprobe-bridge:0.3.0`.
 
 For application teams connecting to an existing broker, start with the
 **[client setup guide](docs/client-setup.md)**. It covers credentials,
@@ -294,7 +294,7 @@ gcloud config set project "<PROJECT_ID>"
 The deployer rejects tracked modifications and untracked files because it
 archives the clean local `HEAD`. Commit every intended change, confirm
 `git status --short` is empty, make sure
-`@doomslayer2945/liveprobe-mcp@0.2.0` is available from npm, set a strong
+`@doomslayer2945/liveprobe-mcp@0.3.0` is available from npm, set a strong
 shared key and database password for first-time Secret Manager initialization,
 and deploy:
 
@@ -415,17 +415,16 @@ managed load balancer; local and pre-activation HTTP must remain on a trusted
 network. The internal Compose network reduces JVM diagnostic exposure but is
 not a substitute for production network policy.
 
-Postgres schema version 7 uses tenant/project/environment keys for durable
+Postgres schema version 8 uses tenant/project/environment keys for durable
 runtime records. Existing records are assigned to the
 `internal/default/default` scope during migration. Clerk organization scopes
 are provisioned transactionally on first authenticated use.
 
-For the `0.2.0` rollout, deploy the broker before publishing or deploying the
-`0.2.0` agents and MCP package. The new broker accepts legacy agents, but older
-strict brokers do not recognize the `agentId` and capability fields sent by
-current agents. During a rolling agent update, advanced probes remain gated
-until every replica that heartbeated in the last 45 seconds reports the needed
-capability.
+For the `0.3.0` rollout, deploy the broker before publishing or deploying the
+`0.3.0` agents and MCP package. The new broker accepts legacy agents, but older
+strict brokers do not recognize structured safety reports. During a rolling
+agent update, advanced probes remain gated until every replica that heartbeated
+in the last 45 seconds reports the needed capability.
 
 ## Benchmarks
 

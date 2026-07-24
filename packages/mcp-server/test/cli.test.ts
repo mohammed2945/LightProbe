@@ -159,7 +159,7 @@ describe("published tarball", () => {
         ) as { name?: string; version?: string };
         expect(installedPackageJson).toMatchObject({
           name: "@doomslayer2945/liveprobe-mcp",
-          version: "0.2.0",
+          version: "0.3.0",
         });
 
         const transport = new StdioClientTransport({
