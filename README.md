@@ -1,5 +1,3 @@
-> Reference client moved to ride_sharing_probe_demo.
-
 # LiveProbe
 
 LiveProbe is an experimental, AI-native live debugger. An MCP server gives an
