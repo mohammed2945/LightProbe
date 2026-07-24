@@ -16,6 +16,9 @@ For application teams connecting to an existing broker, start with the
 connectivity, SDK installation, source maps, JVM debugging, MCP configuration,
 tool usage, and troubleshooting.
 
+The hosted documentation is available at
+**[docs.liveprobe.tryastrea.tech](https://docs.liveprobe.tryastrea.tech)**.
+
 ## Architecture
 
 ```text
@@ -156,11 +159,11 @@ MCP client (replace `/absolute/path/to/LiveProbe`):
 }
 ```
 
-The server exposes eleven tools: service/probe listing, four probe setters,
-retained-data retrieval, removal, authenticated connectivity, a safety
-overview, and admin-only audit-event listing. Creating or removing a probe
-changes diagnostic instrumentation even though it does not intentionally
-change application variables.
+The server exposes twenty-three tools: resource catalog and scoped credential
+management, service/probe listing, four probe setters, retained-data retrieval,
+removal, authenticated connectivity, a safety overview, and audit-event
+listing. Creating or removing a probe changes diagnostic instrumentation even
+though it does not intentionally change application variables.
 
 ### Diagnostic workflow
 
