@@ -1,8 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "standalone",
+  output: "export",
   poweredByHeader: false,
   reactStrictMode: true,
+  trailingSlash: true,
 };
 
 export default nextConfig;

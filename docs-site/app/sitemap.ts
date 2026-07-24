@@ -1,6 +1,8 @@
 import type { MetadataRoute } from "next";
 import { docs } from "@/lib/docs";
 
+export const dynamic = "force-static";
+
 export default function sitemap(): MetadataRoute.Sitemap {
   return docs.map((doc) => ({
     url: `https://docs.liveprobe.tryastrea.tech/docs/${doc.slug}`,

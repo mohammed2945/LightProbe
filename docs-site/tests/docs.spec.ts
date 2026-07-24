@@ -10,7 +10,7 @@ test("renders the quickstart and navigates between pages", async ({ page }) => {
     await page.getByRole("button", { name: "Open navigation" }).click();
   }
   await page.getByRole("link", { name: "Python SDK", exact: true }).click();
-  await expect(page).toHaveURL(/\/docs\/python$/);
+  await expect(page).toHaveURL(/\/docs\/python\/?$/);
   await expect(
     page.getByRole("heading", { level: 1, name: "Python SDK" }),
   ).toBeVisible();
@@ -24,7 +24,7 @@ test("search routes to matching documentation", async ({ page }) => {
     .getByRole("dialog")
     .getByRole("link", { name: /JVM bridge/ })
     .click();
-  await expect(page).toHaveURL(/\/docs\/jvm$/);
+  await expect(page).toHaveURL(/\/docs\/jvm\/?$/);
 });
 
 test("mobile navigation opens without covering its controls", async ({
