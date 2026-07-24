@@ -33,6 +33,14 @@ same serializer limits and redaction policy as ordinary snapshots.
 Numeric expressions use finite IEEE-754 values and reject integer inputs or
 results outside the safe integer range so behavior is identical across SDKs.
 
+Portable safety settings are `maxProbeHitsPerSecond`,
+`maxTelemetryBytesPerSecond`, `maxBufferedEventBytes`, `maxEventLoopLagMs`,
+and `safetyCooldownMs`, with matching `LIVEPROBE_*` variables documented in
+the root environment matrix. Legacy `hitsPerSec`, `bandwidthKbPerSec`,
+`maxQueueBytes`, `maxLagMs`, and `cooldownMs` aliases remain accepted.
+Heartbeats advertise `safety-report-v1`, the enforced limits, and
+`event_loop_lag` while event-loop protection is tripped.
+
 For TypeScript, Esbuild, or Webpack builds, emit external `.js.map` files. One
 agent instance uploads maps for each service/commit pair, with embedded
 `sourcesContent` removed. The broker performs source-to-generated line and

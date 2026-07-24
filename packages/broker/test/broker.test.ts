@@ -1350,7 +1350,19 @@ describe("broker validation and storage", () => {
         sdk: "node",
         commitSha: "ABCDEF1234567890",
         commitSource: "env",
-        agentStatus: { state: "green", detail: "0 probes armed" },
+        capabilities: ["safety-report-v1"],
+        agentStatus: {
+          state: "red",
+          detail: "event-loop p95 exceeded 50ms",
+          reasonCode: "event_loop_lag",
+          limits: {
+            maxProbeHitsPerSecond: 10,
+            safetyCooldownMs: 10_000,
+            maxTelemetryBytesPerSecond: 204_800,
+            maxBufferedEventBytes: 1_024_000,
+            maxEventLoopLagMs: 50,
+          },
+        },
         events: [],
       },
     });
@@ -1367,7 +1379,15 @@ describe("broker validation and storage", () => {
           sdk: "node",
           commitSha: "abcdef1234567890",
           commitSource: "env",
-          agentStatus: { state: "green", detail: "0 probes armed" },
+          agentStatus: {
+            state: "red",
+            detail: "event-loop p95 exceeded 50ms",
+            reasonCode: "event_loop_lag",
+            limits: {
+              maxProbeHitsPerSecond: 10,
+              maxEventLoopLagMs: 50,
+            },
+          },
         },
       ],
     });
@@ -1382,7 +1402,15 @@ describe("broker validation and storage", () => {
         {
           serviceId: "orders",
           online: true,
-          agent: { state: "green", detail: "0 probes armed" },
+          agent: {
+            state: "red",
+            detail: "event-loop p95 exceeded 50ms",
+            reasonCode: "event_loop_lag",
+            limits: {
+              maxProbeHitsPerSecond: 10,
+              maxEventLoopLagMs: 50,
+            },
+          },
           probesSummary: { armed: 0, unknown: 0 },
           caveats: expect.arrayContaining([
             expect.stringContaining("agent-reported"),
@@ -1914,8 +1942,18 @@ describe("Postgres persistence", () => {
           "log-levels-v1",
           "expression-ast-v1",
           "frame-locals-v1",
+          "safety-report-v1",
         ],
-        agentStatus: { state: "green", detail: "1 probe armed" },
+        agentStatus: {
+          state: "red",
+          detail: "event-loop p95 exceeded 50ms",
+          reasonCode: "event_loop_lag",
+          limits: {
+            maxProbeHitsPerSecond: 10,
+            safetyCooldownMs: 10_000,
+            maxEventLoopLagMs: 50,
+          },
+        },
         events: [
           {
             probeId: probe.id,
@@ -1972,7 +2010,16 @@ describe("Postgres persistence", () => {
         sdk: "node",
         commitSha: "abcdef1234567890",
         capabilities: [],
-        agentStatus: { state: "green", detail: "1 probe armed" },
+        agentStatus: {
+          state: "red",
+          detail: "event-loop p95 exceeded 50ms",
+          reasonCode: "event_loop_lag",
+          limits: {
+            maxProbeHitsPerSecond: 10,
+            safetyCooldownMs: 10_000,
+            maxEventLoopLagMs: 50,
+          },
+        },
       },
     ]);
     expect(restored.liveprobeState.getProbe(probe.id)).toMatchObject({

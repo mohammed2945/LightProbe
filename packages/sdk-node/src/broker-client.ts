@@ -319,6 +319,7 @@ export class BrokerClient {
           "log-levels-v1",
           "expression-ast-v1",
           "frame-locals-v1",
+          "safety-report-v1",
         ],
         agentStatus,
         events,

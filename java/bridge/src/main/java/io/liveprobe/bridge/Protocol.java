@@ -289,12 +289,20 @@ final class Protocol {
             String commitSource,
             String state,
             String detail,
+            String reasonCode,
+            int maxProbeHitsPerSecond,
             List<Map<String, Object>> events) {
         LinkedHashMap<String, Object> agentStatus = new LinkedHashMap<>();
         agentStatus.put("state", state);
         if (detail != null && !detail.isBlank()) {
             agentStatus.put("detail", detail);
         }
+        if (reasonCode != null && !reasonCode.isBlank()) {
+            agentStatus.put("reasonCode", reasonCode);
+        }
+        agentStatus.put(
+                "limits",
+                Map.of("maxProbeHitsPerSecond", maxProbeHitsPerSecond));
         LinkedHashMap<String, Object> payload = new LinkedHashMap<>();
         payload.put("serviceId", serviceId);
         payload.put("sdk", "jvm");
@@ -303,7 +311,11 @@ final class Protocol {
         payload.put("commitSource", commitSource);
         payload.put(
                 "capabilities",
-                List.of("log-levels-v1", "expression-ast-v1", "frame-locals-v1"));
+                List.of(
+                        "log-levels-v1",
+                        "expression-ast-v1",
+                        "frame-locals-v1",
+                        "safety-report-v1"));
         payload.put("agentStatus", agentStatus);
         payload.put("events", events);
         return payload;

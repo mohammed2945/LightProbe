@@ -61,10 +61,23 @@ final class BrokerClient {
         return Protocol.parsePoll(response.body());
     }
 
-    void ingest(String state, String detail, List<Map<String, Object>> events)
+    void ingest(
+            String state,
+            String detail,
+            String reasonCode,
+            int maxProbeHitsPerSecond,
+            List<Map<String, Object>> events)
             throws IOException, InterruptedException {
         Map<String, Object> payload = Protocol.ingestPayload(
-                serviceId, agentId, commitSha, commitSource, state, detail, events);
+                serviceId,
+                agentId,
+                commitSha,
+                commitSource,
+                state,
+                detail,
+                reasonCode,
+                maxProbeHitsPerSecond,
+                events);
         HttpRequest request = withAuth(
                         HttpRequest.newBuilder(URI.create(baseUrl + "/v1/ingest")))
                 .timeout(Duration.ofSeconds(10))

@@ -162,9 +162,27 @@ export interface StatusEvent extends EventBase {
 
 export type AgentEvent = SnapshotEvent | LogEvent | CounterEvent | MetricEvent | StatusEvent;
 
+export type SafetyReasonCode =
+  | "event_loop_lag"
+  | "pause_budget"
+  | "rate_limited"
+  | "instrumentation_failure"
+  | "agent_worker_failure";
+
+export interface SafetyLimits {
+  maxProbeHitsPerSecond?: number;
+  maxProbePauseMsPerSecond?: number;
+  safetyCooldownMs?: number;
+  maxTelemetryBytesPerSecond?: number;
+  maxBufferedEventBytes?: number;
+  maxEventLoopLagMs?: number;
+}
+
 export interface AgentStatus {
   state: "green" | "red";
   detail?: string;
+  reasonCode?: SafetyReasonCode;
+  limits?: SafetyLimits;
 }
 
 export interface PollResponse {

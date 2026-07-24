@@ -12,6 +12,7 @@ import pytest
 
 from liveprobe.runtime import (
     Condition,
+    Limits,
     LiveProbe,
     Probe,
     TokenBucket,
@@ -777,6 +778,17 @@ def test_callback_budget_enters_red_then_rearms(fake_monitoring: Any) -> None:
         trigger(agent)
 
         assert agent.agent_state == "red"
+        assert agent._ingest_payload([])["agentStatus"] == {
+            "state": "red",
+            "reasonCode": "pause_budget",
+            "limits": {
+                "maxProbeHitsPerSecond": 10.0,
+                "maxProbePauseMsPerSecond": 0.0,
+                "safetyCooldownMs": 0,
+                "maxTelemetryBytesPerSecond": 204_800.0,
+            },
+            "detail": "1 active locations; 0 dropped hits",
+        }
         assert fake_monitoring.event_calls[-1] == 0
         agent._drain_queue()
         assert any(
@@ -787,6 +799,7 @@ def test_callback_budget_enters_red_then_rearms(fake_monitoring: Any) -> None:
         agent._drain_queue()
 
         assert agent.agent_state == "green"
+        assert "reasonCode" not in agent._ingest_payload([])["agentStatus"]
         assert fake_monitoring.event_calls[-1] == fake_monitoring.events.LINE
         assert fake_monitoring.restart_count >= 2
         assert "[liveprobe] SAFETY RED" in output.getvalue()
@@ -937,9 +950,16 @@ def test_ingest_payload_includes_commit_metadata(fake_monitoring: Any) -> None:
             "log-levels-v1",
             "expression-ast-v1",
             "frame-locals-v1",
+            "safety-report-v1",
         ],
         "agentStatus": {
             "state": "green",
+            "limits": {
+                "maxProbeHitsPerSecond": 10.0,
+                "maxProbePauseMsPerSecond": 20.0,
+                "safetyCooldownMs": 10_000,
+                "maxTelemetryBytesPerSecond": 204_800.0,
+            },
             "detail": "0 active locations; 0 dropped hits",
         },
         "events": [],
@@ -999,6 +1019,34 @@ def test_commit_sha_is_required(fake_monitoring: Any, monkeypatch: pytest.Monkey
             service_id="service",
             broker_url="http://127.0.0.1:1",
             monitoring=fake_monitoring,
+        )
+
+
+def test_canonical_safety_limits_use_environment_and_validate_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LIVEPROBE_MAX_PROBE_HITS_PER_SECOND", "12")
+    monkeypatch.setenv("LIVEPROBE_MAX_PROBE_PAUSE_MS_PER_SECOND", "25")
+    monkeypatch.setenv("LIVEPROBE_SAFETY_COOLDOWN_MS", "2500")
+    monkeypatch.setenv("LIVEPROBE_MAX_TELEMETRY_BYTES_PER_SECOND", "4096")
+
+    assert Limits.from_mapping(None) == Limits(
+        hits_per_sec=12.0,
+        pause_budget_ms=25.0,
+        cooldown_seconds=2.5,
+        bandwidth_kb_per_sec=4.0,
+    )
+    assert Limits.from_mapping(
+        {
+            "maxProbeHitsPerSecond": 20,
+            "hitsPerSec": 20,
+            "maxTelemetryBytesPerSecond": 2048,
+            "bandwidthKbPerSec": 2,
+        }
+    ).hits_per_sec == 20
+    with pytest.raises(ValueError, match="conflicts"):
+        Limits.from_mapping(
+            {"maxProbeHitsPerSecond": 20, "hitsPerSec": 10}
         )
 
 

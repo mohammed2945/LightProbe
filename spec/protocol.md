@@ -150,9 +150,10 @@ Optional common fields:
 
 Agents report additive protocol support in the `capabilities` array on every
 ingest heartbeat. Current capability identifiers are `log-levels-v1`,
-`expression-ast-v1`, and `frame-locals-v1`. An omitted array means a legacy
-agent with no advanced capabilities. The broker rejects probes that require a
-capability the service has not reported instead of silently degrading them.
+`expression-ast-v1`, `frame-locals-v1`, and `safety-report-v1`. An omitted
+array means a legacy agent with no advanced capabilities. The broker rejects
+probes that require a capability the service has not reported instead of
+silently degrading them.
 Each running agent process also reports a stable-for-process `agentId`. For a
 service with multiple active replicas, the broker exposes only the intersection
 of capabilities reported within the 45-second activity window. Capability
@@ -314,11 +315,20 @@ maps locally.
   "capabilities": [
     "log-levels-v1",
     "expression-ast-v1",
-    "frame-locals-v1"
+    "frame-locals-v1",
+    "safety-report-v1"
   ],
   "agentStatus": {
-    "state": "green",
-    "detail": "3 probes armed"
+    "state": "red",
+    "reasonCode": "event_loop_lag",
+    "detail": "event-loop p95 exceeded 50ms",
+    "limits": {
+      "maxProbeHitsPerSecond": 10,
+      "safetyCooldownMs": 10000,
+      "maxTelemetryBytesPerSecond": 204800,
+      "maxBufferedEventBytes": 1024000,
+      "maxEventLoopLagMs": 50
+    }
   },
   "events": []
 }
@@ -336,6 +346,12 @@ maps locally.
   well-formed identifiers are retained for forward compatibility.
 - `agentStatus.state` is `green` or `red`.
 - `agentStatus.detail` is optional.
+- `agentStatus.reasonCode` is omitted when green and otherwise one of
+  `event_loop_lag`, `pause_budget`, `rate_limited`,
+  `instrumentation_failure`, or `agent_worker_failure`.
+- `agentStatus.limits` uses canonical cross-runtime names. Agents report only
+  safeguards they enforce. Omitted fields are unsupported, not measurements
+  of zero load.
 - `events` may be empty; an empty ingest acts as a service heartbeat.
 
 A successful ingest returns HTTP 202:

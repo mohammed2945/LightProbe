@@ -648,7 +648,16 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       sdk: "node",
       commitSha: NORMALIZED_COMMIT,
       commitSource: "env",
-      agentStatus: { state: "green", detail: "0 probes armed" },
+      capabilities: ["safety-report-v1"],
+      agentStatus: {
+        state: "red",
+        detail: "event-loop p95 exceeded 50ms",
+        reasonCode: "event_loop_lag",
+        limits: {
+          maxProbeHitsPerSecond: 10,
+          maxEventLoopLagMs: 50,
+        },
+      },
       events: [],
     });
 
@@ -658,7 +667,14 @@ describe("Phase 1 MCP and fake-agent integration", () => {
         {
           serviceId: "checkout",
           online: true,
-          agent: { state: "green" },
+          agent: {
+            state: "red",
+            reasonCode: "event_loop_lag",
+            limits: {
+              maxProbeHitsPerSecond: 10,
+              maxEventLoopLagMs: 50,
+            },
+          },
         },
       ],
     });

@@ -41,6 +41,7 @@ public final class BridgeTests {
         testExpressionIntegrations();
         testIngestRetryClassification();
         testBrokerRoutingHeaders();
+        testCanonicalSafetyConfiguration();
         testRateLimiter();
         testFalseThenTrueHitLimit();
         testConcurrentMatchingSlots();
@@ -86,6 +87,28 @@ public final class BridgeTests {
                 "production",
                 request.headers().firstValue("LiveProbe-Environment").orElse(null),
                 "broker environment header");
+    }
+
+    private static void testCanonicalSafetyConfiguration() {
+        BridgeConfig config = BridgeConfig.parse(new String[] {
+                "--service", "inventory",
+                "--attach", "127.0.0.1:5005",
+                "--broker", "https://broker.example",
+                "--commit", "abcdef1234567890",
+                "--max-probe-hits-per-second", "12"
+        });
+        assertEquals(12, config.hitsPerSecond(), "canonical hit limit flag");
+
+        assertThrows(
+                () -> BridgeConfig.parse(new String[] {
+                        "--service", "inventory",
+                        "--attach", "127.0.0.1:5005",
+                        "--broker", "https://broker.example",
+                        "--commit", "abcdef1234567890",
+                        "--max-probe-hits-per-second", "12",
+                        "--hits-per-second", "10"
+                }),
+                "conflicting canonical and legacy hit limits rejected");
     }
 
     private static void testSerializerFixtures() throws IOException {
@@ -166,7 +189,8 @@ public final class BridgeTests {
         Map<String, Object> status = Protocol.statusEvent("prb_test", "armed", "Inventory.java:42");
         Map<String, Object> payload = Protocol.ingestPayload(
                 "inventory-service", "agent-jvm-test", "abcdef1234567890", "config",
-                "green", "1 probe(s) active", List.of(status));
+                "red", "1 breakpoint request(s) rate-limited", "rate_limited", 10,
+                List.of(status));
         Map<String, Object> decoded = Json.parseObject(Json.stringify(payload));
         assertEquals("jvm", decoded.get("sdk"), "JVM SDK mapping");
         assertEquals("inventory-service", decoded.get("serviceId"), "service mapping");
@@ -174,9 +198,24 @@ public final class BridgeTests {
         assertEquals("abcdef1234567890", decoded.get("commitSha"), "commit SHA mapping");
         assertEquals("config", decoded.get("commitSource"), "commit source mapping");
         assertEquals(
-                List.of("log-levels-v1", "expression-ast-v1", "frame-locals-v1"),
+                List.of(
+                        "log-levels-v1",
+                        "expression-ast-v1",
+                        "frame-locals-v1",
+                        "safety-report-v1"),
                 decoded.get("capabilities"),
                 "capability mapping");
+        Map<String, Object> agentStatus =
+                Json.stringMap((Map<?, ?>) decoded.get("agentStatus"));
+        assertEquals("red", agentStatus.get("state"), "safety state mapping");
+        assertEquals(
+                "rate_limited",
+                agentStatus.get("reasonCode"),
+                "safety reason mapping");
+        assertEquals(
+                Map.of("maxProbeHitsPerSecond", 10L),
+                agentStatus.get("limits"),
+                "safety limits mapping");
         Object events = decoded.get("events");
         assertTrue(events instanceof List<?> list && list.size() == 1, "status event mapping");
     }

@@ -374,5 +374,8 @@ the repository.
 - Use short-lived, narrow probes and avoid broad watch paths.
 - Node and JVM breakpoints can briefly pause an executing thread. Python line
   callbacks add work inside the target process.
+- `get_safety_overview` returns canonical reason codes and only the limits each
+  runtime actually enforces. Do not interpret an omitted limit as a measured
+  process-health signal.
 - Never expose a JVM JDWP port publicly.
 - Remove probes as soon as the investigation is complete.

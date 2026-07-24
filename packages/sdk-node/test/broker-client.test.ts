@@ -177,7 +177,15 @@ describe("BrokerClient", () => {
       "payments",
       "abcdef1234567890",
       "config",
-      { state: "green", detail: "1 probe armed" },
+      {
+        state: "red",
+        detail: "event-loop p95 exceeded 50ms",
+        reasonCode: "event_loop_lag",
+        limits: {
+          maxProbeHitsPerSecond: 10,
+          maxEventLoopLagMs: 50,
+        },
+      },
       events,
     );
 
@@ -192,8 +200,17 @@ describe("BrokerClient", () => {
         "log-levels-v1",
         "expression-ast-v1",
         "frame-locals-v1",
+        "safety-report-v1",
       ],
-      agentStatus: { state: "green", detail: "1 probe armed" },
+      agentStatus: {
+        state: "red",
+        detail: "event-loop p95 exceeded 50ms",
+        reasonCode: "event_loop_lag",
+        limits: {
+          maxProbeHitsPerSecond: 10,
+          maxEventLoopLagMs: 50,
+        },
+      },
       events,
     });
   });

@@ -45,6 +45,18 @@ export class EventLoopSafetyMonitor {
     return this.#state;
   }
 
+  get reasonCode(): "event_loop_lag" | undefined {
+    return this.#state === "red" ? "event_loop_lag" : undefined;
+  }
+
+  get status():
+    | { state: "green" }
+    | { state: "red"; reasonCode: "event_loop_lag" } {
+    return this.#state === "red"
+      ? { state: "red", reasonCode: "event_loop_lag" }
+      : { state: "green" };
+  }
+
   start(): void {
     if (this.#started) return;
     this.#started = true;

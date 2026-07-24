@@ -472,6 +472,42 @@ class Limits:
     def from_mapping(cls, raw: Mapping[str, object] | None) -> Limits:
         source = raw or {}
 
+        def portable_numeric(
+            camel: str,
+            snake: str,
+            legacy: tuple[tuple[str, float], ...],
+            env_name: str,
+            default: float,
+        ) -> float:
+            candidates: list[float] = []
+            for key, scale in ((camel, 1.0), (snake, 1.0), *legacy):
+                if key not in source:
+                    continue
+                value = source[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"{camel} must be a non-negative number")
+                result = float(value) * scale
+                if not math.isfinite(result) or result < 0:
+                    raise ValueError(f"{camel} must be a non-negative number")
+                candidates.append(result)
+            if candidates:
+                if any(
+                    not math.isclose(value, candidates[0])
+                    for value in candidates[1:]
+                ):
+                    raise ValueError(f"{camel} conflicts with a legacy alias")
+                return candidates[0]
+            configured = _env(env_name)
+            if configured is None:
+                return default
+            try:
+                result = float(configured)
+            except ValueError as error:
+                raise ValueError(f"{env_name} must be numeric") from error
+            if not math.isfinite(result) or result < 0:
+                raise ValueError(f"{env_name} must be a non-negative number")
+            return result
+
         def numeric(camel: str, snake: str, default: float) -> float:
             value = source.get(camel, source.get(snake, default))
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -506,15 +542,42 @@ class Limits:
                 "shutdownTimeout must be in "
                 f"(0, {_MAX_SHUTDOWN_TIMEOUT_SECONDS:g}]"
             )
+        max_probe_hits_per_second = portable_numeric(
+            "maxProbeHitsPerSecond",
+            "max_probe_hits_per_second",
+            (("hitsPerSec", 1.0), ("hits_per_sec", 1.0)),
+            "LIVEPROBE_MAX_PROBE_HITS_PER_SECOND",
+            10.0,
+        )
+        max_probe_pause_ms_per_second = portable_numeric(
+            "maxProbePauseMsPerSecond",
+            "max_probe_pause_ms_per_second",
+            (("pauseBudgetMs", 1.0), ("pause_budget_ms", 1.0)),
+            "LIVEPROBE_MAX_PROBE_PAUSE_MS_PER_SECOND",
+            20.0,
+        )
+        safety_cooldown_ms = portable_numeric(
+            "safetyCooldownMs",
+            "safety_cooldown_ms",
+            (("cooldownSeconds", 1000.0), ("cooldown_seconds", 1000.0)),
+            "LIVEPROBE_SAFETY_COOLDOWN_MS",
+            10_000.0,
+        )
+        max_telemetry_bytes_per_second = portable_numeric(
+            "maxTelemetryBytesPerSecond",
+            "max_telemetry_bytes_per_second",
+            (
+                ("bandwidthKbPerSec", 1024.0),
+                ("bandwidth_kb_per_sec", 1024.0),
+            ),
+            "LIVEPROBE_MAX_TELEMETRY_BYTES_PER_SECOND",
+            200.0 * 1024.0,
+        )
         return cls(
-            hits_per_sec=numeric("hitsPerSec", "hits_per_sec", 10.0),
-            pause_budget_ms=numeric("pauseBudgetMs", "pause_budget_ms", 20.0),
-            cooldown_seconds=numeric(
-                "cooldownSeconds", "cooldown_seconds", 10.0
-            ),
-            bandwidth_kb_per_sec=numeric(
-                "bandwidthKbPerSec", "bandwidth_kb_per_sec", 200.0
-            ),
+            hits_per_sec=max_probe_hits_per_second,
+            pause_budget_ms=max_probe_pause_ms_per_second,
+            cooldown_seconds=safety_cooldown_ms / 1000.0,
+            bandwidth_kb_per_sec=max_telemetry_bytes_per_second / 1024.0,
             stack_frame_depth=integer(
                 "stackFrameDepth", "stack_frame_depth", 8
             ),
@@ -600,6 +663,7 @@ class LiveProbe:
         self._deferred_cleanup = False
         self._shutdown_error: str | None = None
         self._agent_state = "green"
+        self._safety_reason: str | None = None
         self._red_until = 0.0
         self._frame_depth_hint: int | None = None
         self._frame_hint_lock = threading.Lock()
@@ -687,6 +751,7 @@ class LiveProbe:
                     self._shutdown_error = detail
             if timed_out:
                 self._agent_state = "red"
+                self._safety_reason = "instrumentation_failure"
                 with self._state_lock:
                     states = tuple(
                         state
@@ -834,7 +899,7 @@ class LiveProbe:
             try:
                 duration = time.perf_counter_ns() - started
                 if self._callback_budget.record(duration):
-                    self._enter_red("callback budget exceeded")
+                    self._enter_red("callback budget exceeded", "pause_budget")
             except Exception:
                 pass
 
@@ -906,7 +971,7 @@ class LiveProbe:
             current = current.f_back
         return tuple(entries)
 
-    def _enter_red(self, detail: str) -> None:
+    def _enter_red(self, detail: str, reason_code: str) -> None:
         with self._state_lock:
             if (
                 self._stopping
@@ -915,6 +980,7 @@ class LiveProbe:
             ):
                 return
             self._agent_state = "red"
+            self._safety_reason = reason_code
             self._red_until = time.monotonic() + self.limits.cooldown_seconds
             try:
                 self.monitoring.set_events(self._tool_id, 0)
@@ -943,6 +1009,7 @@ class LiveProbe:
                 return
             self._callback_budget.reset(current)
             self._agent_state = "green"
+            self._safety_reason = None
             states = tuple(
                 state for state in self._states.values() if state.is_active()
             )
@@ -988,6 +1055,7 @@ class LiveProbe:
             self._running = False
             self._stopping = True
             self._agent_state = "red"
+            self._safety_reason = "agent_worker_failure"
             self._shutdown_error = detail
             try:
                 self.monitoring.set_events(self._tool_id, 0)
@@ -1495,6 +1563,9 @@ class LiveProbe:
     def _ingest_payload(
         self, events: list[dict[str, object]]
     ) -> dict[str, object]:
+        with self._state_lock:
+            agent_state = self._agent_state
+            safety_reason = self._safety_reason
         return {
             "serviceId": self.service_id,
             "sdk": "python",
@@ -1505,9 +1576,25 @@ class LiveProbe:
                 "log-levels-v1",
                 "expression-ast-v1",
                 "frame-locals-v1",
+                "safety-report-v1",
             ],
             "agentStatus": {
-                "state": self._agent_state,
+                "state": agent_state,
+                **(
+                    {}
+                    if safety_reason is None
+                    else {"reasonCode": safety_reason}
+                ),
+                "limits": {
+                    "maxProbeHitsPerSecond": self.limits.hits_per_sec,
+                    "maxProbePauseMsPerSecond": self.limits.pause_budget_ms,
+                    "safetyCooldownMs": int(
+                        self.limits.cooldown_seconds * 1000
+                    ),
+                    "maxTelemetryBytesPerSecond": (
+                        self.limits.bandwidth_kb_per_sec * 1024
+                    ),
+                },
                 "detail": (
                     f"{len(self._active_by_line)} active locations; "
                     f"{self._dropped_hits} dropped hits"

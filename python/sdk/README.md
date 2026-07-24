@@ -29,3 +29,10 @@ attributes, or mutate application state. All expression and frame-local output
 uses the configured serializer limits and redaction policy.
 Numeric expressions use finite IEEE-754 values and reject integer inputs or
 results outside the safe integer range so behavior is identical across SDKs.
+
+Portable safety settings are `maxProbeHitsPerSecond`,
+`maxProbePauseMsPerSecond`, `safetyCooldownMs`, and
+`maxTelemetryBytesPerSecond` (snake-case forms are also accepted), with
+matching `LIVEPROBE_*` variables. Existing short names remain compatible.
+Heartbeats report the enforced limits and use `pause_budget`,
+`instrumentation_failure`, or `agent_worker_failure` when red.

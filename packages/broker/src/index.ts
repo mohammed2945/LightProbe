@@ -545,12 +545,42 @@ export const ProbeEventSchema = z.discriminatedUnion("type", [
 export type ProbeEvent = z.infer<typeof ProbeEventSchema>;
 export type ProbeStatusName = z.infer<typeof StatusNameSchema>;
 
+export const SafetyReasonCodeSchema = z.enum([
+  "event_loop_lag",
+  "pause_budget",
+  "rate_limited",
+  "instrumentation_failure",
+  "agent_worker_failure",
+]);
+
+export const SafetyLimitsSchema = z
+  .object({
+    maxProbeHitsPerSecond: z.number().finite().nonnegative().optional(),
+    maxProbePauseMsPerSecond: z.number().finite().nonnegative().optional(),
+    safetyCooldownMs: z.number().int().nonnegative().optional(),
+    maxTelemetryBytesPerSecond: z.number().finite().nonnegative().optional(),
+    maxBufferedEventBytes: z.number().int().positive().optional(),
+    maxEventLoopLagMs: z.number().finite().positive().optional(),
+  })
+  .strict();
+
 export const AgentStatusSchema = z
   .object({
     state: z.enum(["green", "red"]),
     detail: z.string().max(4_096).optional(),
+    reasonCode: SafetyReasonCodeSchema.optional(),
+    limits: SafetyLimitsSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((status, context) => {
+    if (status.state === "green" && status.reasonCode !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "reasonCode is only valid when agent state is red",
+        path: ["reasonCode"],
+      });
+    }
+  });
 
 export const IngestSchema = z
   .object({
@@ -1666,6 +1696,12 @@ export class BrokerState {
                 ...(service.agentStatus.detail === undefined
                   ? {}
                   : { detail: service.agentStatus.detail }),
+                ...(service.agentStatus.reasonCode === undefined
+                  ? {}
+                  : { reasonCode: service.agentStatus.reasonCode }),
+                ...(service.agentStatus.limits === undefined
+                  ? {}
+                  : { limits: service.agentStatus.limits }),
               };
         return {
           serviceId: service.serviceId,

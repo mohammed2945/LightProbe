@@ -106,7 +106,8 @@ public final class Main {
                   --service <service-id> --attach <host:port> --broker <http(s)://broker> --commit <sha>
 
                 Optional: --project <project-id>, --environment <environment-id>,
-                  --hits-per-second <n>, --redact-key <pattern>, --redact-value <literal>
+                  --max-probe-hits-per-second <n>, --redact-key <pattern>,
+                  --redact-value <literal>
                 The target must expose JDWP (prefer a localhost bind) and include -g debug information.
                 """);
     }
@@ -140,7 +141,7 @@ record BridgeConfig(
         String commitSource = "config";
         String projectId = null;
         String environment = null;
-        int hitsPerSecond = 10;
+        Integer hitsPerSecond = null;
         ArrayList<String> redactKeys = new ArrayList<>();
         ArrayList<String> redactValues = new ArrayList<>();
         boolean help = false;
@@ -168,7 +169,14 @@ record BridgeConfig(
                 case "--commit" -> commit = value;
                 case "--project" -> projectId = value;
                 case "--environment" -> environment = value;
-                case "--hits-per-second" -> hitsPerSecond = positiveInt(value, flag);
+                case "--hits-per-second", "--max-probe-hits-per-second" -> {
+                    int parsed = positiveInt(value, flag);
+                    if (hitsPerSecond != null && hitsPerSecond != parsed) {
+                        throw new IllegalArgumentException(
+                                "--max-probe-hits-per-second conflicts with --hits-per-second");
+                    }
+                    hitsPerSecond = parsed;
+                }
                 case "--redact-key" -> redactKeys.add(value);
                 case "--redact-value" -> redactValues.add(value);
                 default -> throw new IllegalArgumentException("unknown argument: " + flag);
@@ -178,7 +186,8 @@ record BridgeConfig(
         if (help) {
             return new BridgeConfig(
                     "", new AttachAddress("localhost", 1), URI.create("http://localhost"),
-                    "", "abcdef1", "config", null, null, hitsPerSecond,
+                    "", "abcdef1", "config", null, null,
+                    hitsPerSecond == null ? 10 : hitsPerSecond,
                     SafeSerializer.Config.defaults(), true);
         }
         if (service == null || service.isBlank()) {
@@ -205,6 +214,12 @@ record BridgeConfig(
         }
         projectId = configuredValue(projectId, "LIVEPROBE_PROJECT_ID");
         environment = configuredValue(environment, "LIVEPROBE_ENVIRONMENT");
+        if (hitsPerSecond == null) {
+            String configuredHits = env("LIVEPROBE_MAX_PROBE_HITS_PER_SECOND");
+            hitsPerSecond = configuredHits == null
+                    ? 10
+                    : positiveInt(configuredHits, "LIVEPROBE_MAX_PROBE_HITS_PER_SECOND");
+        }
         SafeSerializer.Config serializerConfig = new SafeSerializer.Config(
                 3, 3, 50, 1024, 8, redactKeys, redactValues);
         return new BridgeConfig(
@@ -378,8 +393,14 @@ final class BridgeAgent implements AutoCloseable {
         }
 
         List<Map<String, Object>> batch = eventBuffer.drain();
+        AgentSafetyStatus safetyStatus = probeManager.agentStatus();
         try {
-            broker.ingest(probeManager.agentState(), probeManager.agentDetail(), batch);
+            broker.ingest(
+                    safetyStatus.state(),
+                    safetyStatus.detail(),
+                    safetyStatus.reasonCode(),
+                    config.hitsPerSecond(),
+                    batch);
         } catch (BrokerIngestException exception) {
             if (!exception.isNonRetryable()) {
                 eventBuffer.restore(batch);
@@ -465,8 +486,14 @@ final class BridgeAgent implements AutoCloseable {
             eventBuffer.add(event);
         }
         List<Map<String, Object>> finalBatch = eventBuffer.drain();
+        AgentSafetyStatus safetyStatus = probeManager.agentStatus();
         try {
-            broker.ingest(probeManager.agentState(), probeManager.agentDetail(), finalBatch);
+            broker.ingest(
+                    safetyStatus.state(),
+                    safetyStatus.detail(),
+                    safetyStatus.reasonCode(),
+                    config.hitsPerSecond(),
+                    finalBatch);
         } catch (IOException | RuntimeException exception) {
             System.err.println("[liveprobe] final broker ingest failed: " + safeMessage(exception));
         } catch (InterruptedException exception) {
@@ -693,16 +720,15 @@ final class ProbeManager implements AutoCloseable {
         managed.requests.clear();
     }
 
-    synchronized String agentState() {
-        return suspendedRequests > 0 ? "red" : "green";
-    }
-
-    synchronized String agentDetail() {
+    synchronized AgentSafetyStatus agentStatus() {
         if (suspendedRequests > 0) {
-            return suspendedRequests + " breakpoint request(s) rate-limited";
+            return new AgentSafetyStatus(
+                    "red",
+                    suspendedRequests + " breakpoint request(s) rate-limited",
+                    "rate_limited");
         }
         long armed = probes.values().stream().filter(probe -> !probe.completed).count();
-        return armed + " probe(s) active";
+        return new AgentSafetyStatus("green", armed + " probe(s) active", null);
     }
 
     private synchronized void reenable(ManagedProbe managed, BreakpointRequest request) {
@@ -832,6 +858,8 @@ final class ManagedProbe {
         this.emittedSlots = new EmittedSlots(definition.hitLimit());
     }
 }
+
+record AgentSafetyStatus(String state, String detail, String reasonCode) {}
 
 sealed interface CaptureOutcome {
     record Captured(ManagedProbe managed, RawHit hit) implements CaptureOutcome {}

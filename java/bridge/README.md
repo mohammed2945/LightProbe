@@ -38,7 +38,10 @@ boundary. Source line resolution requires `LineNumberTable` metadata, and local 
 `LocalVariableTable` metadata; compile target classes with `-g`.
 
 Optional repeated `--redact-key` and `--redact-value` flags extend the serializer defaults.
-`--hits-per-second` defaults to 10.
+`--max-probe-hits-per-second` (legacy alias `--hits-per-second`) defaults to
+`LIVEPROBE_MAX_PROBE_HITS_PER_SECOND` or 10. Heartbeats report this enforced
+limit and use the canonical `rate_limited` reason while JDI breakpoint
+requests are suspended.
 
 Log probe definitions accept an optional camel-case `logLevel` field with
 `debug`, `info`, `warn`, or `error`. The bridge emits the configured level with

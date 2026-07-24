@@ -206,6 +206,12 @@ cryptographic proof that the target bytecode exactly matches that revision.
 | `BROKER_URL` | MCP, agents | HTTP origin for the broker. |
 | `LIVEPROBE_PROJECT_ID` | agents | Stable project/repository ID used for broker routing. |
 | `LIVEPROBE_ENVIRONMENT` | agents | Deployment environment ID, such as `staging` or `production`. |
+| `LIVEPROBE_MAX_PROBE_HITS_PER_SECOND` | agents | Canonical pre-capture hit-rate limit. Defaults to `10`. |
+| `LIVEPROBE_MAX_PROBE_PAUSE_MS_PER_SECOND` | Python agent | Canonical callback-time budget. Defaults to `20`; unsupported runtimes omit it from safety reports. |
+| `LIVEPROBE_SAFETY_COOLDOWN_MS` | Node, Python agents | Cooldown before suspended probes re-arm. Defaults to `10000`. |
+| `LIVEPROBE_MAX_TELEMETRY_BYTES_PER_SECOND` | Node, Python agents | Canonical outbound telemetry budget. Defaults to `204800`. |
+| `LIVEPROBE_MAX_BUFFERED_EVENT_BYTES` | Node agent | Maximum buffered event bytes. Defaults to five seconds of telemetry budget, with a 64 KiB floor. |
+| `LIVEPROBE_MAX_EVENT_LOOP_LAG_MS` | Node agent | Event-loop p95 threshold. Defaults to `50`. |
 | `LIVEPROBE_PUBLIC_URL` | broker | Public HTTPS broker origin used in MCP OAuth protected-resource metadata. |
 | `LIVEPROBE_COMMIT_SHA` / `GIT_COMMIT` | agents | Required deployed commit SHA reported on every ingest. |
 | `LIVEPROBE_SOURCE_MAP_DIR` | Node agent | Directory containing generated `.map` files. |

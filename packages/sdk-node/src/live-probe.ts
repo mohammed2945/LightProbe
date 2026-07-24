@@ -12,9 +12,18 @@ import { normalizeSerializerConfig } from "./serializer.js";
 import type { AgentStatus, SerializerConfigInput } from "./types.js";
 
 export interface LiveProbeLimits {
+  maxProbeHitsPerSecond?: number;
+  maxTelemetryBytesPerSecond?: number;
+  maxBufferedEventBytes?: number;
+  maxEventLoopLagMs?: number;
+  safetyCooldownMs?: number;
+  /** @deprecated Use maxProbeHitsPerSecond. */
   hitsPerSec?: number;
+  /** @deprecated Use maxTelemetryBytesPerSecond. */
   bandwidthKbPerSec?: number;
+  /** @deprecated Use maxEventLoopLagMs. */
   maxLagMs?: number;
+  /** @deprecated Use safetyCooldownMs. */
   cooldownMs?: number;
   pollIntervalMs?: number;
   flushIntervalMs?: number;
@@ -69,25 +78,101 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
   return resolved;
 }
 
-function resolveLimits(input: LiveProbeLimits = {}): ResolvedLimits {
-  const bandwidthKbPerSec = positiveNumber(
-    input.bandwidthKbPerSec,
-    200,
-    "bandwidthKbPerSec",
+function configuredNumber(name: string): number | undefined {
+  const value = envValue(name);
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new RangeError(`${name} must be numeric`);
+  }
+  return parsed;
+}
+
+function aliasedNumber(
+  canonical: number | undefined,
+  legacy: number | undefined,
+  environmentValue: number | undefined,
+  fallback: number,
+  canonicalName: string,
+  legacyName: string,
+): number {
+  if (canonical !== undefined && legacy !== undefined && canonical !== legacy) {
+    throw new RangeError(`${canonicalName} conflicts with legacy ${legacyName}`);
+  }
+  return canonical ?? legacy ?? environmentValue ?? fallback;
+}
+
+export function resolveLimits(input: LiveProbeLimits = {}): ResolvedLimits {
+  const legacyTelemetryBytes =
+    input.bandwidthKbPerSec === undefined
+      ? undefined
+      : input.bandwidthKbPerSec * 1024;
+  const maxTelemetryBytesPerSecond = positiveNumber(
+    aliasedNumber(
+      input.maxTelemetryBytesPerSecond,
+      legacyTelemetryBytes,
+      configuredNumber("LIVEPROBE_MAX_TELEMETRY_BYTES_PER_SECOND"),
+      200 * 1024,
+      "maxTelemetryBytesPerSecond",
+      "bandwidthKbPerSec",
+    ),
+    200 * 1024,
+    "maxTelemetryBytesPerSecond",
+  );
+  const maxBufferedEventBytes = positiveInteger(
+    aliasedNumber(
+      input.maxBufferedEventBytes,
+      input.maxQueueBytes,
+      configuredNumber("LIVEPROBE_MAX_BUFFERED_EVENT_BYTES"),
+      Math.max(64 * 1024, Math.floor(maxTelemetryBytesPerSecond * 5)),
+      "maxBufferedEventBytes",
+      "maxQueueBytes",
+    ),
+    Math.max(64 * 1024, Math.floor(maxTelemetryBytesPerSecond * 5)),
+    "maxBufferedEventBytes",
   );
   return {
-    hitsPerSec: positiveNumber(input.hitsPerSec, 10, "hitsPerSec"),
-    bandwidthKbPerSec,
-    maxLagMs: positiveNumber(input.maxLagMs, 50, "maxLagMs"),
-    cooldownMs: positiveInteger(input.cooldownMs, 10_000, "cooldownMs"),
+    hitsPerSec: positiveNumber(
+      aliasedNumber(
+        input.maxProbeHitsPerSecond,
+        input.hitsPerSec,
+        configuredNumber("LIVEPROBE_MAX_PROBE_HITS_PER_SECOND"),
+        10,
+        "maxProbeHitsPerSecond",
+        "hitsPerSec",
+      ),
+      10,
+      "maxProbeHitsPerSecond",
+    ),
+    bandwidthKbPerSec: maxTelemetryBytesPerSecond / 1024,
+    maxLagMs: positiveNumber(
+      aliasedNumber(
+        input.maxEventLoopLagMs,
+        input.maxLagMs,
+        configuredNumber("LIVEPROBE_MAX_EVENT_LOOP_LAG_MS"),
+        50,
+        "maxEventLoopLagMs",
+        "maxLagMs",
+      ),
+      50,
+      "maxEventLoopLagMs",
+    ),
+    cooldownMs: positiveInteger(
+      aliasedNumber(
+        input.safetyCooldownMs,
+        input.cooldownMs,
+        configuredNumber("LIVEPROBE_SAFETY_COOLDOWN_MS"),
+        10_000,
+        "safetyCooldownMs",
+        "cooldownMs",
+      ),
+      10_000,
+      "safetyCooldownMs",
+    ),
     pollIntervalMs: positiveInteger(input.pollIntervalMs, 1000, "pollIntervalMs"),
     flushIntervalMs: positiveInteger(input.flushIntervalMs, 2000, "flushIntervalMs"),
     requestTimeoutMs: positiveInteger(input.requestTimeoutMs, 5000, "requestTimeoutMs"),
-    maxQueueBytes: positiveInteger(
-      input.maxQueueBytes,
-      Math.max(64 * 1024, Math.floor(bandwidthKbPerSec * 1024 * 5)),
-      "maxQueueBytes",
-    ),
+    maxQueueBytes: maxBufferedEventBytes,
   };
 }
 
@@ -356,8 +441,19 @@ export class LiveProbe {
       ),
     );
     const events = this.#events.takeBatch(byteBudget);
+    const safetyStatus = this.#safety.status;
     const agentStatus: AgentStatus = {
-      state: this.#safety.state,
+      state: safetyStatus.state,
+      ...(!("reasonCode" in safetyStatus)
+        ? {}
+        : { reasonCode: safetyStatus.reasonCode }),
+      limits: {
+        maxProbeHitsPerSecond: this.#limits.hitsPerSec,
+        safetyCooldownMs: this.#limits.cooldownMs,
+        maxTelemetryBytesPerSecond: this.#limits.bandwidthKbPerSec * 1024,
+        maxBufferedEventBytes: this.#limits.maxQueueBytes,
+        maxEventLoopLagMs: this.#limits.maxLagMs,
+      },
       detail:
         `${String(this.#manager.armedCount)} probes armed; ` +
         `${String(this.#manager.droppedHits)} rate-dropped; ` +

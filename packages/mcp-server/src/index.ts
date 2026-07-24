@@ -451,6 +451,25 @@ const probeStatusSchema = z
   })
   .strict();
 
+const safetyReasonCodeSchema = z.enum([
+  "event_loop_lag",
+  "pause_budget",
+  "rate_limited",
+  "instrumentation_failure",
+  "agent_worker_failure",
+]);
+
+const safetyLimitsSchema = z
+  .object({
+    maxProbeHitsPerSecond: z.number().finite().nonnegative().optional(),
+    maxProbePauseMsPerSecond: z.number().finite().nonnegative().optional(),
+    safetyCooldownMs: z.number().int().nonnegative().optional(),
+    maxTelemetryBytesPerSecond: z.number().finite().nonnegative().optional(),
+    maxBufferedEventBytes: z.number().int().positive().optional(),
+    maxEventLoopLagMs: z.number().finite().positive().optional(),
+  })
+  .strict();
+
 const serviceSchema = z
   .object({
     serviceId: serviceIdSchema,
@@ -463,6 +482,8 @@ const serviceSchema = z
       .object({
         state: z.enum(["green", "red"]),
         detail: z.string().optional(),
+        reasonCode: safetyReasonCodeSchema.optional(),
+        limits: safetyLimitsSchema.optional(),
       })
       .strict()
       .optional(),
@@ -492,6 +513,8 @@ const safetyResponseSchema = z
             .object({
               state: z.enum(["green", "red", "unknown"]),
               detail: z.string().optional(),
+              reasonCode: safetyReasonCodeSchema.optional(),
+              limits: safetyLimitsSchema.optional(),
             })
             .strict(),
           probesSummary: z.record(z.string(), z.number().int().nonnegative()),
