@@ -14,16 +14,26 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import CodeType, FrameType
 from typing import IO, Any, Mapping
 
+from .safe_expression import (
+    CompiledExpression,
+    TemplateSegment,
+    evaluate_expression,
+    parse_compiled_expression,
+    parse_template_segments,
+    render_expression_template,
+)
 from .serializer import SerializerConfig, render_node, serialize
 
 _MISSING = object()
 _TEMPLATE_PATH = re.compile(r"\$\{([^{}]+)\}")
 _CONDITION_OPS = frozenset({"eq", "ne", "gt", "gte", "lt", "lte"})
+_LOG_LEVELS = frozenset({"debug", "info", "warn", "error"})
 _MAX_REQUEST_TIMEOUT_SECONDS = 10.0
 _MAX_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
@@ -175,9 +185,16 @@ class Probe:
     version: int
     created_by: str
     condition: Condition | None = None
+    condition_expression: CompiledExpression | None = None
     watch_paths: tuple[str, ...] = ()
+    watch_expressions: tuple[CompiledExpression, ...] = ()
+    include_stack_locals: bool = False
+    stack_frame_limit: int = 3
     template: str | None = None
+    log_level: str = "info"
+    template_segments: tuple[TemplateSegment, ...] | None = None
     metric_path: str | None = None
+    metric_expression: CompiledExpression | None = None
 
     @classmethod
     def parse(cls, raw: object, expected_service: str) -> Probe:
@@ -212,14 +229,66 @@ class Probe:
             isinstance(path, str) and path for path in watch_paths_raw
         ):
             raise ValueError("watchPaths must contain non-empty strings")
-        template = dict.get(raw, "template")
-        metric_path = dict.get(raw, "metricPath")
-        if kind == "log" and not isinstance(template, str):
-            raise ValueError("log probes require template")
-        if kind == "metric" and (
-            not isinstance(metric_path, str) or not metric_path
+        condition_expression_raw = dict.get(raw, "conditionExpression")
+        condition_expression = (
+            None
+            if condition_expression_raw is None
+            else parse_compiled_expression(
+                condition_expression_raw, "conditionExpression"
+            )
+        )
+        watch_expressions_raw = dict.get(raw, "watchExpressions", [])
+        if type(watch_expressions_raw) is not list:
+            raise ValueError("watchExpressions must be an array")
+        watch_expressions = tuple(
+            parse_compiled_expression(
+                expression, f"watchExpressions[{index}]"
+            )
+            for index, expression in enumerate(watch_expressions_raw)
+        )
+        include_stack_locals = dict.get(raw, "includeStackLocals", False)
+        if type(include_stack_locals) is not bool:
+            raise ValueError("includeStackLocals must be a boolean")
+        stack_frame_limit = dict.get(raw, "stackFrameLimit", 3)
+        if (
+            type(stack_frame_limit) is not int
+            or stack_frame_limit < 1
+            or stack_frame_limit > 8
         ):
-            raise ValueError("metric probes require metricPath")
+            raise ValueError("stackFrameLimit must be an integer from 1 to 8")
+        template = dict.get(raw, "template")
+        log_level = dict.get(raw, "logLevel", "info")
+        template_segments_raw = dict.get(raw, "templateSegments")
+        template_segments = (
+            None
+            if template_segments_raw is None
+            else parse_template_segments(template_segments_raw)
+        )
+        metric_path = dict.get(raw, "metricPath")
+        metric_expression_raw = dict.get(raw, "metricExpression")
+        metric_expression = (
+            None
+            if metric_expression_raw is None
+            else parse_compiled_expression(
+                metric_expression_raw, "metricExpression"
+            )
+        )
+        if (
+            kind == "log"
+            and not isinstance(template, str)
+            and template_segments is None
+        ):
+            raise ValueError("log probes require template or templateSegments")
+        if kind == "log" and (
+            not isinstance(log_level, str) or log_level not in _LOG_LEVELS
+        ):
+            raise ValueError("logLevel must be one of debug, info, warn, or error")
+        if (
+            kind == "metric"
+            and (not isinstance(metric_path, str) or not metric_path)
+            and metric_expression is None
+        ):
+            raise ValueError("metric probes require metricPath or metricExpression")
 
         return cls(
             probe_id=probe_id,
@@ -232,9 +301,16 @@ class Probe:
             version=version,
             created_by=created_by,
             condition=Condition.parse(dict.get(raw, "condition")),
+            condition_expression=condition_expression,
             watch_paths=tuple(watch_paths_raw),
+            watch_expressions=watch_expressions,
+            include_stack_locals=include_stack_locals,
+            stack_frame_limit=stack_frame_limit,
             template=template if isinstance(template, str) else None,
+            log_level=log_level if kind == "log" else "info",
+            template_segments=template_segments,
             metric_path=metric_path if isinstance(metric_path, str) else None,
+            metric_expression=metric_expression,
         )
 
 
@@ -305,6 +381,7 @@ class StackEntry:
     fn: str
     file: str
     line: int
+    variables: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +553,7 @@ class LiveProbe:
             raise ValueError("poll and flush intervals must be positive")
 
         self.service_id = service_id
+        self.agent_id = str(uuid.uuid4())
         self.broker_url = broker_url.rstrip("/")
         self.api_key = api_key if api_key is not None else _env("LIVEPROBE_API_KEY")
         self.commit_sha, self.commit_source = _resolve_commit_sha(commit_sha)
@@ -674,7 +752,10 @@ class LiveProbe:
             for state in matching:
                 if not self._hit_bucket.consume():
                     continue
-                if state.probe.condition is not None:
+                if (
+                    state.probe.condition is not None
+                    or state.probe.condition_expression is not None
+                ):
                     if state.is_active():
                         captures.append(ProbeCandidate(state, None))
                     continue
@@ -697,7 +778,20 @@ class LiveProbe:
                 return None
 
             variables = dict(frame.f_locals)
-            stack = self._capture_stack(frame)
+            frame_local_limit = max(
+                (
+                    capture.state.probe.stack_frame_limit
+                    for capture in captures
+                    if capture.state.probe.kind == "snapshot"
+                    and capture.state.probe.include_stack_locals
+                ),
+                default=0,
+            )
+            stack = self._capture_stack(
+                frame,
+                frame_local_limit=frame_local_limit,
+                first_variables=variables,
+            )
             hit = RawHit(
                 candidates=tuple(captures),
                 variables=variables,
@@ -756,7 +850,28 @@ class LiveProbe:
                 break
         return None
 
-    def _capture_stack(self, frame: FrameType) -> tuple[StackEntry, ...]:
+    def _capture_stack(
+        self,
+        frame: FrameType,
+        *,
+        frame_local_limit: int = 0,
+        first_variables: dict[str, object] | None = None,
+    ) -> tuple[StackEntry, ...]:
+        def bounded_locals(
+            values: Mapping[str, object],
+        ) -> dict[str, object]:
+            captured: dict[str, object] = {}
+            items = (
+                dict.items(values)
+                if type(values) is dict
+                else ((name, values[name]) for name in values)
+            )
+            for index, (name, value) in enumerate(items):
+                if index >= self.serializer_config.max_props:
+                    break
+                captured[name] = value
+            return captured
+
         entries: list[StackEntry] = []
         current: FrameType | None = frame
         stack_limit = min(
@@ -769,6 +884,13 @@ class LiveProbe:
                     fn=current.f_code.co_name,
                     file=current.f_code.co_filename,
                     line=current.f_lineno,
+                    variables=(
+                        bounded_locals(first_variables)
+                        if not entries and first_variables is not None
+                        else bounded_locals(current.f_locals)
+                    )
+                    if len(entries) < frame_local_limit
+                    else None,
                 )
             )
             current = current.f_back
@@ -1026,6 +1148,20 @@ class LiveProbe:
                 if capture.reservation is not None:
                     capture.reservation.release()
                 continue
+            if probe.condition_expression is not None:
+                condition_result = evaluate_expression(
+                    probe.condition_expression,
+                    hit.variables,
+                    self.serializer_config,
+                )
+                if (
+                    not condition_result.ok
+                    or type(condition_result.value) is not bool
+                    or condition_result.value is not True
+                ):
+                    if capture.reservation is not None:
+                        capture.reservation.release()
+                    continue
             if capture.reservation is None:
                 capture.reservation = state.reserve()
                 if capture.reservation is None:
@@ -1041,6 +1177,20 @@ class LiveProbe:
                     path: self._serialize_path(hit.variables, path)
                     for path in probe.watch_paths
                 }
+                for expression in probe.watch_expressions:
+                    expression_result = evaluate_expression(
+                        expression,
+                        hit.variables,
+                        self.serializer_config,
+                    )
+                    watches[expression.source] = (
+                        serialize(
+                            expression_result.value,
+                            self.serializer_config,
+                        )
+                        if expression_result.ok
+                        else {"t": "truncated", "v": "unsupported"}
+                    )
                 event = {
                     "probeId": probe.probe_id,
                     "type": "snapshot",
@@ -1049,39 +1199,65 @@ class LiveProbe:
                         hit.variables, self.serializer_config
                     ),
                     "watches": watches,
-                    "stack": [
-                        {"fn": entry.fn, "file": entry.file, "line": entry.line}
-                        for entry in hit.stack
-                    ],
+                    "stack": self._snapshot_stack(probe, hit.stack),
                 }
             elif probe.kind == "log":
-                log_message = self._render_template(
-                    probe.template or "", hit.variables
+                log_message = (
+                    self._render_template(
+                        probe.template or "", hit.variables
+                    )
+                    if probe.template_segments is None
+                    else render_expression_template(
+                        probe.template_segments,
+                        hit.variables,
+                        serializer_config=self.serializer_config,
+                    )
                 )
                 event = {
                     "probeId": probe.probe_id,
                     "type": "log",
                     "ts": timestamp,
                     "message": log_message,
-                    "level": "info",
+                    "level": probe.log_level,
                 }
             elif probe.kind == "counter":
                 counter_delta = 1
             else:
-                metric_key = (probe.metric_path or "").rsplit(".", 1)[-1]
-                if self.serializer_config.redacts_key(metric_key):
-                    capture.reservation.release()
-                    self._probe_error_once(
-                        state, "metric path is redacted by policy"
+                metric_error: str | None = None
+                if probe.metric_expression is None:
+                    metric_key = (probe.metric_path or "").rsplit(".", 1)[-1]
+                    if self.serializer_config.redacts_key(metric_key):
+                        capture.reservation.release()
+                        self._probe_error_once(
+                            state, "metric path is redacted by policy"
+                        )
+                        continue
+                    sample = resolve_dot_path(
+                        hit.variables, probe.metric_path or ""
                     )
-                    continue
-                sample = resolve_dot_path(
-                    hit.variables, probe.metric_path or ""
-                )
+                    metric_source = probe.metric_path or ""
+                else:
+                    metric_result = evaluate_expression(
+                        probe.metric_expression,
+                        hit.variables,
+                        self.serializer_config,
+                    )
+                    sample = (
+                        metric_result.value if metric_result.ok else _MISSING
+                    )
+                    metric_source = probe.metric_expression.source
+                    metric_error = (
+                        "expected-number"
+                        if metric_result.ok
+                        else metric_result.error
+                    )
                 if not _number(sample):
                     capture.reservation.release()
+                    detail = f"invalid-metric: {metric_source}"
+                    if metric_error is not None:
+                        detail += f" ({metric_error})"
                     self._probe_error_once(
-                        state, "metric path did not resolve to a finite number"
+                        state, detail
                     )
                     continue
                 assert isinstance(sample, (int, float))
@@ -1126,6 +1302,29 @@ class LiveProbe:
             last = match.end()
         pieces.append(template[last:])
         return "".join(pieces)
+
+    def _snapshot_stack(
+        self, probe: Probe, stack: tuple[StackEntry, ...]
+    ) -> list[dict[str, object]]:
+        selected = (
+            stack[: probe.stack_frame_limit]
+            if probe.include_stack_locals
+            else stack
+        )
+        frames: list[dict[str, object]] = []
+        for entry in selected:
+            rendered: dict[str, object] = {
+                "fn": entry.fn,
+                "file": entry.file,
+                "line": entry.line,
+            }
+            if probe.include_stack_locals:
+                rendered["variables"] = serialize(
+                    entry.variables if entry.variables is not None else {},
+                    self.serializer_config,
+                )
+            frames.append(rendered)
+        return frames
 
     def _serialize_path(
         self, variables: dict[str, object], path: str
@@ -1289,8 +1488,14 @@ class LiveProbe:
         return {
             "serviceId": self.service_id,
             "sdk": "python",
+            "agentId": self.agent_id,
             "commitSha": self.commit_sha,
             "commitSource": self.commit_source,
+            "capabilities": [
+                "log-levels-v1",
+                "expression-ast-v1",
+                "frame-locals-v1",
+            ],
             "agentStatus": {
                 "state": self._agent_state,
                 "detail": (

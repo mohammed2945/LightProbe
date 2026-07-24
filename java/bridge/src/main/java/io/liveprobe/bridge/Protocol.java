@@ -48,6 +48,36 @@ final class Protocol {
         }
     }
 
+    enum LogLevel {
+        DEBUG("debug"),
+        INFO("info"),
+        WARN("warn"),
+        ERROR("error");
+
+        private final String wireName;
+
+        LogLevel(String wireName) {
+            this.wireName = wireName;
+        }
+
+        String wireName() {
+            return wireName;
+        }
+
+        static LogLevel parse(Object raw) {
+            if (raw == null) {
+                return INFO;
+            }
+            String value = requiredString(raw, "logLevel");
+            for (LogLevel level : values()) {
+                if (level.wireName.equals(value)) {
+                    return level;
+                }
+            }
+            throw new ProtocolException("unsupported log level: " + value);
+        }
+    }
+
     record Condition(String path, String op, Object value) {
         Condition {
             validatePath(path, "condition.path");
@@ -67,9 +97,16 @@ final class Protocol {
             String file,
             int line,
             Condition condition,
+            SafeExpression.Compiled conditionExpression,
             List<String> watchPaths,
+            List<SafeExpression.Compiled> watchExpressions,
+            boolean includeStackLocals,
+            int stackFrameLimit,
             String template,
+            LogLevel logLevel,
+            List<SafeExpression.TemplateSegment> templateSegments,
             String metricPath,
+            SafeExpression.Compiled metricExpression,
             int hitLimit,
             int ttlSeconds,
             long version,
@@ -88,15 +125,31 @@ final class Protocol {
             if (line <= 0 || hitLimit <= 0 || ttlSeconds <= 0 || version < 0) {
                 throw new ProtocolException("line, hitLimit, and ttlSeconds must be positive");
             }
+            if (stackFrameLimit < 1 || stackFrameLimit > 8) {
+                throw new ProtocolException("stackFrameLimit must be an integer from 1 to 8");
+            }
+            if (type != ProbeType.SNAPSHOT && includeStackLocals) {
+                throw new ProtocolException(
+                        "includeStackLocals is supported only for snapshot probes");
+            }
             watchPaths = List.copyOf(watchPaths);
+            watchExpressions = List.copyOf(watchExpressions);
+            templateSegments = List.copyOf(templateSegments);
             for (String watchPath : watchPaths) {
                 validatePath(watchPath, "watchPaths");
             }
             if (type == ProbeType.LOG && (template == null || template.isBlank())) {
                 throw new ProtocolException("log probes require template");
             }
+            Objects.requireNonNull(logLevel, "logLevel");
             if (type == ProbeType.METRIC) {
-                validatePath(metricPath, "metricPath");
+                if ((metricPath == null) == (metricExpression == null)) {
+                    throw new ProtocolException(
+                            "metric probes require exactly one of metricPath or metricExpression");
+                }
+                if (metricPath != null) {
+                    validatePath(metricPath, "metricPath");
+                }
             }
         }
     }
@@ -135,9 +188,26 @@ final class Protocol {
     static ProbeDefinition parseProbe(Map<String, Object> object) {
         ProbeType type = ProbeType.parse(object.get("type"));
         Condition condition = parseCondition(object.get("condition"));
+        SafeExpression.Compiled conditionExpression = SafeExpression.parseOptionalCompiled(
+                object.get("conditionExpression"), "conditionExpression");
         List<String> watchPaths = stringList(object.get("watchPaths"), "watchPaths");
+        List<SafeExpression.Compiled> watchExpressions =
+                SafeExpression.parseCompiledList(
+                        object.get("watchExpressions"), "watchExpressions");
+        boolean includeStackLocals = type == ProbeType.SNAPSHOT
+                && optionalBoolean(object.get("includeStackLocals"), "includeStackLocals", false);
+        int stackFrameLimit = type == ProbeType.SNAPSHOT
+                ? boundedPositiveInteger(object.get("stackFrameLimit"), "stackFrameLimit", 3, 8)
+                : 3;
         String template = optionalString(object.get("template"), "template");
+        LogLevel logLevel = type == ProbeType.LOG
+                ? LogLevel.parse(object.get("logLevel"))
+                : LogLevel.INFO;
+        List<SafeExpression.TemplateSegment> templateSegments =
+                SafeExpression.parseTemplateSegments(object.get("templateSegments"));
         String metricPath = optionalString(object.get("metricPath"), "metricPath");
+        SafeExpression.Compiled metricExpression = SafeExpression.parseOptionalCompiled(
+                object.get("metricExpression"), "metricExpression");
         int hitLimit = object.containsKey("hitLimit")
                 ? positiveInteger(object.get("hitLimit"), "hitLimit")
                 : type.defaultHitLimit();
@@ -151,9 +221,16 @@ final class Protocol {
                 requiredString(object.get("file"), "file"),
                 positiveInteger(object.get("line"), "line"),
                 condition,
+                conditionExpression,
                 watchPaths,
+                watchExpressions,
+                includeStackLocals,
+                stackFrameLimit,
                 template,
+                logLevel,
+                templateSegments,
                 metricPath,
+                metricExpression,
                 hitLimit,
                 ttlSeconds,
                 integer(object.get("version"), "version", true),
@@ -181,10 +258,10 @@ final class Protocol {
         return event;
     }
 
-    static Map<String, Object> logEvent(String probeId, String message) {
+    static Map<String, Object> logEvent(String probeId, String message, LogLevel level) {
         LinkedHashMap<String, Object> event = baseEvent(probeId, "log");
         event.put("message", message);
-        event.put("level", "info");
+        event.put("level", level.wireName());
         return event;
     }
 
@@ -207,6 +284,7 @@ final class Protocol {
 
     static Map<String, Object> ingestPayload(
             String serviceId,
+            String agentId,
             String commitSha,
             String commitSource,
             String state,
@@ -220,8 +298,12 @@ final class Protocol {
         LinkedHashMap<String, Object> payload = new LinkedHashMap<>();
         payload.put("serviceId", serviceId);
         payload.put("sdk", "jvm");
+        payload.put("agentId", agentId);
         payload.put("commitSha", commitSha);
         payload.put("commitSource", commitSource);
+        payload.put(
+                "capabilities",
+                List.of("log-levels-v1", "expression-ast-v1", "frame-locals-v1"));
         payload.put("agentStatus", agentStatus);
         payload.put("events", events);
         return payload;
@@ -269,6 +351,31 @@ final class Protocol {
             throw new ProtocolException(name + " must be a positive integer");
         }
         return (int) value;
+    }
+
+    private static int boundedPositiveInteger(
+            Object raw,
+            String name,
+            int fallback,
+            int maximum) {
+        if (raw == null) {
+            return fallback;
+        }
+        int value = positiveInteger(raw, name);
+        if (value > maximum) {
+            throw new ProtocolException(name + " must be an integer from 1 to " + maximum);
+        }
+        return value;
+    }
+
+    private static boolean optionalBoolean(Object raw, String name, boolean fallback) {
+        if (raw == null) {
+            return fallback;
+        }
+        if (!(raw instanceof Boolean value)) {
+            throw new ProtocolException(name + " must be a boolean");
+        }
+        return value;
     }
 
     private static long integer(Object raw, String name, boolean nonNegative) {

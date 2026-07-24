@@ -37,6 +37,13 @@ import {
   clerkOAuthAuthenticatorFromEnv,
   combineBearerAuthenticators,
 } from "./clerk-auth.js";
+import {
+  compileExpression,
+  compileTemplate,
+  type CompiledExpression,
+  type ExpressionNode,
+  type TemplateSegment,
+} from "./expression.js";
 import { PostgresStore } from "./store/postgres.js";
 import {
   resolveSourceLocation,
@@ -46,6 +53,12 @@ import {
 } from "./source-map-resolver.js";
 
 export { PostgresStore } from "./store/postgres.js";
+export { compileExpression, compileTemplate } from "./expression.js";
+export type {
+  CompiledExpression,
+  ExpressionNode,
+  TemplateSegment,
+} from "./expression.js";
 export {
   BearerAuthenticationError,
   SERVICE_API_KEY_PREFIX,
@@ -97,6 +110,12 @@ const DEFAULT_TTL_SECONDS = 1_800;
 const DEFAULT_RING_CAPACITY = 500;
 const DEFAULT_TTL_SWEEP_INTERVAL_MS = 10_000;
 const DEFAULT_SNAPSHOT_INTERVAL_MS = 15_000;
+const ACTIVE_AGENT_WINDOW_MS = 45_000;
+const KNOWN_AGENT_CAPABILITIES = [
+  "log-levels-v1",
+  "expression-ast-v1",
+  "frame-locals-v1",
+] as const;
 const SOURCE_MAP_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 const SOURCE_MAP_COMMITS_PER_SERVICE = 5;
 
@@ -115,6 +134,17 @@ const sourceCommitSchema = z
   .transform((value) => value.toLowerCase());
 const commitShaSchema = sourceCommitSchema;
 const commitSourceSchema = z.enum(["env", "config"]);
+const logLevelSchema = z.enum(["debug", "info", "warn", "error"]);
+export const AgentCapabilitySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(
+    /^[a-z0-9][a-z0-9.-]*$/,
+    "must be a lowercase capability identifier",
+  );
+const agentIdSchema = z.string().trim().min(1).max(200);
 const uploaderIdSchema = z.string().trim().min(1).max(200);
 const sourceMapPathSchema = z
   .string()
@@ -142,6 +172,18 @@ const jsonScalarSchema = z.union([
   z.boolean(),
   z.null(),
 ]);
+const expressionScalarSchema = z.union([
+  z.string(),
+  z
+    .number()
+    .finite()
+    .refine(
+      (value) => !Number.isInteger(value) || Number.isSafeInteger(value),
+      "integer expression values must be within the IEEE-754 safe range",
+    ),
+  z.boolean(),
+  z.null(),
+]);
 
 export const ConditionSchema = z
   .object({
@@ -151,12 +193,86 @@ export const ConditionSchema = z
   })
   .strict();
 
+const expressionPathSegmentSchema = z.union([
+  z.string().min(1).max(128),
+  z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+]);
+export const ExpressionNodeSchema: z.ZodType<ExpressionNode> = z.lazy(() =>
+  z.discriminatedUnion("type", [
+    z
+      .object({
+        type: z.literal("literal"),
+        value: expressionScalarSchema,
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("reference"),
+        path: z.array(expressionPathSegmentSchema).min(1).max(64),
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("unary"),
+        operator: z.enum(["not", "negate"]),
+        operand: ExpressionNodeSchema,
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("binary"),
+        operator: z.enum([
+          "add",
+          "subtract",
+          "multiply",
+          "divide",
+          "modulo",
+          "eq",
+          "ne",
+          "gt",
+          "gte",
+          "lt",
+          "lte",
+          "and",
+          "or",
+        ]),
+        left: ExpressionNodeSchema,
+        right: ExpressionNodeSchema,
+      })
+      .strict(),
+  ]),
+);
+
+export const CompiledExpressionSchema: z.ZodType<CompiledExpression> = z
+  .object({
+    source: z.string().min(1).max(4_096),
+    ast: ExpressionNodeSchema,
+  })
+  .strict();
+
+const TemplateSegmentSchema: z.ZodType<TemplateSegment> =
+  z.discriminatedUnion("type", [
+    z
+      .object({
+        type: z.literal("text"),
+        value: z.string().max(16_384),
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("expression"),
+        expression: CompiledExpressionSchema,
+      })
+      .strict(),
+  ]);
+
 const createCommonShape = {
   serviceId: serviceIdSchema,
   sourceCommit: sourceCommitSchema.optional(),
   file: sourceFileSchema,
   line: z.number().int().positive(),
   condition: ConditionSchema.optional(),
+  conditionExpression: z.string().trim().min(1).max(4_096).optional(),
   ttlSeconds: z.number().int().positive().default(DEFAULT_TTL_SECONDS),
   createdBy: z.string().trim().min(1).max(500),
 } as const;
@@ -167,6 +283,9 @@ export const CreateProbeSchema = z.discriminatedUnion("type", [
       ...createCommonShape,
       type: z.literal("snapshot"),
       watchPaths: z.array(dotPathSchema).max(100).optional(),
+      watchExpressions: z.array(z.string().trim().min(1).max(4_096)).max(100).optional(),
+      includeStackLocals: z.boolean().default(false),
+      stackFrameLimit: z.number().int().min(1).max(8).default(3),
       hitLimit: z.number().int().positive().default(1),
     })
     .strict(),
@@ -175,6 +294,7 @@ export const CreateProbeSchema = z.discriminatedUnion("type", [
       ...createCommonShape,
       type: z.literal("log"),
       template: z.string().min(1).max(16_384),
+      logLevel: logLevelSchema.default("info"),
       hitLimit: z.number().int().positive().default(100),
     })
     .strict(),
@@ -189,7 +309,8 @@ export const CreateProbeSchema = z.discriminatedUnion("type", [
     .object({
       ...createCommonShape,
       type: z.literal("metric"),
-      metricPath: dotPathSchema,
+      metricPath: dotPathSchema.optional(),
+      metricExpression: z.string().trim().min(1).max(4_096).optional(),
       hitLimit: z.number().int().positive().default(10_000),
     })
     .strict(),
@@ -205,6 +326,7 @@ const definitionCommonShape = {
   runtimeLine: z.number().int().positive().optional(),
   runtimeColumn: z.number().int().nonnegative().optional(),
   condition: ConditionSchema.optional(),
+  conditionExpression: CompiledExpressionSchema.optional(),
   ttlSeconds: z.number().int().positive(),
   hitLimit: z.number().int().positive(),
   version: z.number().int().positive(),
@@ -217,6 +339,9 @@ export const ProbeDefinitionSchema = z.discriminatedUnion("type", [
       ...definitionCommonShape,
       type: z.literal("snapshot"),
       watchPaths: z.array(dotPathSchema).max(100).optional(),
+      watchExpressions: z.array(CompiledExpressionSchema).max(100).optional(),
+      includeStackLocals: z.boolean().default(false),
+      stackFrameLimit: z.number().int().min(1).max(8).default(3),
     })
     .strict(),
   z
@@ -224,6 +349,8 @@ export const ProbeDefinitionSchema = z.discriminatedUnion("type", [
       ...definitionCommonShape,
       type: z.literal("log"),
       template: z.string().min(1).max(16_384),
+      logLevel: logLevelSchema.default("info"),
+      templateSegments: z.array(TemplateSegmentSchema).max(201).optional(),
     })
     .strict(),
   z
@@ -236,7 +363,8 @@ export const ProbeDefinitionSchema = z.discriminatedUnion("type", [
     .object({
       ...definitionCommonShape,
       type: z.literal("metric"),
-      metricPath: dotPathSchema,
+      metricPath: dotPathSchema.optional(),
+      metricExpression: CompiledExpressionSchema.optional(),
     })
     .strict(),
 ]);
@@ -322,6 +450,7 @@ const stackFrameSchema = z
     fn: z.string().max(1_024),
     file: z.string().max(4_096),
     line: z.number().int().positive(),
+    variables: SerializedNodeSchema.optional(),
   })
   .strict();
 
@@ -353,7 +482,7 @@ export const ProbeEventSchema = z.discriminatedUnion("type", [
       ...eventCommonShape,
       type: z.literal("log"),
       message: z.string().max(65_536),
-      level: z.enum(["debug", "info", "warn", "error"]),
+      level: logLevelSchema,
     })
     .strict(),
   z
@@ -407,16 +536,22 @@ export const IngestSchema = z
   .object({
     serviceId: serviceIdSchema,
     sdk: z.enum(["node", "python", "jvm"]),
+    agentId: agentIdSchema.optional(),
     commitSha: commitShaSchema,
     commitSource: commitSourceSchema.optional(),
+    capabilities: z.array(AgentCapabilitySchema).max(32).default([]),
     agentStatus: AgentStatusSchema,
     events: z.array(ProbeEventSchema).max(10_000),
   })
   .strict();
 
 export type AgentSdk = z.infer<typeof IngestSchema>["sdk"];
+export type AgentCapability = z.infer<typeof AgentCapabilitySchema>;
 export type AgentStatus = z.infer<typeof AgentStatusSchema>;
-export type IngestInput = z.infer<typeof IngestSchema>;
+type ParsedIngestInput = z.infer<typeof IngestSchema>;
+export type IngestInput = Omit<ParsedIngestInput, "capabilities"> & {
+  capabilities?: AgentCapability[];
+};
 
 export interface ProbeStatus {
   status: ProbeStatusName;
@@ -430,6 +565,7 @@ export interface ServiceRecord {
   sdk?: AgentSdk | undefined;
   commitSha?: string | undefined;
   commitSource?: "env" | "config" | undefined;
+  capabilities?: AgentCapability[] | undefined;
   agentStatus?: AgentStatus | undefined;
 }
 
@@ -668,6 +804,7 @@ const persistedServiceSchema = z
     sdk: z.enum(["node", "python", "jvm"]).optional(),
     commitSha: commitShaSchema.optional(),
     commitSource: commitSourceSchema.optional(),
+    capabilities: z.array(AgentCapabilitySchema).max(32).default([]),
     agentStatus: AgentStatusSchema.optional(),
   })
   .strict();
@@ -831,6 +968,21 @@ interface SourceMapLease {
   expiresAt: number;
 }
 
+interface AgentCapabilityReport {
+  lastSeen: number;
+  capabilities: AgentCapability[];
+}
+
+function normalizeAgentCapabilities(
+  capabilities: AgentCapability[],
+): AgentCapability[] {
+  const unique = new Set(capabilities);
+  return [
+    ...KNOWN_AGENT_CAPABILITIES.filter((capability) => unique.delete(capability)),
+    ...[...unique].sort(),
+  ];
+}
+
 type ScopedServiceRecord = ServiceRecord & ResourceScope;
 type ScopedServiceVersion = ResourceScope & {
   serviceId: string;
@@ -864,11 +1016,113 @@ function sameResourceScope(
   );
 }
 
+function invalidExpression(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  throw new BrokerHttpError(400, "invalid_expression", message);
+}
+
+function compileProbeInput(input: CreateProbeInput): Record<string, unknown> {
+  if (input.condition !== undefined && input.conditionExpression !== undefined) {
+    throw new BrokerHttpError(
+      400,
+      "invalid_request",
+      "condition and conditionExpression are mutually exclusive",
+    );
+  }
+
+  let conditionExpression: CompiledExpression | undefined;
+  try {
+    conditionExpression =
+      input.conditionExpression === undefined
+        ? undefined
+        : compileExpression(input.conditionExpression);
+  } catch (error) {
+    invalidExpression(error);
+  }
+
+  const { conditionExpression: _conditionExpression, ...common } = input;
+  const compiledCommon: Record<string, unknown> = {
+    ...common,
+    ...(conditionExpression === undefined ? {} : { conditionExpression }),
+  };
+
+  if (input.type === "snapshot") {
+    let watchExpressions: CompiledExpression[] | undefined;
+    try {
+      watchExpressions = input.watchExpressions?.map(compileExpression);
+    } catch (error) {
+      invalidExpression(error);
+    }
+    const { watchExpressions: _watchExpressions, ...snapshot } = compiledCommon;
+    return {
+      ...snapshot,
+      ...(watchExpressions === undefined ? {} : { watchExpressions }),
+    };
+  }
+
+  if (input.type === "log") {
+    let templateSegments: TemplateSegment[] | undefined;
+    try {
+      templateSegments = compileTemplate(input.template);
+    } catch (error) {
+      invalidExpression(error);
+    }
+    return {
+      ...compiledCommon,
+      ...(templateSegments === undefined ? {} : { templateSegments }),
+    };
+  }
+
+  if (input.type === "metric") {
+    if (
+      (input.metricPath === undefined) ===
+      (input.metricExpression === undefined)
+    ) {
+      throw new BrokerHttpError(
+        400,
+        "invalid_request",
+        "metric probes require exactly one of metricPath or metricExpression",
+      );
+    }
+    let metricExpression: CompiledExpression | undefined;
+    try {
+      metricExpression =
+        input.metricExpression === undefined
+          ? undefined
+          : compileExpression(input.metricExpression);
+    } catch (error) {
+      invalidExpression(error);
+    }
+    const { metricExpression: _metricExpression, ...metric } = compiledCommon;
+    return {
+      ...metric,
+      ...(metricExpression === undefined ? {} : { metricExpression }),
+    };
+  }
+
+  return compiledCommon;
+}
+
+function requiresExpressionCapability(
+  input: Record<string, unknown>,
+): boolean {
+  return (
+    input["conditionExpression"] !== undefined ||
+    input["watchExpressions"] !== undefined ||
+    input["templateSegments"] !== undefined ||
+    input["metricExpression"] !== undefined
+  );
+}
+
 export class BrokerState {
   private readonly probes = new Map<string, StoredProbe>();
   private readonly serviceVersions = new Map<string, ScopedServiceVersion>();
   private readonly events = new Map<string, ProbeEvent[]>();
   private readonly services = new Map<string, ScopedServiceRecord>();
+  private readonly agentCapabilityReports = new Map<
+    string,
+    Map<string, AgentCapabilityReport>
+  >();
   private readonly statuses = new Map<string, ProbeStatus>();
   private readonly sourceMapSets = new Map<string, SourceMapSet>();
   private readonly sourceMapLeases = new Map<string, SourceMapLease>();
@@ -898,6 +1152,39 @@ export class BrokerState {
     input: CreateProbeInput,
     scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): ProbeDefinition {
+    const compiledInput = compileProbeInput(input);
+    this.refreshServiceCapabilities(scope, input.serviceId);
+    const service = this.services.get(this.serviceKey(scope, input.serviceId));
+    if (input.type === "log" && input.logLevel !== "info") {
+      if (!service?.capabilities?.includes("log-levels-v1")) {
+        throw new BrokerHttpError(
+          409,
+          "agent_upgrade_required",
+          `service ${input.serviceId} does not report log-levels-v1`,
+        );
+      }
+    }
+    if (
+      requiresExpressionCapability(compiledInput) &&
+      !service?.capabilities?.includes("expression-ast-v1")
+    ) {
+      throw new BrokerHttpError(
+        409,
+        "agent_upgrade_required",
+        `service ${input.serviceId} does not report expression-ast-v1`,
+      );
+    }
+    if (
+      input.type === "snapshot" &&
+      input.includeStackLocals &&
+      !service?.capabilities?.includes("frame-locals-v1")
+    ) {
+      throw new BrokerHttpError(
+        409,
+        "agent_upgrade_required",
+        `service ${input.serviceId} does not report frame-locals-v1`,
+      );
+    }
     const now = this.now();
     let id = this.idGenerator(now);
     for (let attempt = 0; this.probes.has(id); attempt += 1) {
@@ -909,7 +1196,7 @@ export class BrokerState {
     probeIdSchema.parse(id);
 
     const version = this.incrementServiceVersion(input.serviceId, scope);
-    const probe = ProbeDefinitionSchema.parse({ ...input, id, version });
+    const probe = ProbeDefinitionSchema.parse({ ...compiledInput, id, version });
     this.probes.set(id, {
       scope: resourceScope(scope),
       probe,
@@ -1142,7 +1429,7 @@ export class BrokerState {
   }
 
   public ingest(
-    input: z.infer<typeof IngestSchema>,
+    input: IngestInput,
     scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): number {
     this.expireDueProbes();
@@ -1185,6 +1472,12 @@ export class BrokerState {
       }
     }
 
+    const capabilities = this.reportAgentCapabilities(
+      scope,
+      input.serviceId,
+      input.agentId ?? `legacy:${input.sdk}:${input.commitSha}`,
+      input.capabilities ?? [],
+    );
     this.touchService(
       input.serviceId,
       input.sdk,
@@ -1192,6 +1485,7 @@ export class BrokerState {
       input.commitSha,
       input.commitSource,
       scope,
+      capabilities,
     );
     for (const event of input.events) {
       this.appendEvent(event);
@@ -1210,6 +1504,11 @@ export class BrokerState {
   public listServices(
     scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
   ): ServiceRecord[] {
+    for (const service of this.services.values()) {
+      if (sameResourceScope(service, scope)) {
+        this.refreshServiceCapabilities(scope, service.serviceId);
+      }
+    }
     return [...this.services.values()]
       .filter((service) => sameResourceScope(service, scope))
       .map((service) => {
@@ -1466,6 +1765,7 @@ export class BrokerState {
     this.serviceVersions.clear();
     this.events.clear();
     this.services.clear();
+    this.agentCapabilityReports.clear();
     this.statuses.clear();
     this.sourceMapSets.clear();
     this.sourceMapLeases.clear();
@@ -1486,7 +1786,10 @@ export class BrokerState {
       );
     }
     for (const service of parsed.services) {
-      this.services.set(this.serviceKey(service, service.serviceId), service);
+      this.services.set(this.serviceKey(service, service.serviceId), {
+        ...service,
+        capabilities: [],
+      });
     }
     for (const status of parsed.statuses) {
       this.statuses.set(status.probeId, status.value);
@@ -1544,6 +1847,7 @@ export class BrokerState {
       }
     }
     this.listeners.clear();
+    this.agentCapabilityReports.clear();
   }
 
   private incrementServiceVersion(
@@ -1632,6 +1936,7 @@ export class BrokerState {
     commitSha?: string,
     commitSource?: "env" | "config",
     scope: ResourceScope = DEFAULT_RESOURCE_SCOPE,
+    capabilities?: AgentCapability[],
   ): void {
     const key = this.serviceKey(scope, serviceId);
     const previous = this.services.get(key);
@@ -1659,8 +1964,58 @@ export class BrokerState {
           ? {}
           : { commitSource: previous.commitSource }
         : { commitSource }),
+      ...(capabilities === undefined
+        ? previous?.capabilities === undefined
+          ? {}
+          : { capabilities: previous.capabilities }
+        : { capabilities: [...capabilities] }),
     };
     this.services.set(key, service);
+  }
+
+  private reportAgentCapabilities(
+    scope: ResourceScope,
+    serviceId: string,
+    agentId: string,
+    capabilities: AgentCapability[],
+  ): AgentCapability[] {
+    const key = this.serviceKey(scope, serviceId);
+    const reports =
+      this.agentCapabilityReports.get(key) ??
+      new Map<string, AgentCapabilityReport>();
+    reports.set(agentId, {
+      lastSeen: this.now(),
+      capabilities: normalizeAgentCapabilities(capabilities),
+    });
+    this.agentCapabilityReports.set(key, reports);
+    return this.activeCapabilityIntersection(reports);
+  }
+
+  private refreshServiceCapabilities(
+    scope: ResourceScope,
+    serviceId: string,
+  ): void {
+    const key = this.serviceKey(scope, serviceId);
+    const service = this.services.get(key);
+    if (service === undefined) return;
+    const reports = this.agentCapabilityReports.get(key);
+    const capabilities =
+      reports === undefined ? [] : this.activeCapabilityIntersection(reports);
+    this.services.set(key, { ...service, capabilities });
+  }
+
+  private activeCapabilityIntersection(
+    reports: Map<string, AgentCapabilityReport>,
+  ): AgentCapability[] {
+    const cutoff = this.now() - ACTIVE_AGENT_WINDOW_MS;
+    for (const [agentId, report] of reports) {
+      if (report.lastSeen < cutoff) reports.delete(agentId);
+    }
+    const active = [...reports.values()];
+    if (active.length === 0) return [];
+    return active[0]?.capabilities.filter((capability) =>
+      active.every((report) => report.capabilities.includes(capability)),
+    ) ?? [];
   }
 
   private appendEvent(event: ProbeEvent): void {

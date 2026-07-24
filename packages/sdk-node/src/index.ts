@@ -8,9 +8,13 @@ export {
 } from "./serializer.js";
 export type {
   AgentEvent,
+  CompiledExpression,
+  ExpressionNode,
+  LogLevel,
   ProbeCondition,
   ProbeDefinition,
   SanitizedNode,
   SerializerConfig,
   SerializerConfigInput,
+  TemplateSegment,
 } from "./types.js";

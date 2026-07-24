@@ -4,6 +4,13 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const fixtureDirectory = join(root, "spec", "fixtures", "serializer");
+const expressionFixturePath = join(
+  root,
+  "spec",
+  "fixtures",
+  "expressions",
+  "evaluator.json",
+);
 const requiredFixtures = new Set([
   "circular.json",
   "deep-object.json",
@@ -168,4 +175,33 @@ for (const file of files) {
   validateNode(fixture.expected, `${file}.expected`);
 }
 
-console.log(`Validated ${files.length} serializer fixtures.`);
+const expressionFixture = JSON.parse(
+  await readFile(expressionFixturePath, "utf8"),
+);
+if (
+  !isObject(expressionFixture) ||
+  !Array.isArray(expressionFixture.cases) ||
+  expressionFixture.cases.length === 0
+) {
+  fail(expressionFixturePath, "must contain a non-empty cases array");
+}
+for (const [index, testCase] of expressionFixture.cases.entries()) {
+  const location = `evaluator.json.cases[${index}]`;
+  if (!isObject(testCase)) fail(location, "must be an object");
+  if (typeof testCase.name !== "string" || testCase.name.length === 0) {
+    fail(`${location}.name`, "must be a non-empty string");
+  }
+  if (!isObject(testCase.expression) || !isObject(testCase.expression.ast)) {
+    fail(`${location}.expression`, "must contain source and ast");
+  }
+  if (typeof testCase.expression.source !== "string") {
+    fail(`${location}.expression.source`, "must be a string");
+  }
+  if (!isObject(testCase.expected) || typeof testCase.expected.ok !== "boolean") {
+    fail(`${location}.expected`, "must contain a boolean ok field");
+  }
+}
+
+console.log(
+  `Validated ${files.length} serializer fixtures and ${expressionFixture.cases.length} expression cases.`,
+);

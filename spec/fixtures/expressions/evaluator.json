@@ -1,0 +1,209 @@
+{
+  "cases": [
+    {
+      "name": "numeric arithmetic",
+      "root": {
+        "order": {
+          "total": 120,
+          "discount": 20
+        }
+      },
+      "expression": {
+        "source": "(order.total - order.discount) / 2",
+        "ast": {
+          "type": "binary",
+          "operator": "divide",
+          "left": {
+            "type": "binary",
+            "operator": "subtract",
+            "left": {
+              "type": "reference",
+              "path": ["order", "total"]
+            },
+            "right": {
+              "type": "reference",
+              "path": ["order", "discount"]
+            }
+          },
+          "right": {
+            "type": "literal",
+            "value": 2
+          }
+        }
+      },
+      "expected": {
+        "ok": true,
+        "value": 50
+      }
+    },
+    {
+      "name": "boolean short circuit",
+      "root": {
+        "enabled": false
+      },
+      "expression": {
+        "source": "enabled && missing.value > 0",
+        "ast": {
+          "type": "binary",
+          "operator": "and",
+          "left": {
+            "type": "reference",
+            "path": ["enabled"]
+          },
+          "right": {
+            "type": "binary",
+            "operator": "gt",
+            "left": {
+              "type": "reference",
+              "path": ["missing", "value"]
+            },
+            "right": {
+              "type": "literal",
+              "value": 0
+            }
+          }
+        }
+      },
+      "expected": {
+        "ok": true,
+        "value": false
+      }
+    },
+    {
+      "name": "fixed array index",
+      "root": {
+        "items": [
+          {
+            "price": 7
+          }
+        ]
+      },
+      "expression": {
+        "source": "items[0].price * 3",
+        "ast": {
+          "type": "binary",
+          "operator": "multiply",
+          "left": {
+            "type": "reference",
+            "path": ["items", 0, "price"]
+          },
+          "right": {
+            "type": "literal",
+            "value": 3
+          }
+        }
+      },
+      "expected": {
+        "ok": true,
+        "value": 21
+      }
+    },
+    {
+      "name": "missing reference",
+      "root": {},
+      "expression": {
+        "source": "missing.value",
+        "ast": {
+          "type": "reference",
+          "path": ["missing", "value"]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "error": "missing"
+      }
+    },
+    {
+      "name": "division by zero",
+      "root": {
+        "value": 10
+      },
+      "expression": {
+        "source": "value / 0",
+        "ast": {
+          "type": "binary",
+          "operator": "divide",
+          "left": {
+            "type": "reference",
+            "path": ["value"]
+          },
+          "right": {
+            "type": "literal",
+            "value": 0
+          }
+        }
+      },
+      "expected": {
+        "ok": false,
+        "error": "division-by-zero"
+      }
+    },
+    {
+      "name": "negative remainder uses truncation toward zero",
+      "root": {},
+      "expression": {
+        "source": "-5 % 2",
+        "ast": {
+          "type": "binary",
+          "operator": "modulo",
+          "left": {
+            "type": "unary",
+            "operator": "negate",
+            "operand": {
+              "type": "literal",
+              "value": 5
+            }
+          },
+          "right": {
+            "type": "literal",
+            "value": 2
+          }
+        }
+      },
+      "expected": {
+        "ok": true,
+        "value": -1
+      }
+    },
+    {
+      "name": "unsafe runtime integer is rejected",
+      "root": {
+        "value": 9007199254740992
+      },
+      "expression": {
+        "source": "value",
+        "ast": {
+          "type": "reference",
+          "path": ["value"]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "error": "unsafe-number"
+      }
+    },
+    {
+      "name": "unsafe arithmetic result is rejected",
+      "root": {},
+      "expression": {
+        "source": "9007199254740991 + 1",
+        "ast": {
+          "type": "binary",
+          "operator": "add",
+          "left": {
+            "type": "literal",
+            "value": 9007199254740991
+          },
+          "right": {
+            "type": "literal",
+            "value": 1
+          }
+        }
+      },
+      "expected": {
+        "ok": false,
+        "error": "unsafe-number"
+      }
+    }
+  ]
+}

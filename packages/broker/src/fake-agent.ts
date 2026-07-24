@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { z } from "zod";
 
 import {
   ProbeDefinitionSchema,
+  type AgentCapability,
   type AgentSdk,
   type ProbeDefinition,
   type ProbeEvent,
@@ -31,6 +33,8 @@ export interface FakeAgentOptions {
   apiKey?: string;
   commitSha?: string;
   sdk?: AgentSdk;
+  capabilities?: AgentCapability[];
+  agentId?: string;
   pollIntervalMs?: number;
   fetchImplementation?: typeof fetch;
   clock?: () => Date;
@@ -80,8 +84,16 @@ export function fabricateEvent(
             fn: "fakeAgentHit",
             file: probe.file,
             line: probe.line,
+            ...(probe.includeStackLocals
+              ? {
+                  variables: {
+                    t: "obj" as const,
+                    c: { fakeFrame: { t: "bool" as const, v: true } },
+                  },
+                }
+              : {}),
           },
-        ],
+        ].slice(0, probe.stackFrameLimit),
       };
     }
     case "log":
@@ -90,7 +102,7 @@ export function fabricateEvent(
         type: "log",
         ts: timestamp,
         message: renderFakeLog(probe),
-        level: "info",
+        level: probe.logLevel,
       };
     case "counter":
       return {
@@ -119,6 +131,8 @@ export class FakeAgent {
   private readonly apiKey: string | undefined;
   private readonly commitSha: string;
   private readonly sdk: AgentSdk;
+  private readonly capabilities: AgentCapability[];
+  private readonly agentId: string;
   private readonly pollIntervalMs: number;
   private readonly fetchImplementation: typeof fetch;
   private readonly clock: () => Date;
@@ -132,6 +146,11 @@ export class FakeAgent {
     this.apiKey = options.apiKey;
     this.commitSha = options.commitSha ?? "abcdef1234567890";
     this.sdk = options.sdk ?? "node";
+    this.capabilities = options.capabilities ?? [
+      "log-levels-v1",
+      "frame-locals-v1",
+    ];
+    this.agentId = options.agentId ?? randomUUID();
     this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
     this.fetchImplementation = options.fetchImplementation ?? fetch;
     this.clock = options.clock ?? (() => new Date());
@@ -273,8 +292,10 @@ export class FakeAgent {
         body: JSON.stringify({
           serviceId: this.serviceId,
           sdk: this.sdk,
+          agentId: this.agentId,
           commitSha: this.commitSha,
           commitSource: "config",
+          capabilities: this.capabilities,
           agentStatus: {
             state: "green",
             detail: `${this.active.size} fake probes active`,

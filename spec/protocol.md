@@ -6,8 +6,10 @@ behavior from another implementation.
 
 ## 1. Invariants
 
-1. Runtime agents are read-only. They must not evaluate expressions or invoke
-   target-process methods while capturing data.
+1. Runtime agents are read-only. They must not evaluate source text, mutate
+   target state, or invoke target-process methods while capturing data.
+   Portable broker-compiled ASTs may be evaluated only over already captured
+   values.
 2. Redaction and structural limits are applied while traversing raw values.
    Only a `SanitizedSnapshot` may cross a process or network boundary.
 3. Rate limits are checked before capture work.
@@ -136,13 +138,29 @@ Optional common fields:
   `line`; runtime coordinates identify the generated JavaScript location used
   by V8.
 
+Agents report additive protocol support in the `capabilities` array on every
+ingest heartbeat. Current capability identifiers are `log-levels-v1`,
+`expression-ast-v1`, and `frame-locals-v1`. An omitted array means a legacy
+agent with no advanced capabilities. The broker rejects probes that require a
+capability the service has not reported instead of silently degrading them.
+Each running agent process also reports a stable-for-process `agentId`. For a
+service with multiple active replicas, the broker exposes only the intersection
+of capabilities reported within the 45-second activity window. Capability
+claims are intentionally cleared after broker restore until agents heartbeat
+again.
+
 Type-specific fields:
 
-- `snapshot`: optional `watchPaths`, an array of dot paths.
-- `log`: required `template`, containing zero or more `${dot.path}`
-  interpolations.
+- `snapshot`: optional `watchPaths`, optional compiled `watchExpressions`,
+  `includeStackLocals` (default `false`), and `stackFrameLimit` (default `3`,
+  maximum `8`).
+- `log`: required `template`, containing zero or more `${dot.path}` or safe
+  `${expression}` interpolations, plus `logLevel` (`debug`, `info`, `warn`, or
+  `error`). `logLevel` defaults to `info` when omitted. Advanced templates
+  include broker-generated `templateSegments`.
 - `counter`: no additional fields.
-- `metric`: required `metricPath`, a dot path resolving to a finite number.
+- `metric`: exactly one of `metricPath` or compiled `metricExpression`,
+  resolving to a finite number.
 
 Type-specific default hit limits are `1` for snapshot, `100` for log, and
 `10000` for counter and metric probes.
@@ -166,6 +184,52 @@ the condition false, including for `ne`.
 
 Conditions are evaluated after capture. A false condition emits no probe data
 event, but the hit still counts toward safety rate limits.
+
+### 3.2 Safe expressions
+
+Advanced probes may use broker-compiled expressions:
+
+- `conditionExpression` on every probe type.
+- `watchExpressions` on snapshots.
+- `templateSegments` on logs, compiled from `${expression}` placeholders.
+- `metricExpression` instead of `metricPath` on metrics.
+
+A compiled expression contains the audited `source` string and a portable
+`ast`. Supported AST nodes are JSON scalar literals, fixed reference paths,
+unary `not`/`negate`, and bounded binary arithmetic, comparison, equality, and
+boolean operators. References use fixed string or non-negative integer path
+segments.
+
+The grammar intentionally excludes calls, assignment, constructors, imports,
+reflection, optional chaining, dynamic property expressions, and prototype
+segments. The broker caps source length, AST depth, node count, and path depth.
+Agents evaluate only the broker AST over already captured values using own
+data properties or runtime-equivalent field access. They never pass expression
+source to `eval` or a target-language interpreter.
+
+Every reference applies the runtime's configured key and exact-value redaction
+policy before returning a value. A redacted reference is an evaluation error,
+so it cannot affect a condition or metric and cannot appear in a watch or log.
+
+Types are strict and never coerced. Boolean operators require booleans,
+ordering and numeric arithmetic require finite IEEE-754 values, and `add`
+accepts two finite numbers or two strings. Integer inputs and integer-valued
+results must remain within JavaScript's safe integer range
+`[-9007199254740991, 9007199254740991]`; this gives Node, Python, and JVM the
+same numeric domain. Missing values, unsafe integers, invalid types, division
+by zero, and non-finite results are structured evaluation errors. Such errors
+make a condition false, mark a watch unavailable, render an explicit log
+placeholder, or reject a metric sample without escaping into the host
+application.
+
+### 3.3 Per-frame locals
+
+Snapshot definitions accept `includeStackLocals` (default `false`) and
+`stackFrameLimit` (default `3`, maximum `8`). When enabled, each retained stack
+entry may include a `variables` serialized tree for that frame. Frame variables
+use the same in-process redaction, depth, property, array, string, frame-count,
+queue, and bandwidth boundaries as current-frame variables. Agents that do not
+report `frame-locals-v1` cannot receive these probes.
 
 ## 4. Agent-facing broker API
 
@@ -234,8 +298,14 @@ maps locally.
 {
   "serviceId": "payment-service",
   "sdk": "node",
+  "agentId": "9d33bcb7-83f8-4f70-929d-85d1e8432afe",
   "commitSha": "4f3c2a1d9e8b7c6a5f4e3d2c1b0a9876543210ab",
   "commitSource": "env",
+  "capabilities": [
+    "log-levels-v1",
+    "expression-ast-v1",
+    "frame-locals-v1"
+  ],
   "agentStatus": {
     "state": "green",
     "detail": "3 probes armed"
@@ -245,10 +315,15 @@ maps locally.
 ```
 
 - `sdk` is `node`, `python`, or `jvm`.
+- `agentId` identifies one running agent process. Current agents generate a
+  random UUID at startup. It is optional only for legacy agents.
 - `commitSha` is required, normalized lowercase hexadecimal, and must be sent
   on every heartbeat/ingest. It is agent-reported honesty metadata, not
   cryptographic proof of bytecode identity.
 - `commitSource` is optional and is `env` or `config`.
+- `capabilities` is optional for legacy agents and otherwise contains the
+  additive feature identifiers the current agent build implements. Unknown
+  well-formed identifiers are retained for forward compatibility.
 - `agentStatus.state` is `green` or `red`.
 - `agentStatus.detail` is optional.
 - `events` may be empty; an empty ingest acts as a service heartbeat.
@@ -434,6 +509,11 @@ HTTP 200 returns:
     {
       "serviceId": "payment-service",
       "sdk": "node",
+      "capabilities": [
+        "log-levels-v1",
+        "expression-ast-v1",
+        "frame-locals-v1"
+      ],
       "lastSeen": "2026-07-19T18:30:00.123Z",
       "agentStatus": {
         "state": "green"
@@ -444,6 +524,8 @@ HTTP 200 returns:
 ```
 
 Services are discovered through poll and ingest heartbeats.
+`capabilities` is the intersection reported by all active agent replicas and is
+empty after broker restart until at least one current heartbeat is received.
 
 ### 5.5 Read probe data
 

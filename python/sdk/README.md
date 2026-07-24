@@ -15,3 +15,12 @@ agent = liveprobe.start(
 
 `commit_sha` is required unless `LIVEPROBE_COMMIT_SHA` or `GIT_COMMIT` is set.
 `api_key` defaults to `LIVEPROBE_API_KEY`.
+
+The agent supports `debug`, `info`, `warn`, and `error` log events,
+broker-compiled safe expressions for conditions, watches, logs, and metrics,
+and optional bounded locals on selected stack frames. Expressions read only
+captured dictionaries/sequences; they cannot call Python code, inspect
+attributes, or mutate application state. All expression and frame-local output
+uses the configured serializer limits and redaction policy.
+Numeric expressions use finite IEEE-754 values and reject integer inputs or
+results outside the safe integer range so behavior is identical across SDKs.

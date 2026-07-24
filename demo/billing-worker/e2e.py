@@ -197,6 +197,20 @@ def _assert_sanitized_evidence(event: dict[str, Any]) -> None:
         raise AssertionError("user.address watch did not show sanitized null")
     if watches.get("user.is_legacy") != {"t": "bool", "v": True}:
         raise AssertionError("user.is_legacy watch did not show sanitized true")
+    if watches.get("subtotal_cents / 100") != {"t": "num", "v": 25.0}:
+        raise AssertionError("subtotal expression watch did not equal 25")
+
+    stack = event.get("stack")
+    if (
+        not isinstance(stack, list)
+        or not stack
+        or len(stack) > 2
+        or any(
+            not isinstance(frame, dict) or "variables" not in frame
+            for frame in stack
+        )
+    ):
+        raise AssertionError("requested stack frames did not include bounded locals")
 
 
 def main() -> int:
@@ -353,12 +367,13 @@ def main() -> int:
                         "type": "snapshot",
                         "file": PROBE_FILE,
                         "line": _bug_line(),
-                        "condition": {
-                            "path": "user.is_legacy",
-                            "op": "eq",
-                            "value": True,
-                        },
+                        "conditionExpression": (
+                            "user.is_legacy == true && subtotal_cents >= 2500"
+                        ),
                         "watchPaths": ["user.address", "user.is_legacy"],
+                        "watchExpressions": ["subtotal_cents / 100"],
+                        "includeStackLocals": True,
+                        "stackFrameLimit": 2,
                         "hitLimit": 1,
                         "ttlSeconds": 60,
                         "createdBy": "e2e:billing-worker",

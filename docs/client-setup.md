@@ -59,7 +59,7 @@ Install the agent that matches the target service. Use a stable, unique
 Install the published ESM package:
 
 ```sh
-npm install @doomslayer2945/liveprobe-node@0.1.1
+npm install @doomslayer2945/liveprobe-node@0.2.0
 ```
 
 Start it during application startup and stop it during graceful shutdown:
@@ -111,7 +111,7 @@ embedded `sourcesContent` before uploading maps.
 Python uses `sys.monitoring`, so Python 3.12 or newer is required.
 
 ```sh
-python -m pip install liveprobe==0.1.1
+python -m pip install liveprobe==0.2.0
 ```
 
 Start one process-wide agent from the application's lifecycle hook:
@@ -139,7 +139,7 @@ to build and run the service.
 ### JVM bridge, Java 17+
 
 The JVM integration is a zero-dependency JDI sidecar, not a `-javaagent`. The
-artifact is `io.liveprobe:liveprobe-bridge:0.1.1` in the private GitHub Maven
+artifact is `io.liveprobe:liveprobe-bridge:0.2.0` in the private GitHub Maven
 registry for this repository.
 
 Authenticate Maven with a GitHub token that has `read:packages` and access to
@@ -170,7 +170,7 @@ Download the bridge into the local Maven repository:
 
 ```sh
 mvn dependency:get \
-  -Dartifact=io.liveprobe:liveprobe-bridge:0.1.1 \
+  -Dartifact=io.liveprobe:liveprobe-bridge:0.2.0 \
   -DremoteRepositories=github::default::https://maven.pkg.github.com/mohammed2945/LightProbe
 ```
 
@@ -187,7 +187,7 @@ Run the bridge beside the target:
 
 ```sh
 java --add-modules jdk.jdi \
-  -jar "$HOME/.m2/repository/io/liveprobe/liveprobe-bridge/0.1.1/liveprobe-bridge-0.1.1.jar" \
+  -jar "$HOME/.m2/repository/io/liveprobe/liveprobe-bridge/0.2.0/liveprobe-bridge-0.2.0.jar" \
   --service inventory-service \
   --attach 127.0.0.1:5005 \
   --broker "$BROKER_URL" \
@@ -225,7 +225,7 @@ package does not need to be installed globally.
 Confirm that npm can resolve it:
 
 ```sh
-npx -y @doomslayer2945/liveprobe-mcp@0.1.1 --help
+npx -y @doomslayer2945/liveprobe-mcp@0.2.0 --help
 ```
 
 For Cursor or another client that accepts the common `mcpServers` JSON shape,
@@ -238,7 +238,7 @@ add this configuration:
       "command": "npx",
       "args": [
         "-y",
-        "@doomslayer2945/liveprobe-mcp@0.1.1",
+        "@doomslayer2945/liveprobe-mcp@0.2.0",
         "--broker-url",
         "https://liveprobe.tryastrea.tech"
       ],
@@ -295,10 +295,10 @@ The server exposes fourteen tools:
 | `create_service_credential` | Create a per-service agent key; the plaintext key is returned once. |
 | `list_service_credentials` | List credential metadata and revocation state without secrets. |
 | `revoke_service_credential` | Revoke an agent key in your organization. |
-| `set_snapshot_probe` | Capture bounded locals, watch paths, and stack data. |
-| `set_log_probe` | Add a temporary log with `${dot.path}` placeholders. |
+| `set_snapshot_probe` | Capture bounded locals, watch paths or safe expressions, and optional locals for up to eight stack frames. |
+| `set_log_probe` | Add a temporary `debug`, `info`, `warn`, or `error` log with `${dot.path}` or safe `${expression}` placeholders. |
 | `set_counter_probe` | Count executions of a source line. |
-| `set_metric_probe` | Aggregate a numeric dot path at a source line. |
+| `set_metric_probe` | Aggregate a numeric dot path or safe numeric expression at a source line. |
 | `list_probes` | Inspect probe definitions and status. |
 | `get_probe_data` | Read retained evidence, optionally long-polling for it. |
 | `remove_probe` | Remove a probe and uninstall it on the next agent poll. |

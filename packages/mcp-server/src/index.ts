@@ -32,6 +32,127 @@ const scalarSchema = z.union([
   z.boolean(),
   z.null(),
 ]);
+const logLevelSchema = z.enum(["debug", "info", "warn", "error"]);
+const agentCapabilitySchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9.-]*$/);
+const requiredAgentCapabilities = [
+  "log-levels-v1",
+  "expression-ast-v1",
+  "frame-locals-v1",
+] as const;
+const expressionSourceSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4_096)
+  .describe(
+    "Safe expression: literals, fixed property/index access, arithmetic, comparisons, boolean operators, and parentheses; no calls or mutation",
+  );
+
+type ExpressionNode =
+  | { type: "literal"; value: string | number | boolean | null }
+  | { type: "reference"; path: Array<string | number> }
+  | {
+      type: "unary";
+      operator: "not" | "negate";
+      operand: ExpressionNode;
+    }
+  | {
+      type: "binary";
+      operator:
+        | "add"
+        | "subtract"
+        | "multiply"
+        | "divide"
+        | "modulo"
+        | "eq"
+        | "ne"
+        | "gt"
+        | "gte"
+        | "lt"
+        | "lte"
+        | "and"
+        | "or";
+      left: ExpressionNode;
+      right: ExpressionNode;
+    };
+
+const expressionNodeSchema: z.ZodType<ExpressionNode> = z.lazy(() =>
+  z.discriminatedUnion("type", [
+    z
+      .object({
+        type: z.literal("literal"),
+        value: z.union([
+          z.string(),
+          z
+            .number()
+            .finite()
+            .refine(
+              (value) =>
+                !Number.isInteger(value) || Number.isSafeInteger(value),
+            ),
+          z.boolean(),
+          z.null(),
+        ]),
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("reference"),
+        path: z.array(
+          z.union([
+            z.string(),
+            z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+          ]),
+        ),
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("unary"),
+        operator: z.enum(["not", "negate"]),
+        operand: expressionNodeSchema,
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal("binary"),
+        operator: z.enum([
+          "add",
+          "subtract",
+          "multiply",
+          "divide",
+          "modulo",
+          "eq",
+          "ne",
+          "gt",
+          "gte",
+          "lt",
+          "lte",
+          "and",
+          "or",
+        ]),
+        left: expressionNodeSchema,
+        right: expressionNodeSchema,
+      })
+      .strict(),
+  ]),
+);
+const compiledExpressionSchema = z
+  .object({ source: z.string(), ast: expressionNodeSchema })
+  .strict();
+const templateSegmentSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("text"), value: z.string() }).strict(),
+  z
+    .object({
+      type: z.literal("expression"),
+      expression: compiledExpressionSchema,
+    })
+    .strict(),
+]);
 
 export const McpConditionSchema = z
   .object({
@@ -57,6 +178,7 @@ const commonInputShape = {
   condition: McpConditionSchema.optional().describe(
     "Optional read-only post-capture condition; no target code is evaluated",
   ),
+  condition_expression: expressionSourceSchema.optional(),
   hit_limit: z.number().int().positive().optional(),
   ttl_seconds: z.number().int().positive().optional().default(1_800),
   created_by: z
@@ -76,6 +198,13 @@ export const SetSnapshotProbeInputSchema = z
       .max(100)
       .optional()
       .describe("Extra dot paths to capture alongside local variables"),
+    watch_expressions: z.array(expressionSourceSchema).max(100).optional(),
+    include_stack_locals: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Capture redacted, bounded locals for selected stack frames"),
+    stack_frame_limit: z.number().int().min(1).max(8).optional().default(3),
   })
   .strict();
 
@@ -89,6 +218,10 @@ export const SetLogProbeInputSchema = z
       .describe(
         "Log template with optional ${dot.path} placeholders resolved read-only",
       ),
+    log_level: logLevelSchema
+      .optional()
+      .default("info")
+      .describe("Severity attached to the captured telemetry event"),
   })
   .strict();
 
@@ -99,11 +232,23 @@ export const SetCounterProbeInputSchema = z
 export const SetMetricProbeInputSchema = z
   .object({
     ...commonInputShape,
-    metric_path: dotPathSchema.describe(
+    metric_path: dotPathSchema.optional().describe(
       "Dot path that resolves to the numeric value to aggregate",
     ),
+    metric_expression: expressionSourceSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      (value.metric_path === undefined) ===
+      (value.metric_expression === undefined)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "provide exactly one of metric_path or metric_expression",
+      });
+    }
+  });
 
 export const ListServicesInputSchema = z.object({}).strict();
 export const PingBrokerInputSchema = z.object({}).strict();
@@ -169,6 +314,7 @@ const definitionCommonShape = {
   file: sourceFileSchema,
   line: z.number().int().positive(),
   condition: conditionResponseSchema.optional(),
+  conditionExpression: compiledExpressionSchema.optional(),
   hitLimit: z.number().int().positive(),
   ttlSeconds: z.number().int().positive(),
   version: z.number().int().positive(),
@@ -181,6 +327,9 @@ export const BrokerProbeDefinitionSchema = z.discriminatedUnion("type", [
       ...definitionCommonShape,
       type: z.literal("snapshot"),
       watchPaths: z.array(z.string()).optional(),
+      watchExpressions: z.array(compiledExpressionSchema).optional(),
+      includeStackLocals: z.boolean().default(false),
+      stackFrameLimit: z.number().int().min(1).max(8).default(3),
     })
     .strict(),
   z
@@ -188,6 +337,8 @@ export const BrokerProbeDefinitionSchema = z.discriminatedUnion("type", [
       ...definitionCommonShape,
       type: z.literal("log"),
       template: z.string(),
+      logLevel: logLevelSchema.default("info"),
+      templateSegments: z.array(templateSegmentSchema).optional(),
     })
     .strict(),
   z
@@ -200,7 +351,8 @@ export const BrokerProbeDefinitionSchema = z.discriminatedUnion("type", [
     .object({
       ...definitionCommonShape,
       type: z.literal("metric"),
-      metricPath: z.string(),
+      metricPath: z.string().optional(),
+      metricExpression: compiledExpressionSchema.optional(),
     })
     .strict(),
 ]);
@@ -225,6 +377,7 @@ const serviceSchema = z
     sdk: z.enum(["node", "python", "jvm"]).optional(),
     commitSha: commitHashSchema.optional(),
     commitSource: z.enum(["env", "config"]).optional(),
+    capabilities: z.array(agentCapabilitySchema).optional(),
     lastSeen: z.string().datetime({ offset: true }),
     agentStatus: z
       .object({
@@ -353,7 +506,11 @@ export type BrokerCreateProbeInput =
       file: string;
       line: number;
       condition?: BrokerCondition;
+      conditionExpression?: string;
       watchPaths?: string[];
+      watchExpressions?: string[];
+      includeStackLocals: boolean;
+      stackFrameLimit: number;
       hitLimit?: number;
       ttlSeconds: number;
       createdBy: string;
@@ -365,7 +522,9 @@ export type BrokerCreateProbeInput =
       file: string;
       line: number;
       condition?: BrokerCondition;
+      conditionExpression?: string;
       template: string;
+      logLevel: z.infer<typeof logLevelSchema>;
       hitLimit?: number;
       ttlSeconds: number;
       createdBy: string;
@@ -377,6 +536,7 @@ export type BrokerCreateProbeInput =
       file: string;
       line: number;
       condition?: BrokerCondition;
+      conditionExpression?: string;
       hitLimit?: number;
       ttlSeconds: number;
       createdBy: string;
@@ -388,7 +548,9 @@ export type BrokerCreateProbeInput =
       file: string;
       line: number;
       condition?: BrokerCondition;
-      metricPath: string;
+      conditionExpression?: string;
+      metricPath?: string;
+      metricExpression?: string;
       hitLimit?: number;
       ttlSeconds: number;
       createdBy: string;
@@ -710,15 +872,20 @@ export type ProbeCreateResult = BrokerProbeDefinition & {
 
 function optionalCommonFields(input: {
   condition?: BrokerCondition | undefined;
+  condition_expression?: string | undefined;
   hit_limit?: number | undefined;
 }): {
   condition?: BrokerCondition;
+  conditionExpression?: string;
   hitLimit?: number;
 } {
   return {
     ...(input.condition === undefined
       ? {}
       : { condition: input.condition }),
+    ...(input.condition_expression === undefined
+      ? {}
+      : { conditionExpression: input.condition_expression }),
     ...(input.hit_limit === undefined ? {} : { hitLimit: input.hit_limit }),
   };
 }
@@ -773,6 +940,11 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         ...(input.watch_paths === undefined
           ? {}
           : { watchPaths: input.watch_paths }),
+        ...(input.watch_expressions === undefined
+          ? {}
+          : { watchExpressions: input.watch_expressions }),
+        includeStackLocals: input.include_stack_locals,
+        stackFrameLimit: input.stack_frame_limit,
       });
     },
     async set_log_probe(rawInput) {
@@ -784,6 +956,7 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         file: input.file,
         line: input.line,
         template: input.template,
+        logLevel: input.log_level,
         ttlSeconds: input.ttl_seconds,
         createdBy: input.created_by,
         ...optionalCommonFields(input),
@@ -810,7 +983,12 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
         type: "metric",
         file: input.file,
         line: input.line,
-        metricPath: input.metric_path,
+        ...(input.metric_path === undefined
+          ? {}
+          : { metricPath: input.metric_path }),
+        ...(input.metric_expression === undefined
+          ? {}
+          : { metricExpression: input.metric_expression }),
         ttlSeconds: input.ttl_seconds,
         createdBy: input.created_by,
         ...optionalCommonFields(input),
@@ -823,12 +1001,20 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
       return {
         services: response.services.map((service) => {
           const online = now - Date.parse(service.lastSeen) <= 45_000;
+          const missingCapabilities = requiredAgentCapabilities.filter(
+            (capability) => !service.capabilities?.includes(capability),
+          );
           return {
             ...service,
             online,
             caveats: [
               "commitSha is agent-reported audit metadata, not cryptographic proof of bytecode identity.",
               ...(online ? [] : ["service has not heartbeated within 45 seconds"]),
+              ...(missingCapabilities.length === 0
+                ? []
+                : [
+                    `agent upgrade required for: ${missingCapabilities.join(", ")}`,
+                  ]),
             ],
           };
         }),
@@ -1010,14 +1196,14 @@ export function createMcpServer(
   const handlers = createToolHandlers(client);
   const server = new McpServer({
     name: "liveprobe",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.registerTool(
     "set_snapshot_probe",
     {
       title: "Set snapshot probe",
-      description: `${DEPLOYED_COMMIT_GUIDANCE} Use when you need local variables, selected watch paths, and a bounded stack from one source line. Snapshot probes default to one hit and never evaluate code in the target runtime.`,
+      description: `${DEPLOYED_COMMIT_GUIDANCE} Use when you need local variables, selected watch paths or safe watch expressions, and a bounded stack from one source line. Safe expressions support fixed reads and operators only; calls and mutation are rejected.`,
       inputSchema: SetSnapshotProbeInputSchema,
       annotations: { destructiveHint: false },
     },
@@ -1028,7 +1214,7 @@ export function createMcpServer(
     "set_log_probe",
     {
       title: "Set dynamic log probe",
-      description: `${DEPLOYED_COMMIT_GUIDANCE} Use to add a temporary diagnostic log at a source line without redeploying. \${dot.path} placeholders are resolved from captured data; no target-runtime expression is evaluated.`,
+      description: `${DEPLOYED_COMMIT_GUIDANCE} Use to add a temporary diagnostic log at a source line without redeploying. Choose debug, info, warn, or error severity. \${expression} placeholders use the bounded safe-expression engine; calls and mutation are rejected.`,
       inputSchema: SetLogProbeInputSchema,
       annotations: { destructiveHint: false },
     },
@@ -1048,7 +1234,7 @@ export function createMcpServer(
     "set_metric_probe",
     {
       title: "Set metric probe",
-      description: `${DEPLOYED_COMMIT_GUIDANCE} Use to aggregate count, sum, min, max, and last for one numeric dot path at a source line. Values are resolved read-only and pre-aggregated by the runtime agent.`,
+      description: `${DEPLOYED_COMMIT_GUIDANCE} Use to aggregate count, sum, min, max, and last for one numeric dot path or safe numeric expression at a source line. Values are resolved read-only and pre-aggregated by the runtime agent.`,
       inputSchema: SetMetricProbeInputSchema,
       annotations: { destructiveHint: false },
     },

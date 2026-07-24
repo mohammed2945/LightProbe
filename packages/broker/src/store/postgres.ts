@@ -12,7 +12,11 @@ import type {
   ServiceCredentialRecord,
   StoredServiceCredential,
 } from "../auth.js";
-import type { BrokerState, IngestInput } from "../index.js";
+import type {
+  AgentCapability,
+  BrokerState,
+  IngestInput,
+} from "../index.js";
 import {
   POSTGRES_MIGRATION_SQL,
   POSTGRES_SCHEMA_VERSION,
@@ -27,6 +31,7 @@ interface ServiceRow extends QueryResultRow {
   sdk: "node" | "python" | "jvm" | null;
   commit_sha: string | null;
   commit_source: "env" | "config" | null;
+  capabilities: AgentCapability[];
   agent_status: unknown | null;
 }
 
@@ -253,7 +258,7 @@ export class PostgresStore {
     try {
       const services = await client.query<ServiceRow>(
         `select tenant_id, project_id, environment_id, service_id, last_seen,
-           sdk, commit_sha, commit_source, agent_status
+           sdk, commit_sha, commit_source, capabilities, agent_status
          from services order by service_id`,
       );
       const probes = await client.query<ProbeRow>(
@@ -382,6 +387,7 @@ export class PostgresStore {
           ...(row.commit_source === null
             ? {}
             : { commitSource: row.commit_source }),
+          capabilities: row.capabilities,
           ...(row.agent_status === null
             ? {}
             : { agentStatus: row.agent_status }),
@@ -799,14 +805,15 @@ export class PostgresStore {
     await client.query(
       `insert into services (
          tenant_id, project_id, environment_id, service_id, last_seen, sdk,
-         commit_sha, commit_source, agent_status
+         commit_sha, commit_source, capabilities, agent_status
        )
        select tenant_id, project_id, environment_id, service_id,
-         last_seen::timestamptz, sdk, commit_sha, commit_source, agent_status
+         last_seen::timestamptz, sdk, commit_sha, commit_source, capabilities,
+         agent_status
        from jsonb_to_recordset($1::jsonb) as service(
          tenant_id text, project_id text, environment_id text, service_id text,
          last_seen text, sdk text, commit_sha text, commit_source text,
-         agent_status jsonb
+         capabilities jsonb, agent_status jsonb
        )
        on conflict (
          tenant_id, project_id, environment_id, service_id
@@ -815,6 +822,7 @@ export class PostgresStore {
          sdk = excluded.sdk,
          commit_sha = excluded.commit_sha,
          commit_source = excluded.commit_source,
+         capabilities = excluded.capabilities,
          agent_status = excluded.agent_status`,
       [
         JSON.stringify(
@@ -827,6 +835,7 @@ export class PostgresStore {
             sdk: service.sdk ?? null,
             commit_sha: service.commitSha ?? null,
             commit_source: service.commitSource ?? null,
+            capabilities: service.capabilities ?? [],
             agent_status: service.agentStatus ?? null,
           })),
         ),

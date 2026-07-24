@@ -3,7 +3,7 @@ import pytest
 
 
 def test_package_imports() -> None:
-    assert liveprobe.__version__ == "0.1.1"
+    assert liveprobe.__version__ == "0.2.0"
     assert callable(liveprobe.start)
     assert callable(liveprobe.stop)
 

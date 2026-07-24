@@ -110,7 +110,7 @@ e2e-jvm:
 	pnpm --filter @liveprobe/broker run build
 	sh scripts/java17.sh $(MAKE) -C java/bridge jar
 	sh scripts/java17.sh $(MAKE) -C demo/inventory-service package
-	node scripts/e2e-jvm.mjs
+	sh scripts/java17.sh node scripts/e2e-jvm.mjs
 
 demo-prerequisites:
 	pnpm --filter @doomslayer2945/liveprobe-node run build

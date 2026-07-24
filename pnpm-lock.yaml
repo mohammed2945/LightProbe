@@ -32,6 +32,9 @@ importers:
       fastify:
         specifier: ^5.10.0
         version: 5.10.0
+      jsep:
+        specifier: ^1.4.0
+        version: 1.4.0
       pg:
         specifier: ^8.16.3
         version: 8.22.0
@@ -1071,6 +1074,10 @@ packages:
   js-cookie@3.0.7:
     resolution: {integrity: sha512-z/wZZgDrkNV1eA0ULjM/F9/50Ya8fbzgKneSpoPsXSGd0KnpdtHfOZWK+GcwLk+EZbS4F9RBhU+K2RgzuDaItw==}
     engines: {node: '>=20'}
+
+  jsep@1.4.0:
+    resolution: {integrity: sha512-B7qPcEVE3NVkmSJbaYxvv4cHkVW7DQsZz13pUMrfS8z8Q/BuShN+gcTXrUlPiGqM2/t/EEaI030bpxMqY8gMlw==}
+    engines: {node: '>= 10.16.0'}
 
   json-schema-ref-resolver@3.0.0:
     resolution: {integrity: sha512-hOrZIVL5jyYFjzk7+y7n5JDzGlU8rfWDuYyHwGa2WA8/pcmMHezp2xsVwxrebD/Q9t8Nc5DboieySDpCp4WG4A==}
@@ -2403,6 +2410,8 @@ snapshots:
   jose@6.2.3: {}
 
   js-cookie@3.0.7: {}
+
+  jsep@1.4.0: {}
 
   json-schema-ref-resolver@3.0.0:
     dependencies:

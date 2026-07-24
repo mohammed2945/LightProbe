@@ -292,6 +292,7 @@ describe("ProbeManager pipelines", () => {
         type: "log",
         line: 10,
         template: "tier=${user.tier} token=${user.token}",
+        logLevel: "warn",
         hitLimit: 2,
       }),
       probe({ id: "counter", type: "counter", line: 11, hitLimit: 2 }),
@@ -313,6 +314,7 @@ describe("ProbeManager pipelines", () => {
         probeId: "log",
         type: "log",
         message: "tier=free token=[REDACTED]",
+        level: "warn",
       }),
     ]);
     expect(aggregates.flush(new Date("2026-07-19T18:30:02.000Z"))).toEqual([
@@ -328,6 +330,88 @@ describe("ProbeManager pipelines", () => {
       }),
     ]);
     expect(audit).toContain("[liveprobe] tier=free token=[REDACTED]");
+  });
+
+  it("evaluates safe conditions, watches, logs, and metrics", async () => {
+    const commands: string[] = [];
+    const { manager, events, aggregates } = setup(createInspector(commands));
+    const doubled = {
+      source: "amount * 2",
+      ast: {
+        type: "binary" as const,
+        operator: "multiply" as const,
+        left: { type: "reference" as const, path: ["amount"] },
+        right: { type: "literal" as const, value: 2 },
+      },
+    };
+    const positive = {
+      source: "amount > 0",
+      ast: {
+        type: "binary" as const,
+        operator: "gt" as const,
+        left: { type: "reference" as const, path: ["amount"] },
+        right: { type: "literal" as const, value: 0 },
+      },
+    };
+    await manager.reconcile([
+      probe({
+        id: "snapshot-expression",
+        conditionExpression: positive,
+        watchExpressions: [doubled],
+        includeStackLocals: true,
+        stackFrameLimit: 1,
+        hitLimit: 2,
+      }),
+      probe({
+        id: "log-expression",
+        type: "log",
+        line: 11,
+        template: "double=${amount * 2}",
+        templateSegments: [
+          { type: "text", value: "double=" },
+          { type: "expression", expression: doubled },
+        ],
+        hitLimit: 2,
+      }),
+      probe({
+        id: "metric-expression",
+        type: "metric",
+        line: 12,
+        metricExpression: doubled,
+        hitLimit: 2,
+      }),
+    ]);
+    events.takeBatch(100_000);
+
+    manager.handlePaused(paused(["bp-10", "bp-11", "bp-12"]));
+    await nextImmediate();
+
+    expect(events.takeBatch(100_000)).toEqual([
+      expect.objectContaining({
+        probeId: "snapshot-expression",
+        watches: expect.objectContaining({
+          "amount * 2": { t: "num", v: 8 },
+        }),
+        stack: [
+          expect.objectContaining({
+            variables: expect.objectContaining({
+              t: "obj",
+            }),
+          }),
+        ],
+      }),
+      expect.objectContaining({
+        probeId: "log-expression",
+        message: "double=8",
+      }),
+    ]);
+    expect(aggregates.flush()).toEqual([
+      expect.objectContaining({
+        probeId: "metric-expression",
+        count: 1,
+        sum: 8,
+      }),
+    ]);
   });
 
   it("filters false post-capture conditions without consuming the hit limit", async () => {

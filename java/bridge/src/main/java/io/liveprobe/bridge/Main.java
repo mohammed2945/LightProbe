@@ -585,15 +585,33 @@ final class ProbeManager implements AutoCloseable {
 
         try {
             StackFrame frame = event.thread().frame(0);
-            List<LocalVariable> visible = frame.visibleVariables();
-            Map<LocalVariable, Value> values = frame.getValues(visible);
-            LinkedHashMap<String, Object> variables = new LinkedHashMap<>();
-            for (LocalVariable variable : visible) {
-                variables.put(variable.name(), JdiValueReader.read(
-                        values.get(variable), serializerConfig));
+            boolean includeStackLocals =
+                    managed.definition.type() == Protocol.ProbeType.SNAPSHOT
+                            && managed.definition.includeStackLocals();
+            Map<String, Object> variables;
+            try {
+                variables = JdiStackCapture.readLocals(frame, serializerConfig);
+            } catch (AbsentInformationException exception) {
+                if (!includeStackLocals) {
+                    throw exception;
+                }
+                variables = Map.of();
+            } catch (RuntimeException exception) {
+                if (!includeStackLocals) {
+                    return new CaptureOutcome.Failed(
+                            managed, "event-thread-frame-unavailable");
+                }
+                variables = Map.of();
             }
             List<RawStackFrame> stack = managed.definition.type() == Protocol.ProbeType.SNAPSHOT
-                    ? captureStack(event, serializerConfig.maxStackFrames())
+                    ? JdiStackCapture.capture(
+                            event,
+                            serializerConfig.maxStackFrames(),
+                            includeStackLocals
+                                    ? managed.definition.stackFrameLimit()
+                                    : 0,
+                            variables,
+                            serializerConfig)
                     : List.of();
             return new CaptureOutcome.Captured(
                     managed, new RawHit(managed.definition, variables, stack));
@@ -768,27 +786,6 @@ final class ProbeManager implements AutoCloseable {
         }
     }
 
-    private static List<RawStackFrame> captureStack(BreakpointEvent event, int limit)
-            throws IncompatibleThreadStateException {
-        List<StackFrame> frames = event.thread().frames(0, Math.min(limit, event.thread().frameCount()));
-        ArrayList<RawStackFrame> stack = new ArrayList<>(frames.size());
-        for (StackFrame frame : frames) {
-            Location location = frame.location();
-            int line = location.lineNumber();
-            if (line <= 0) {
-                continue;
-            }
-            String source;
-            try {
-                source = location.sourcePath();
-            } catch (AbsentInformationException exception) {
-                source = location.declaringType().name();
-            }
-            stack.add(new RawStackFrame(location.method().name(), source, line));
-        }
-        return stack;
-    }
-
     private static void audit(String action, Protocol.ProbeDefinition probe, String suffix) {
         String message = "[liveprobe] " + action + " " + probe.file() + ":" + probe.line()
                 + " (" + probe.type().wireName() + ", by " + probe.createdBy() + ")";
@@ -871,7 +868,94 @@ record RawHit(
         Map<String, Object> variables,
         List<RawStackFrame> stack) {}
 
-record RawStackFrame(String function, String file, int line) {}
+record RawStackFrame(
+        String function,
+        String file,
+        int line,
+        Map<String, Object> variables) {
+    RawStackFrame {
+        if (variables != null) {
+            variables = Collections.unmodifiableMap(new LinkedHashMap<>(variables));
+        }
+    }
+
+    RawStackFrame(String function, String file, int line) {
+        this(function, file, line, null);
+    }
+}
+
+final class JdiStackCapture {
+    private JdiStackCapture() {}
+
+    static List<RawStackFrame> capture(
+            BreakpointEvent event,
+            int stackLimit,
+            int frameLocalLimit,
+            Map<String, Object> firstVariables,
+            SafeSerializer.Config serializerConfig)
+            throws IncompatibleThreadStateException {
+        if (stackLimit <= 0) {
+            return List.of();
+        }
+        int count = Math.min(stackLimit, event.thread().frameCount());
+        List<StackFrame> frames = event.thread().frames(0, count);
+        ArrayList<RawStackFrame> stack = new ArrayList<>(frames.size());
+        for (int index = 0; index < frames.size(); index++) {
+            StackFrame frame = frames.get(index);
+            try {
+                Location location = frame.location();
+                int line = location.lineNumber();
+                if (line <= 0) {
+                    continue;
+                }
+                String source;
+                try {
+                    source = location.sourcePath();
+                } catch (AbsentInformationException exception) {
+                    source = location.declaringType().name();
+                }
+                Map<String, Object> frameVariables = null;
+                if (stack.size() < frameLocalLimit) {
+                    frameVariables = index == 0
+                            ? firstVariables
+                            : readLocalsOrNull(frame, serializerConfig);
+                }
+                stack.add(new RawStackFrame(
+                        location.method().name(), source, line, frameVariables));
+            } catch (RuntimeException ignored) {
+                // One stale or unreadable frame must not discard the snapshot.
+            }
+        }
+        return stack;
+    }
+
+    static Map<String, Object> readLocals(
+            StackFrame frame,
+            SafeSerializer.Config serializerConfig)
+            throws AbsentInformationException {
+        List<LocalVariable> visible = frame.visibleVariables();
+        List<LocalVariable> selected = visible.subList(
+                0, Math.min(visible.size(), serializerConfig.maxProps()));
+        Map<LocalVariable, Value> values = frame.getValues(selected);
+        LinkedHashMap<String, Object> variables = new LinkedHashMap<>();
+        for (LocalVariable variable : selected) {
+            variables.put(
+                    variable.name(),
+                    JdiValueReader.read(values.get(variable), serializerConfig));
+        }
+        return variables;
+    }
+
+    static Map<String, Object> readLocalsOrNull(
+            StackFrame frame,
+            SafeSerializer.Config serializerConfig) {
+        try {
+            return readLocals(frame, serializerConfig);
+        } catch (AbsentInformationException | RuntimeException exception) {
+            return null;
+        }
+    }
+}
 
 final class JdiValueReader {
     private JdiValueReader() {}
@@ -1011,6 +1095,13 @@ final class HitProcessor {
         if (!ConditionEvaluator.evaluate(hit.variables(), probe.condition())) {
             return;
         }
+        if (probe.conditionExpression() != null) {
+            SafeExpression.Result condition = SafeExpression.evaluate(
+                    probe.conditionExpression(), hit.variables(), serializerConfig);
+            if (!condition.ok() || !Boolean.TRUE.equals(condition.value())) {
+                return;
+            }
+        }
         EmittedSlots.Claim claim = emittedSlots.tryClaim();
         if (!claim.acquired()) {
             return;
@@ -1034,8 +1125,20 @@ final class HitProcessor {
             Object value = ConditionEvaluator.resolve(hit.variables(), path);
             watches.put(path, SafeSerializer.serializePath(path, value, serializerConfig));
         }
+        for (SafeExpression.Compiled expression : probe.watchExpressions()) {
+            SafeExpression.Result result =
+                    SafeExpression.evaluate(expression, hit.variables(), serializerConfig);
+            watches.put(
+                    expression.source(),
+                    result.ok()
+                            ? SafeSerializer.serialize(result.value(), serializerConfig)
+                            : SafeExpression.unsupportedMarker());
+        }
         ArrayList<Map<String, Object>> stack = new ArrayList<>();
-        for (RawStackFrame rawFrame : hit.stack()) {
+        List<RawStackFrame> selectedStack = probe.includeStackLocals()
+                ? hit.stack().subList(0, Math.min(probe.stackFrameLimit(), hit.stack().size()))
+                : hit.stack();
+        for (RawStackFrame rawFrame : selectedStack) {
             if (rawFrame.line() <= 0) {
                 continue;
             }
@@ -1043,6 +1146,15 @@ final class HitProcessor {
             frame.put("fn", rawFrame.function());
             frame.put("file", rawFrame.file());
             frame.put("line", rawFrame.line());
+            if (probe.includeStackLocals()) {
+                frame.put(
+                        "variables",
+                        SafeSerializer.serialize(
+                                rawFrame.variables() == null
+                                        ? Map.of()
+                                        : rawFrame.variables(),
+                                serializerConfig));
+            }
             stack.add(frame);
         }
         eventBuffer.add(Protocol.snapshotEvent(probe.id(), variables, watches, stack));
@@ -1050,13 +1162,34 @@ final class HitProcessor {
 
     private void processLog(RawHit hit) {
         Protocol.ProbeDefinition probe = hit.definition();
-        String message = renderTemplate(probe.template(), hit.variables());
-        eventBuffer.add(Protocol.logEvent(probe.id(), message));
+        String message = probe.templateSegments().isEmpty()
+                ? renderTemplate(probe.template(), hit.variables())
+                : SafeExpression.renderTemplate(
+                        probe.templateSegments(), hit.variables(), serializerConfig);
+        eventBuffer.add(Protocol.logEvent(probe.id(), message, probe.logLevel()));
         System.out.println("[liveprobe] " + message);
     }
 
     private void processMetric(RawHit hit) {
         Protocol.ProbeDefinition probe = hit.definition();
+        if (probe.metricExpression() != null) {
+            SafeExpression.Result result =
+                    SafeExpression.evaluate(
+                            probe.metricExpression(), hit.variables(), serializerConfig);
+            if (result.ok() && result.value() instanceof Number number) {
+                double sample = number.doubleValue();
+                if (Double.isFinite(sample)) {
+                    aggregations.addMetric(probe.id(), sample);
+                    return;
+                }
+            }
+            String reason = result.ok() ? "expected-number" : result.error();
+            eventBuffer.add(Protocol.statusEvent(
+                    probe.id(),
+                    "error",
+                    "invalid-metric: " + probe.metricExpression().source() + " (" + reason + ")"));
+            return;
+        }
         if (ConditionEvaluator.pathIsRedacted(probe.metricPath(), serializerConfig)) {
             eventBuffer.add(Protocol.statusEvent(
                     probe.id(), "error", "metric path is redacted"));

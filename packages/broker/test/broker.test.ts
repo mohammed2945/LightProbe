@@ -902,6 +902,65 @@ describe("broker validation and storage", () => {
     });
   });
 
+  it("defaults log probes to info and preserves an explicit log level", () => {
+    const common = {
+      serviceId: "orders",
+      type: "log" as const,
+      file: "src/orders.ts",
+      line: 19,
+      template: "order=${order.id}",
+      createdBy: "test",
+    };
+
+    expect(CreateProbeSchema.parse(common)).toMatchObject({
+      logLevel: "info",
+    });
+    expect(
+      CreateProbeSchema.parse({ ...common, logLevel: "warn" }),
+    ).toMatchObject({ logLevel: "warn" });
+    expect(() =>
+      CreateProbeSchema.parse({ ...common, logLevel: "fatal" }),
+    ).toThrow();
+  });
+
+  it("requires a reporting-capable agent for non-default log levels", () => {
+    const state = new BrokerState();
+    const warning = CreateProbeSchema.parse({
+      serviceId: "orders",
+      type: "log",
+      file: "src/orders.ts",
+      line: 19,
+      template: "order=${order.id}",
+      logLevel: "warn",
+      createdBy: "test",
+    });
+
+    expect(() => state.createProbe(warning)).toThrow(
+      /does not report log-levels-v1/,
+    );
+
+    state.ingest({
+      serviceId: "orders",
+      sdk: "node",
+      commitSha: "abcdef1234567890",
+      commitSource: "config",
+      capabilities: ["log-levels-v1"],
+      agentStatus: { state: "green" },
+      events: [],
+    });
+
+    expect(state.createProbe(warning)).toMatchObject({
+      type: "log",
+      logLevel: "warn",
+    });
+    expect(state.listServices()).toEqual([
+      expect.objectContaining({
+        serviceId: "orders",
+        capabilities: ["log-levels-v1"],
+      }),
+    ]);
+  });
+
   it("normalizes and round-trips optional source commit metadata", async () => {
     const broker = await buildBroker();
     openBrokers.push(broker);
@@ -1540,6 +1599,11 @@ describe("Postgres persistence", () => {
         sdk: "node",
         commitSha: "abcdef1234567890",
         commitSource: "config",
+        capabilities: [
+          "log-levels-v1",
+          "expression-ast-v1",
+          "frame-locals-v1",
+        ],
         agentStatus: { state: "green", detail: "1 probe armed" },
         events: [
           {
@@ -1596,6 +1660,7 @@ describe("Postgres persistence", () => {
         serviceId: "orders",
         sdk: "node",
         commitSha: "abcdef1234567890",
+        capabilities: [],
         agentStatus: { state: "green", detail: "1 probe armed" },
       },
     ]);
@@ -1795,7 +1860,7 @@ describe("Postgres persistence", () => {
       const versions = await inspection.query<{ version: number }>(
         `select version from liveprobe_schema_migrations order by version`,
       );
-      expect(versions.rows.map(({ version }) => version)).toEqual([4, 6]);
+      expect(versions.rows.map(({ version }) => version)).toEqual([4, 7]);
 
       await inspection.query(`
         insert into tenants (tenant_id, display_name)

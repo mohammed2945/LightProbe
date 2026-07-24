@@ -108,6 +108,16 @@ function evidenceValue(snapshot, path) {
   return variableNode.v;
 }
 
+function watchValue(snapshot, expression) {
+  const watchNode = snapshot.watches?.[expression];
+  assert.ok(
+    watchNode !== null && typeof watchNode === "object",
+    `watches must include ${expression}`,
+  );
+  assert.ok("v" in watchNode, `${expression} must have a scalar value`);
+  return watchNode.v;
+}
+
 async function markerLine() {
   const lines = (await readFile(inventorySource, "utf8")).split(/\r?\n/u);
   const matches = lines
@@ -183,13 +193,19 @@ try {
         `127.0.0.1:${String(jdwpPort)}`,
         "--broker",
         brokerUrl,
+        "--commit",
+        "abcdef1234567890",
       ],
     ),
   );
   await waitFor("JVM bridge registration", 10_000, async () => {
     const response = await requestJson(`${brokerUrl}/v1/services`);
     return response.services?.some(
-      (service) => service.serviceId === serviceId && service.sdk === "jvm",
+      (service) =>
+        service.serviceId === serviceId
+        && service.sdk === "jvm"
+        && service.capabilities?.includes("expression-ast-v1")
+        && service.capabilities?.includes("frame-locals-v1"),
     )
       ? true
       : null;
@@ -204,7 +220,12 @@ try {
       type: "snapshot",
       file: "demo/inventory-service/src/main/java/io/liveprobe/demo/inventory/InventoryService.java",
       line,
+      conditionExpression:
+        'requestRole == "follower" && cachedStock > authoritativeStock',
       watchPaths: ["cachedStock", "authoritativeStock", "requested", "requestRole"],
+      watchExpressions: ["cachedStock - authoritativeStock"],
+      includeStackLocals: true,
+      stackFrameLimit: 2,
       hitLimit: 1,
       ttlSeconds: 60,
       createdBy: "e2e:jvm",
@@ -264,12 +285,22 @@ try {
     "snapshot must prove the stale cache permits an invalid reservation",
   );
   assert.ok(
+    watchValue(snapshot, "cachedStock - authoritativeStock") > 0,
+    "expression watch must quantify the stale-cache gap",
+  );
+  assert.ok(
     snapshot.stack.some((frame) => frame.file.endsWith("InventoryService.java")),
     "snapshot stack should identify InventoryService.java",
   );
   assert.ok(
     snapshot.stack.every((frame) => frame.line > 0),
     "snapshot stack must contain only positive source lines",
+  );
+  assert.ok(
+    snapshot.stack.length > 0
+      && snapshot.stack.length <= 2
+      && snapshot.stack.every((frame) => frame.variables),
+    "requested JVM stack frames must include bounded serialized locals",
   );
 
   await fetch(`${brokerUrl}/v1/probes/${probeId}`, { method: "DELETE" });

@@ -1,4 +1,4 @@
-export const POSTGRES_SCHEMA_VERSION = 6;
+export const POSTGRES_SCHEMA_VERSION = 7;
 
 export const DEFAULT_TENANT_ID = "internal";
 export const DEFAULT_PROJECT_ID = "default";
@@ -59,6 +59,7 @@ export const POSTGRES_MIGRATION_SQL = `
     sdk text,
     commit_sha text,
     commit_source text,
+    capabilities jsonb not null default '[]'::jsonb,
     agent_status jsonb,
     primary key (tenant_id, project_id, environment_id, service_id)
   );
@@ -198,7 +199,8 @@ export const POSTGRES_MIGRATION_SQL = `
   alter table services
     add column if not exists tenant_id text not null default '${DEFAULT_TENANT_ID}',
     add column if not exists project_id text not null default '${DEFAULT_PROJECT_ID}',
-    add column if not exists environment_id text not null default '${DEFAULT_ENVIRONMENT_ID}';
+    add column if not exists environment_id text not null default '${DEFAULT_ENVIRONMENT_ID}',
+    add column if not exists capabilities jsonb not null default '[]'::jsonb;
   alter table probes
     add column if not exists tenant_id text not null default '${DEFAULT_TENANT_ID}',
     add column if not exists project_id text not null default '${DEFAULT_PROJECT_ID}',

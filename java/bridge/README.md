@@ -35,6 +35,26 @@ boundary. Source line resolution requires `LineNumberTable` metadata, and local 
 Optional repeated `--redact-key` and `--redact-value` flags extend the serializer defaults.
 `--hits-per-second` defaults to 10.
 
+Log probe definitions accept an optional camel-case `logLevel` field with
+`debug`, `info`, `warn`, or `error`. The bridge emits the configured level with
+each log event; definitions without `logLevel` remain compatible and default to
+`info`.
+
+The bridge advertises `expression-ast-v1` and evaluates broker-compiled
+conditions, snapshot watches, log template segments, and metric expressions.
+The portable AST is bounded and supports only fixed map/field/list access,
+finite scalar arithmetic, comparisons, and strict boolean operators. It never
+calls target methods, getters, constructors, reflection, or a language
+evaluator. Legacy dot-path probe definitions remain supported.
+Numeric expressions use finite IEEE-754 values and reject integer inputs or
+results outside the safe integer range so behavior is identical across SDKs.
+
+Snapshot probes may request bounded per-frame locals with
+`includeStackLocals`, which defaults to `false`; `stackFrameLimit` defaults to
+3 and is capped at 8. Frames without `LocalVariableTable` data remain visible
+with an empty serialized variables object. Frame data uses the normal serializer
+and redaction limits. The bridge advertises this support as `frame-locals-v1`.
+
 Maven builds and verifies the publishable artifact with `mvn verify`. The
-package coordinates are `io.liveprobe:liveprobe-bridge:0.1.1`; the first MVP
+package coordinates are `io.liveprobe:liveprobe-bridge:0.2.0`; the first MVP
 publishes to GitHub Packages.

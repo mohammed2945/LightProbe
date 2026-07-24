@@ -12,6 +12,7 @@ import {
 import { FakeAgent } from "../../broker/src/fake-agent.js";
 import {
   BrokerClient,
+  BrokerProbeDefinitionSchema,
   createMcpServer,
   createToolHandlers,
 } from "../src/index.js";
@@ -22,6 +23,25 @@ const NORMALIZED_COMMIT = DEPLOYED_COMMIT.toLowerCase();
 
 afterEach(async () => {
   await Promise.all(openBrokers.splice(0).map((broker) => broker.close()));
+});
+
+it("parses legacy probe definitions with additive defaults", () => {
+  expect(
+    BrokerProbeDefinitionSchema.parse({
+      id: "prb_01J5V4T8NZ6M2KQ7CYX3R9W0AB",
+      serviceId: "checkout",
+      type: "snapshot",
+      file: "src/checkout.ts",
+      line: 20,
+      hitLimit: 1,
+      ttlSeconds: 1_800,
+      version: 1,
+      createdBy: "legacy",
+    }),
+  ).toMatchObject({
+    includeStackLocals: false,
+    stackFrameLimit: 3,
+  });
 });
 
 async function startBroker(apiKey?: string): Promise<{
@@ -200,6 +220,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       file: "src/checkout.ts",
       line: 21,
       template: "total=${cart.total}",
+      log_level: "error",
       hit_limit: 1,
     });
     const counter = await handlers.set_counter_probe({
@@ -224,6 +245,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       "counter",
       "metric",
     ]);
+    expect(log).toMatchObject({ logLevel: "error" });
     expect(
       [snapshot, log, counter, metric].map((probe) => probe.sourceCommit),
     ).toEqual(Array.from({ length: 4 }, () => NORMALIZED_COMMIT));
@@ -268,6 +290,11 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       expect(dataEvents(result.events)).toContainEqual(
         expect.objectContaining({ type: probe.type }),
       );
+      if (probe.type === "log") {
+        expect(dataEvents(result.events)).toContainEqual(
+          expect.objectContaining({ type: "log", level: "error" }),
+        );
+      }
     }
 
     const completedList = await handlers.list_probes({
@@ -287,7 +314,15 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       expect.objectContaining({
         serviceId: "checkout",
         sdk: "node",
+        capabilities: [
+          "log-levels-v1",
+          "frame-locals-v1",
+        ],
         agentStatus: expect.objectContaining({ state: "green" }),
+        caveats: [
+          "commitSha is agent-reported audit metadata, not cryptographic proof of bytecode identity.",
+          "agent upgrade required for: expression-ast-v1",
+        ],
       }),
     ]);
 
@@ -298,6 +333,93 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       service_id: "checkout",
     });
     expect(afterRemoval.probes).toHaveLength(3);
+  });
+
+  it("compiles safe expressions through MCP and rejects executable syntax", async () => {
+    const { brokerUrl } = await startBroker();
+    const handlers = createToolHandlers(new BrokerClient(brokerUrl));
+    const fakeAgent = new FakeAgent({
+      brokerUrl,
+      serviceId: "checkout",
+      capabilities: [
+        "log-levels-v1",
+        "expression-ast-v1",
+        "frame-locals-v1",
+      ],
+    });
+    await fakeAgent.tick();
+
+    const snapshot = await handlers.set_snapshot_probe({
+      service_id: "checkout",
+      commit_hash: DEPLOYED_COMMIT,
+      file: "src/checkout.ts",
+      line: 20,
+      condition_expression: "cart.total >= 100 && user.active",
+      watch_expressions: ["cart.total - cart.discount"],
+      include_stack_locals: true,
+      stack_frame_limit: 2,
+    });
+    expect(snapshot).toMatchObject({
+      conditionExpression: {
+        source: "cart.total >= 100 && user.active",
+        ast: { type: "binary", operator: "and" },
+      },
+      watchExpressions: [
+        {
+          source: "cart.total - cart.discount",
+          ast: { type: "binary", operator: "subtract" },
+        },
+      ],
+      includeStackLocals: true,
+      stackFrameLimit: 2,
+    });
+
+    const log = await handlers.set_log_probe({
+      service_id: "checkout",
+      commit_hash: DEPLOYED_COMMIT,
+      file: "src/checkout.ts",
+      line: 21,
+      template: "net=${cart.total - cart.discount}",
+    });
+    expect(log).toMatchObject({
+      templateSegments: [
+        { type: "text", value: "net=" },
+        {
+          type: "expression",
+          expression: {
+            source: "cart.total - cart.discount",
+            ast: { type: "binary", operator: "subtract" },
+          },
+        },
+      ],
+    });
+
+    const metric = await handlers.set_metric_probe({
+      service_id: "checkout",
+      commit_hash: DEPLOYED_COMMIT,
+      file: "src/checkout.ts",
+      line: 22,
+      metric_expression: "endedAt - startedAt",
+    });
+    expect(metric).toMatchObject({
+      metricExpression: {
+        source: "endedAt - startedAt",
+        ast: { type: "binary", operator: "subtract" },
+      },
+    });
+
+    await expect(
+      handlers.set_snapshot_probe({
+        service_id: "checkout",
+        commit_hash: DEPLOYED_COMMIT,
+        file: "src/checkout.ts",
+        line: 23,
+        watch_expressions: ["user.deleteAll()"],
+      }),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_expression",
+    });
   });
 
   it("validates tool inputs and cleans timeout listeners", async () => {

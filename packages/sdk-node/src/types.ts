@@ -1,6 +1,45 @@
 export type ProbeType = "snapshot" | "log" | "counter" | "metric";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 export type ConditionOperator = "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
 export type JsonScalar = string | number | boolean | null;
+export type ExpressionPathSegment = string | number;
+
+export type ExpressionNode =
+  | { type: "literal"; value: JsonScalar }
+  | { type: "reference"; path: ExpressionPathSegment[] }
+  | {
+      type: "unary";
+      operator: "not" | "negate";
+      operand: ExpressionNode;
+    }
+  | {
+      type: "binary";
+      operator:
+        | "add"
+        | "subtract"
+        | "multiply"
+        | "divide"
+        | "modulo"
+        | "eq"
+        | "ne"
+        | "gt"
+        | "gte"
+        | "lt"
+        | "lte"
+        | "and"
+        | "or";
+      left: ExpressionNode;
+      right: ExpressionNode;
+    };
+
+export interface CompiledExpression {
+  source: string;
+  ast: ExpressionNode;
+}
+
+export type TemplateSegment =
+  | { type: "text"; value: string }
+  | { type: "expression"; expression: CompiledExpression };
 
 export interface ProbeCondition {
   path: string;
@@ -19,9 +58,16 @@ export interface ProbeDefinition {
   runtimeLine?: number;
   runtimeColumn?: number;
   condition?: ProbeCondition;
+  conditionExpression?: CompiledExpression;
   watchPaths?: string[];
+  watchExpressions?: CompiledExpression[];
+  includeStackLocals?: boolean;
+  stackFrameLimit?: number;
   template?: string;
+  logLevel?: LogLevel;
+  templateSegments?: TemplateSegment[];
   metricPath?: string;
+  metricExpression?: CompiledExpression;
   hitLimit: number;
   ttlSeconds: number;
   version: number;
@@ -71,6 +117,7 @@ export interface StackFrame {
   fn: string;
   file: string;
   line: number;
+  variables?: SanitizedNode;
 }
 
 interface EventBase {
@@ -88,7 +135,7 @@ export interface SnapshotEvent extends EventBase {
 export interface LogEvent extends EventBase {
   type: "log";
   message: string;
-  level: "info";
+  level: LogLevel;
 }
 
 export interface CounterEvent extends EventBase {

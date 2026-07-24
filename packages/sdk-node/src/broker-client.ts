@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type {
   AgentEvent,
   AgentStatus,
@@ -7,6 +9,10 @@ import type {
   ProbeDefinition,
   ProbeType,
 } from "./types.js";
+import {
+  isCompiledExpression,
+  isTemplateSegment,
+} from "./safe-expression.js";
 
 type FetchLike = (
   input: string | URL,
@@ -27,6 +33,7 @@ export class BrokerIngestError extends Error {
 
 const PROBE_TYPES = new Set<ProbeType>(["snapshot", "log", "counter", "metric"]);
 const CONDITION_OPERATORS = new Set(["eq", "ne", "gt", "gte", "lt", "lte"]);
+const LOG_LEVELS = new Set(["debug", "info", "warn", "error"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -84,8 +91,19 @@ function parseProbe(value: unknown, serviceId: string): ProbeDefinition {
   if (type === "log" && typeof value["template"] !== "string") {
     throw new Error("broker returned a log probe without a template");
   }
-  if (type === "metric" && typeof value["metricPath"] !== "string") {
-    throw new Error("broker returned a metric probe without a path");
+  if (
+    type === "log" &&
+    value["logLevel"] !== undefined &&
+    (typeof value["logLevel"] !== "string" || !LOG_LEVELS.has(value["logLevel"]))
+  ) {
+    throw new Error("broker returned a log probe with an invalid level");
+  }
+  if (
+    value["metricPath"] !== undefined &&
+    (typeof value["metricPath"] !== "string" ||
+      value["metricPath"].length === 0)
+  ) {
+    throw new Error("broker returned an invalid metric path");
   }
   if (
     value["watchPaths"] !== undefined &&
@@ -93,6 +111,57 @@ function parseProbe(value: unknown, serviceId: string): ProbeDefinition {
       !value["watchPaths"].every((path) => typeof path === "string"))
   ) {
     throw new Error("broker returned invalid watch paths");
+  }
+  if (
+    value["conditionExpression"] !== undefined &&
+    !isCompiledExpression(value["conditionExpression"])
+  ) {
+    throw new Error("broker returned an invalid condition expression");
+  }
+  if (
+    value["watchExpressions"] !== undefined &&
+    (!Array.isArray(value["watchExpressions"]) ||
+      !value["watchExpressions"].every(isCompiledExpression))
+  ) {
+    throw new Error("broker returned invalid watch expressions");
+  }
+  if (
+    type === "snapshot" &&
+    (value["includeStackLocals"] !== undefined &&
+      typeof value["includeStackLocals"] !== "boolean")
+  ) {
+    throw new Error("broker returned an invalid stack-locals option");
+  }
+  if (
+    type === "snapshot" &&
+    value["stackFrameLimit"] !== undefined &&
+    (!Number.isSafeInteger(value["stackFrameLimit"]) ||
+      (value["stackFrameLimit"] as number) < 1 ||
+      (value["stackFrameLimit"] as number) > 8)
+  ) {
+    throw new Error("broker returned an invalid stack frame limit");
+  }
+  if (
+    value["templateSegments"] !== undefined &&
+    (!Array.isArray(value["templateSegments"]) ||
+      !value["templateSegments"].every(isTemplateSegment))
+  ) {
+    throw new Error("broker returned invalid template segments");
+  }
+  if (
+    value["metricExpression"] !== undefined &&
+    !isCompiledExpression(value["metricExpression"])
+  ) {
+    throw new Error("broker returned an invalid metric expression");
+  }
+  if (
+    type === "metric" &&
+    ((value["metricPath"] === undefined) ===
+      (value["metricExpression"] === undefined))
+  ) {
+    throw new Error(
+      "broker returned a metric probe without exactly one value source",
+    );
   }
   const runtimeFields = [
     value["runtimeLocation"],
@@ -112,6 +181,9 @@ function parseProbe(value: unknown, serviceId: string): ProbeDefinition {
     throw new Error("broker returned invalid runtime probe coordinates");
   }
   parseCondition(value["condition"]);
+  if (type === "log" && value["logLevel"] === undefined) {
+    return { ...value, logLevel: "info" } as unknown as ProbeDefinition;
+  }
   return value as unknown as ProbeDefinition;
 }
 
@@ -140,12 +212,18 @@ export class BrokerClient {
   readonly #fetch: FetchLike;
   readonly #requestTimeoutMs: number;
   readonly #apiKey: string | undefined;
+  readonly #agentId: string;
   readonly #controllers = new Set<AbortController>();
   #stopped = false;
 
   constructor(
     brokerUrl: string,
-    options: { apiKey?: string; fetch?: FetchLike; requestTimeoutMs?: number } = {},
+    options: {
+      agentId?: string;
+      apiKey?: string;
+      fetch?: FetchLike;
+      requestTimeoutMs?: number;
+    } = {},
   ) {
     const baseUrl = new URL(brokerUrl);
     if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
@@ -161,6 +239,7 @@ export class BrokerClient {
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 5000;
     this.#apiKey = options.apiKey;
+    this.#agentId = options.agentId ?? randomUUID();
   }
 
   async poll(
@@ -227,8 +306,14 @@ export class BrokerClient {
       body: JSON.stringify({
         serviceId,
         sdk: "node",
+        agentId: this.#agentId,
         commitSha,
         commitSource,
+        capabilities: [
+          "log-levels-v1",
+          "expression-ast-v1",
+          "frame-locals-v1",
+        ],
         agentStatus,
         events,
       }),

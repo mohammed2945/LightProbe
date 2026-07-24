@@ -20,6 +20,7 @@
     "@doomslayer2945/liveprobe-mcp": "workspace:*",
     "@jridgewell/trace-mapping": "^0.3.31",
     "fastify": "^5.10.0",
+    "jsep": "^1.4.0",
     "pg": "^8.16.3",
     "zod": "^4.4.3"
   },

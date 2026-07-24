@@ -12,6 +12,7 @@ import pytest
 from liveprobe.runtime import (
     Condition,
     LiveProbe,
+    Probe,
     TokenBucket,
     condition_matches,
     resolve_dot_path,
@@ -46,6 +47,8 @@ def make_agent(
     *,
     limits: dict[str, object] | None = None,
     output: io.StringIO | None = None,
+    redact_values: list[str] | None = None,
+    serializer_config: dict[str, object] | None = None,
 ) -> LiveProbe:
     return LiveProbe(
         service_id="service",
@@ -53,7 +56,9 @@ def make_agent(
         commit_sha="abcdef1234567890",
         monitoring=fake_monitoring,
         limits=limits,
+        serializer_config=serializer_config,
         output=output or io.StringIO(),
+        redact_values=redact_values,
     )
 
 
@@ -62,6 +67,33 @@ def trigger(agent: LiveProbe, line: int = 700) -> object | None:
     sample = 3.5
     result = agent._on_line(trigger.__code__, line)
     assert user["tier"] == "free" and sample > 0
+    return result
+
+
+def stack_locals_inner(agent: LiveProbe, line: int = 702) -> object | None:
+    frame_visible = "inner-visible"
+    accessToken = "inner-secret"  # noqa: N806 - intentional redaction fixture
+    result = agent._on_line(stack_locals_inner.__code__, line)
+    assert frame_visible and accessToken
+    return result
+
+
+def stack_locals_outer(agent: LiveProbe, line: int = 702) -> object | None:
+    outer_visible = "outer-visible"
+    password = "outer-secret"
+    result = stack_locals_inner(agent, line)
+    assert outer_visible and password
+    return result
+
+
+def redacted_expression_trigger(
+    agent: LiveProbe, line: int = 703
+) -> object | None:
+    password = "password-must-not-escape"
+    classified = "configured-must-not-escape"
+    secretAmount = 42  # noqa: N806 - intentional redaction fixture
+    result = agent._on_line(redacted_expression_trigger.__code__, line)
+    assert password and classified and secretAmount
     return result
 
 
@@ -127,6 +159,7 @@ def test_callback_verifies_frame_and_builds_snapshot(fake_monitoring: Any) -> No
             "user.apiToken": {"t": "redacted"},
         }
         assert snapshot["stack"][0]["fn"] == "trigger"
+        assert all("variables" not in frame for frame in snapshot["stack"])
         assert any(
             event.get("status") == "hit-limit-reached"
             for event in agent._events
@@ -137,6 +170,96 @@ def test_callback_verifies_frame_and_builds_snapshot(fake_monitoring: Any) -> No
         assert "[liveprobe] PROBE HIT LIMIT" in output.getvalue()
     finally:
         agent._uninstall_monitoring()
+
+
+def test_snapshot_frame_locals_respect_limit_and_redaction(
+    fake_monitoring: Any,
+) -> None:
+    agent = make_agent(fake_monitoring)
+    agent._install_monitoring()
+    try:
+        agent._reconcile(
+            [
+                probe(
+                    "prb_frame_locals",
+                    "snapshot",
+                    line=702,
+                    hit_limit=1,
+                    includeStackLocals=True,
+                    stackFrameLimit=2,
+                )
+            ]
+        )
+
+        stack_locals_outer(agent)
+        agent._drain_queue()
+
+        snapshots = [
+            event for event in agent._events if event["type"] == "snapshot"
+        ]
+        assert len(snapshots) == 1
+        stack = snapshots[0]["stack"]
+        assert len(stack) == 2
+        assert [frame["fn"] for frame in stack] == [
+            "stack_locals_inner",
+            "stack_locals_outer",
+        ]
+        inner_variables = stack[0]["variables"]
+        outer_variables = stack[1]["variables"]
+        assert inner_variables["c"]["frame_visible"] == {
+            "t": "str",
+            "v": "inner-visible",
+        }
+        assert inner_variables["c"]["accessToken"] == {"t": "redacted"}
+        assert outer_variables["c"]["outer_visible"] == {
+            "t": "str",
+            "v": "outer-visible",
+        }
+        assert outer_variables["c"]["password"] == {"t": "redacted"}
+        serialized = json.dumps(snapshots[0])
+        assert "inner-secret" not in serialized
+        assert "outer-secret" not in serialized
+    finally:
+        agent._uninstall_monitoring()
+
+
+def test_stack_local_capture_bounds_raw_local_copy(fake_monitoring: Any) -> None:
+    agent = make_agent(
+        fake_monitoring,
+        serializer_config={"maxProps": 2},
+    )
+    first_variables = {f"local_{index}": index for index in range(100)}
+
+    stack = agent._capture_stack(
+        __import__("sys")._getframe(),
+        frame_local_limit=1,
+        first_variables=first_variables,
+    )
+
+    assert stack[0].variables == {"local_0": 0, "local_1": 1}
+
+
+def test_frame_local_defaults_and_malformed_fields() -> None:
+    parsed = Probe.parse(probe("prb_frame_defaults", "snapshot"), "service")
+
+    assert not parsed.include_stack_locals
+    assert parsed.stack_frame_limit == 3
+
+    invalid_fields = [
+        {"includeStackLocals": None},
+        {"includeStackLocals": 1},
+        {"includeStackLocals": "true"},
+        {"stackFrameLimit": 0},
+        {"stackFrameLimit": 9},
+        {"stackFrameLimit": True},
+        {"stackFrameLimit": 3.5},
+    ]
+    for fields in invalid_fields:
+        with pytest.raises(ValueError):
+            Probe.parse(
+                probe("prb_invalid_frame_fields", "snapshot", **fields),
+                "service",
+            )
 
 
 def test_counter_and_metric_are_aggregated(fake_monitoring: Any) -> None:
@@ -199,10 +322,310 @@ def test_log_template_is_rendered_only_from_sanitized_nodes(
 
         logs = [event for event in agent._events if event["type"] == "log"]
         assert logs[0]["message"] == "tier=free token=[REDACTED]"
+        assert logs[0]["level"] == "info"
         assert "[liveprobe] tier=free token=[REDACTED]" in output.getvalue()
         assert "hidden" not in output.getvalue()
     finally:
         agent._uninstall_monitoring()
+
+
+@pytest.mark.parametrize("level", ["debug", "info", "warn", "error"])
+def test_log_level_is_emitted(
+    fake_monitoring: Any,
+    level: str,
+) -> None:
+    agent = make_agent(fake_monitoring)
+    agent._install_monitoring()
+    try:
+        agent._reconcile(
+            [
+                probe(
+                    f"prb_log_{level}",
+                    "log",
+                    template="tier=${user.tier}",
+                    logLevel=level,
+                )
+            ]
+        )
+
+        trigger(agent)
+        agent._drain_queue()
+
+        logs = [event for event in agent._events if event["type"] == "log"]
+        assert logs == [
+            {
+                "probeId": f"prb_log_{level}",
+                "type": "log",
+                "ts": logs[0]["ts"],
+                "message": "tier=free",
+                "level": level,
+            }
+        ]
+    finally:
+        agent._uninstall_monitoring()
+
+
+@pytest.mark.parametrize("level", ["fatal", None, ["info"]])
+def test_invalid_log_level_is_rejected(level: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match="logLevel must be one of debug, info, warn, or error",
+    ):
+        Probe.parse(
+            probe(
+                "prb_log_invalid",
+                "log",
+                template="invalid",
+                logLevel=level,
+            ),
+            "service",
+        )
+
+
+def test_compiled_expressions_integrate_with_all_probe_types(
+    fake_monitoring: Any,
+) -> None:
+    product = {
+        "source": "sample * 2",
+        "ast": {
+            "type": "binary",
+            "operator": "multiply",
+            "left": {"type": "reference", "path": ["sample"]},
+            "right": {"type": "literal", "value": 2},
+        },
+    }
+    paid_condition = {
+        "source": 'user.tier == "free"',
+        "ast": {
+            "type": "binary",
+            "operator": "eq",
+            "left": {"type": "reference", "path": ["user", "tier"]},
+            "right": {"type": "literal", "value": "free"},
+        },
+    }
+    missing = {
+        "source": "missing.value",
+        "ast": {"type": "reference", "path": ["missing", "value"]},
+    }
+    agent = make_agent(fake_monitoring)
+    agent._install_monitoring()
+    try:
+        agent._reconcile(
+            [
+                probe(
+                    "prb_expression_snapshot",
+                    "snapshot",
+                    conditionExpression=paid_condition,
+                    watchExpressions=[product, missing],
+                ),
+                probe(
+                    "prb_expression_false",
+                    "snapshot",
+                    conditionExpression=missing,
+                ),
+                probe(
+                    "prb_expression_log",
+                    "log",
+                    template="double=${sample * 2}",
+                    templateSegments=[
+                        {"type": "text", "value": "double="},
+                        {"type": "expression", "expression": product},
+                        {"type": "text", "value": " missing="},
+                        {"type": "expression", "expression": missing},
+                    ],
+                ),
+                probe(
+                    "prb_expression_metric",
+                    "metric",
+                    metricExpression=product,
+                ),
+            ]
+        )
+
+        trigger(agent)
+        agent._drain_queue()
+
+        snapshots = [
+            event for event in agent._events if event["type"] == "snapshot"
+        ]
+        assert len(snapshots) == 1
+        assert snapshots[0]["probeId"] == "prb_expression_snapshot"
+        assert snapshots[0]["watches"] == {
+            "sample * 2": {"t": "num", "v": 7.0},
+            "missing.value": {"t": "truncated", "v": "unsupported"},
+        }
+        logs = [event for event in agent._events if event["type"] == "log"]
+        assert logs[0]["message"] == (
+            "double=7 missing=<expression-error:missing>"
+        )
+        metrics = {
+            event["probeId"]: event for event in agent._aggregate_events()
+        }
+        assert metrics["prb_expression_metric"]["count"] == 1
+        assert metrics["prb_expression_metric"]["sum"] == 7.0
+        false_state = agent._states["prb_expression_false"]
+        assert false_state.emitted == 0
+        assert false_state.in_flight == 0
+    finally:
+        agent._uninstall_monitoring()
+
+
+def test_invalid_metric_expression_drops_sample_and_reports_status(
+    fake_monitoring: Any,
+) -> None:
+    agent = make_agent(fake_monitoring)
+    agent._install_monitoring()
+    try:
+        agent._reconcile(
+            [
+                probe(
+                    "prb_invalid_metric_expression",
+                    "metric",
+                    metricExpression={
+                        "source": "sample / 0",
+                        "ast": {
+                            "type": "binary",
+                            "operator": "divide",
+                            "left": {
+                                "type": "reference",
+                                "path": ["sample"],
+                            },
+                            "right": {"type": "literal", "value": 0},
+                        },
+                    },
+                )
+            ]
+        )
+
+        trigger(agent)
+        agent._drain_queue()
+
+        assert not agent._aggregate_events()
+        assert any(
+            event.get("probeId") == "prb_invalid_metric_expression"
+            and event.get("type") == "status"
+            and event.get("status") == "error"
+            and event.get("detail")
+            == "invalid-metric: sample / 0 (division-by-zero)"
+            for event in agent._events
+        )
+        state = agent._states["prb_invalid_metric_expression"]
+        assert state.emitted == 0
+        assert state.in_flight == 0
+    finally:
+        agent._uninstall_monitoring()
+
+
+def test_compiled_expressions_never_use_or_expose_redacted_data(
+    fake_monitoring: Any,
+) -> None:
+    def expression(source: str, *path: str) -> dict[str, object]:
+        return {
+            "source": source,
+            "ast": {"type": "reference", "path": list(path)},
+        }
+
+    password = expression("password", "password")
+    classified = expression("classified", "classified")
+    secret_amount = expression("secretAmount", "secretAmount")
+    classified_condition = {
+        "source": 'classified == "allowed"',
+        "ast": {
+            "type": "binary",
+            "operator": "eq",
+            "left": {"type": "reference", "path": ["classified"]},
+            "right": {"type": "literal", "value": "allowed"},
+        },
+    }
+    output = io.StringIO()
+    agent = make_agent(
+        fake_monitoring,
+        output=output,
+        redact_values=["configured-must-not-escape"],
+    )
+    agent._install_monitoring()
+    try:
+        agent._reconcile(
+            [
+                probe(
+                    "prb_redacted_condition",
+                    "snapshot",
+                    line=703,
+                    conditionExpression=classified_condition,
+                ),
+                probe(
+                    "prb_redacted_watches",
+                    "snapshot",
+                    line=703,
+                    watchExpressions=[password, classified],
+                ),
+                probe(
+                    "prb_redacted_log",
+                    "log",
+                    line=703,
+                    template="${password} ${classified}",
+                    templateSegments=[
+                        {"type": "expression", "expression": password},
+                        {"type": "text", "value": " "},
+                        {"type": "expression", "expression": classified},
+                    ],
+                ),
+                probe(
+                    "prb_redacted_metric",
+                    "metric",
+                    line=703,
+                    metricExpression=secret_amount,
+                ),
+            ]
+        )
+
+        redacted_expression_trigger(agent)
+        agent._drain_queue()
+
+        snapshots = [
+            event for event in agent._events if event["type"] == "snapshot"
+        ]
+        assert len(snapshots) == 1
+        assert snapshots[0]["probeId"] == "prb_redacted_watches"
+        assert snapshots[0]["watches"] == {
+            "password": {"t": "truncated", "v": "unsupported"},
+            "classified": {"t": "truncated", "v": "unsupported"},
+        }
+        logs = [event for event in agent._events if event["type"] == "log"]
+        assert logs[0]["message"] == (
+            "<expression-error:redacted> <expression-error:redacted>"
+        )
+        assert not agent._aggregate_events()
+        assert any(
+            event.get("probeId") == "prb_redacted_metric"
+            and event.get("type") == "status"
+            and event.get("detail")
+            == "invalid-metric: secretAmount (redacted)"
+            for event in agent._events
+        )
+        condition_state = agent._states["prb_redacted_condition"]
+        assert condition_state.emitted == 0
+        assert condition_state.in_flight == 0
+        serialized = json.dumps(agent._events) + output.getvalue()
+        assert "password-must-not-escape" not in serialized
+        assert "configured-must-not-escape" not in serialized
+    finally:
+        agent._uninstall_monitoring()
+
+
+def test_malformed_compiled_expression_is_rejected_before_arming() -> None:
+    with pytest.raises(ValueError, match="unsupported node type"):
+        Probe.parse(
+            probe(
+                "prb_malformed_expression",
+                "snapshot",
+                conditionExpression={
+                    "source": "danger()",
+                    "ast": {"type": "call", "name": "danger"},
+                },
+            ),
+            "service",
+        )
 
 
 def test_condition_runs_in_background_and_releases_reservation(
@@ -506,8 +929,14 @@ def test_ingest_payload_includes_commit_metadata(fake_monitoring: Any) -> None:
     assert agent._ingest_payload([]) == {
         "serviceId": "service",
         "sdk": "python",
+        "agentId": agent.agent_id,
         "commitSha": "abcdef1234567890",
         "commitSource": "config",
+        "capabilities": [
+            "log-levels-v1",
+            "expression-ast-v1",
+            "frame-locals-v1",
+        ],
         "agentStatus": {
             "state": "green",
             "detail": "0 active locations; 0 dropped hits",

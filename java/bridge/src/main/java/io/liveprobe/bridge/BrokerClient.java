@@ -10,11 +10,13 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /** HTTP client constrained to the user-configured broker origin and fixed API paths. */
 final class BrokerClient {
     private final String baseUrl;
     private final String serviceId;
+    private final String agentId;
     private final String apiKey;
     private final String commitSha;
     private final String commitSource;
@@ -28,6 +30,7 @@ final class BrokerClient {
             String commitSource) {
         this.baseUrl = normalizedBase(brokerUri);
         this.serviceId = serviceId;
+        this.agentId = UUID.randomUUID().toString();
         this.apiKey = apiKey;
         this.commitSha = commitSha;
         this.commitSource = commitSource;
@@ -39,10 +42,9 @@ final class BrokerClient {
 
     Protocol.PollResponse poll(long version) throws IOException, InterruptedException {
         URI uri = URI.create(baseUrl + "/v1/services/" + pathSegment(serviceId) + "/probes?since=" + version);
-        HttpRequest request = HttpRequest.newBuilder(uri)
+        HttpRequest request = withAuth(HttpRequest.newBuilder(uri))
                 .timeout(Duration.ofSeconds(10))
                 .header("Accept", "application/json")
-                .headers(authHeader())
                 .GET()
                 .build();
         HttpResponse<String> response = client.send(
@@ -56,12 +58,12 @@ final class BrokerClient {
     void ingest(String state, String detail, List<Map<String, Object>> events)
             throws IOException, InterruptedException {
         Map<String, Object> payload = Protocol.ingestPayload(
-                serviceId, commitSha, commitSource, state, detail, events);
-        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/v1/ingest"))
+                serviceId, agentId, commitSha, commitSource, state, detail, events);
+        HttpRequest request = withAuth(
+                        HttpRequest.newBuilder(URI.create(baseUrl + "/v1/ingest")))
                 .timeout(Duration.ofSeconds(10))
                 .header("Accept", "application/json")
                 .header("Content-Type", "application/json; charset=utf-8")
-                .headers(authHeader())
                 .POST(HttpRequest.BodyPublishers.ofString(Json.stringify(payload), StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> response = client.send(
@@ -71,11 +73,11 @@ final class BrokerClient {
         }
     }
 
-    private String[] authHeader() {
-        if (apiKey == null || apiKey.isBlank()) {
-            return new String[0];
+    private HttpRequest.Builder withAuth(HttpRequest.Builder builder) {
+        if (apiKey != null && !apiKey.isBlank()) {
+            builder.header("Authorization", "Bearer " + apiKey);
         }
-        return new String[] {"Authorization", "Bearer " + apiKey};
+        return builder;
     }
 
     private static String normalizedBase(URI uri) {

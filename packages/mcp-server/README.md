@@ -28,7 +28,7 @@ the tenant boundary.
 
 ```sh
 LIVEPROBE_API_KEY="your-shared-key" \
-  npx -y @doomslayer2945/liveprobe-mcp@0.1.1 \
+  npx -y @doomslayer2945/liveprobe-mcp@0.2.0 \
   --broker-url http://HOST:7070
 ```
 
@@ -49,7 +49,7 @@ Add this server to your Cursor MCP configuration:
       "command": "npx",
       "args": [
         "-y",
-        "@doomslayer2945/liveprobe-mcp@0.1.1",
+        "@doomslayer2945/liveprobe-mcp@0.2.0",
         "--broker-url",
         "http://HOST:7070"
       ],
@@ -70,4 +70,4 @@ same pilot permissions within their organization. Tool failures return
 structured JSON guidance for bad credentials, insufficient roles, unknown
 services, missing probes, and an unreachable broker.
 
-Run `npx -y @doomslayer2945/liveprobe-mcp@0.1.1 --help` for CLI options.
+Run `npx -y @doomslayer2945/liveprobe-mcp@0.2.0 --help` for CLI options.

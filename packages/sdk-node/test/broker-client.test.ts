@@ -60,6 +60,41 @@ describe("BrokerClient", () => {
     );
   });
 
+  it("accepts a compiled metric expression without a legacy metric path", async () => {
+    const metricProbe = {
+      ...probe,
+      id: "prb_metric",
+      type: "metric",
+      metricPath: undefined,
+      metricExpression: {
+        source: "cart.total - cart.discount",
+        ast: {
+          type: "binary",
+          operator: "subtract",
+          left: { type: "reference", path: ["cart", "total"] },
+          right: { type: "reference", path: ["cart", "discount"] },
+        },
+      },
+    };
+    const client = new BrokerClient("http://broker:7070", {
+      fetch: (async () =>
+        new Response(JSON.stringify({ version: 3, probes: [metricProbe] }))) as never,
+    });
+
+    await expect(client.poll("payments/api", 2)).resolves.toMatchObject({
+      version: 3,
+      probes: [
+        {
+          id: "prb_metric",
+          type: "metric",
+          metricExpression: {
+            source: "cart.total - cart.discount",
+          },
+        },
+      ],
+    });
+  });
+
   it("performs the source-map upload handshake", async () => {
     const requests: Array<{ url: string; body: unknown }> = [];
     const client = new BrokerClient("http://broker:7070", {
@@ -105,6 +140,7 @@ describe("BrokerClient", () => {
     let body: unknown;
     let method = "";
     const client = new BrokerClient("https://broker.example/base", {
+      agentId: "agent-node-test",
       fetch: (async (_input: URL, init: { body: string; method: string }) => {
         method = init.method;
         body = JSON.parse(init.body);
@@ -132,8 +168,14 @@ describe("BrokerClient", () => {
     expect(body).toEqual({
       serviceId: "payments",
       sdk: "node",
+      agentId: "agent-node-test",
       commitSha: "abcdef1234567890",
       commitSource: "config",
+      capabilities: [
+        "log-levels-v1",
+        "expression-ast-v1",
+        "frame-locals-v1",
+      ],
       agentStatus: { state: "green", detail: "1 probe armed" },
       events,
     });

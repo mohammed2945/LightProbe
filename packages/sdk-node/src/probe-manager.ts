@@ -8,6 +8,11 @@ import {
   resolveDotPath,
   templatePaths,
 } from "./safe-values.js";
+import {
+  evaluateExpression,
+  expressionPaths,
+  renderExpressionTemplate,
+} from "./safe-expression.js";
 import { ScriptRegistry } from "./script-registry.js";
 import { isRedactedKey, serialize } from "./serializer.js";
 import type {
@@ -81,6 +86,19 @@ export class ProbeManager {
   #inspectorFailed = false;
   #epoch = 0;
   #droppedHits = 0;
+
+  #expressionPolicy(): {
+    isRedactedKey: (key: string) => boolean;
+    isRedactedValue: (value: unknown) => boolean;
+  } {
+    return {
+      isRedactedKey: (key) =>
+        isRedactedKey(key, this.#serializerConfig),
+      isRedactedValue: (value) =>
+        typeof value === "string" &&
+        this.#serializerConfig.redactValues.includes(value),
+    };
+  }
 
   constructor(options: ProbeManagerOptions) {
     this.#inspector = options.inspector;
@@ -181,7 +199,9 @@ export class ProbeManager {
 
     const needsCapture = candidates.some(
       ({ definition }) =>
-        definition.type !== "counter" || definition.condition !== undefined,
+        definition.type !== "counter" ||
+        definition.condition !== undefined ||
+        definition.conditionExpression !== undefined,
     );
     if (!needsCapture) {
       const empty = Object.create(null) as Record<string, unknown>;
@@ -203,6 +223,18 @@ export class ProbeManager {
       ...(definition.watchPaths ?? []),
       ...(definition.metricPath === undefined ? [] : [definition.metricPath]),
       ...(definition.template === undefined ? [] : templatePaths(definition.template)),
+      ...[
+        definition.conditionExpression,
+        ...(definition.watchExpressions ?? []),
+        definition.metricExpression,
+        ...(definition.templateSegments ?? []).flatMap((segment) =>
+          segment.type === "expression" ? [segment.expression] : [],
+        ),
+      ]
+        .filter((expression) => expression !== undefined)
+        .flatMap((expression) =>
+          expressionPaths(expression).map((path) => path.map(String).join(".")),
+        ),
     ]);
     const requestedDepth = requestedPaths.reduce(
       (maximum, path) => Math.max(maximum, path.split(".").length),
@@ -493,6 +525,16 @@ export class ProbeManager {
     if (!matchesCondition(capture.variables, probe.condition)) {
       return;
     }
+    if (probe.conditionExpression !== undefined) {
+      const condition = evaluateExpression(
+        probe.conditionExpression,
+        capture.variables,
+        this.#expressionPolicy(),
+      );
+      if (!condition.ok || condition.value !== true) {
+        return;
+      }
+    }
 
     const ts = new Date().toISOString();
     if (probe.type === "snapshot") {
@@ -507,33 +549,96 @@ export class ProbeManager {
             );
         setSafe(watches, path, node);
       }
+      for (const expression of probe.watchExpressions ?? []) {
+        const result = evaluateExpression(
+          expression,
+          capture.variables,
+          this.#expressionPolicy(),
+        );
+        setSafe(
+          watches,
+          expression.source,
+          result.ok
+            ? serialize(result.value, this.#serializerConfig)
+            : { t: "truncated", v: "unsupported" },
+        );
+      }
       this.#events.enqueue({
         probeId: probe.id,
         type: "snapshot",
         ts,
         variables: serialize(capture.variables, this.#serializerConfig),
         watches,
-        stack: capture.stack,
+        stack:
+          probe.includeStackLocals === true
+            ? capture.stack
+                .slice(0, probe.stackFrameLimit ?? 3)
+                .map((frame, index) => ({
+                  ...frame,
+                  variables: serialize(
+                    capture.frameLocals[index],
+                    this.#serializerConfig,
+                  ),
+                }))
+            : capture.stack,
       });
     } else if (probe.type === "log") {
-      const message = renderTemplate(probe.template ?? "", capture.variables, {
-        shouldRedact: (path, value) => this.#shouldRedact(path, value),
+      const message =
+        probe.templateSegments === undefined
+          ? renderTemplate(probe.template ?? "", capture.variables, {
+              shouldRedact: (path, value) => this.#shouldRedact(path, value),
+            })
+          : renderExpressionTemplate(
+              probe.templateSegments,
+              capture.variables,
+              4_096,
+              this.#expressionPolicy(),
+            );
+      this.#events.enqueue({
+        probeId: probe.id,
+        type: "log",
+        ts,
+        message,
+        level: probe.logLevel ?? "info",
       });
-      this.#events.enqueue({ probeId: probe.id, type: "log", ts, message, level: "info" });
       this.#audit(`[liveprobe] ${safeAuditText(message)}`);
     } else if (probe.type === "counter") {
       this.#aggregates.incrementCounter(probe.id);
     } else {
-      const resolved = resolveDotPath(capture.variables, probe.metricPath ?? "");
-      if (resolved.truncated === true) {
+      const pathResult =
+        probe.metricExpression === undefined
+          ? resolveDotPath(capture.variables, probe.metricPath ?? "")
+          : undefined;
+      const expressionResult =
+        probe.metricExpression === undefined
+          ? undefined
+          : evaluateExpression(
+              probe.metricExpression,
+              capture.variables,
+              this.#expressionPolicy(),
+            );
+      if (pathResult?.truncated === true) {
         this.#error(probe, `capture-truncated: ${probe.metricPath ?? ""}`);
         return;
       }
-      if (!resolved.found || typeof resolved.value !== "number" || !Number.isFinite(resolved.value)) {
-        this.#error(probe, `invalid-metric: ${probe.metricPath ?? ""}`);
+      const found = pathResult?.found ?? expressionResult?.ok ?? false;
+      const value =
+        pathResult?.value ??
+        (expressionResult?.ok === true ? expressionResult.value : undefined);
+      if (
+        !found ||
+        typeof value !== "number" ||
+        !Number.isFinite(value)
+      ) {
+        this.#error(
+          probe,
+          `invalid-metric: ${
+            probe.metricExpression?.source ?? probe.metricPath ?? ""
+          }`,
+        );
         return;
       }
-      this.#aggregates.recordMetric(probe.id, resolved.value);
+      this.#aggregates.recordMetric(probe.id, value);
     }
 
     installed.hits += 1;

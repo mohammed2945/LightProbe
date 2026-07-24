@@ -37,6 +37,12 @@ interface SnapshotEvent {
   type: "snapshot";
   variables: SanitizedNode;
   watches: Record<string, SanitizedNode>;
+  stack: Array<{
+    fn: string;
+    file: string;
+    line: number;
+    variables?: SanitizedNode;
+  }>;
 }
 
 interface ProbeDataResponse {
@@ -215,6 +221,21 @@ test(
         const response = await fetch(`${serviceUrl}/health`);
         return response.ok ? true : null;
       });
+      await waitFor("Node SDK capability heartbeat", 7_000, async () => {
+        const response = await requestJson<{
+          services: Array<{
+            serviceId: string;
+            capabilities?: string[];
+          }>;
+        }>(`${brokerUrl}/v1/services`);
+        const registered = response.services.find(
+          (candidate) => candidate.serviceId === serviceId,
+        );
+        return registered?.capabilities?.includes("expression-ast-v1") === true &&
+          registered.capabilities.includes("frame-locals-v1")
+          ? true
+          : null;
+      });
 
       const traffic = startChild(
         "traffic",
@@ -246,12 +267,12 @@ test(
             type: "snapshot",
             file: "src/payments.ts",
             line: probeLine,
-            condition: {
-              path: "user.tier",
-              op: "eq",
-              value: "free",
-            },
+            conditionExpression:
+              'user.tier == "free" && pool.active >= 5',
             watchPaths: ["balance", "pool.active"],
+            watchExpressions: ["amountCents / 100"],
+            includeStackLocals: true,
+            stackFrameLimit: 2,
             hitLimit: 1,
             ttlSeconds: 60,
             createdBy: "e2e:payment-service",
@@ -272,6 +293,15 @@ test(
 
       assert.deepEqual(snapshot.watches["balance"], { t: "null", v: null });
       assert.deepEqual(snapshot.watches["pool.active"], { t: "num", v: 5 });
+      assert.deepEqual(snapshot.watches["amountCents / 100"], {
+        t: "num",
+        v: 25,
+      });
+      assert.ok(snapshot.stack.length > 0 && snapshot.stack.length <= 2);
+      assert.ok(
+        snapshot.stack.every((frame) => frame.variables !== undefined),
+        "requested stack frames must include serialized locals",
+      );
 
       const balance = objectChild(snapshot.variables, "balance");
       const pool = objectChild(snapshot.variables, "pool");
