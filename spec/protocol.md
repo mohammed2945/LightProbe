@@ -549,12 +549,36 @@ until the first event arrives or the timeout elapses.
 Events are retained, not consumed, in a per-probe ring buffer capped at 500
 events. The oldest event is discarded first.
 
-### 5.6 Service credentials
+### 5.6 Resource catalog
+
+The PostgreSQL-backed catalog separates project-level service identities from
+environment-specific runtime deployments:
+
+- `GET|POST /v1/projects`
+- `DELETE /v1/projects/{projectId}`
+- `GET|POST /v1/projects/{projectId}/environments`
+- `DELETE /v1/projects/{projectId}/environments/{environmentId}`
+- `GET|POST /v1/projects/{projectId}/services`
+- `DELETE /v1/projects/{projectId}/services/{serviceId}`
+
+Project and environment IDs are lowercase deployment-safe identifiers. A
+registered service belongs to a project and may be deployed into multiple
+environments. `DELETE` archives catalog records rather than deleting
+diagnostic or audit history. Archiving revokes affected active service
+credentials. Recreating an archived identifier restores it.
+
+Catalog management is tenant-scoped from the authenticated Clerk organization
+and never accepts a client-supplied tenant ID. It requires PostgreSQL and
+returns `503 catalog_store_unavailable` with the JSON fallback.
+
+### 5.7 Service credentials
 
 `POST /v1/service-credentials` accepts:
 
 ```json
 {
+  "projectId": "acquireiq",
+  "environmentId": "production",
   "serviceId": "payment-service",
   "label": "Payments production"
 }
@@ -579,13 +603,20 @@ once alongside its non-secret metadata:
 }
 ```
 
-`GET /v1/service-credentials` returns metadata only. It never returns a secret
-or secret hash. `DELETE /v1/service-credentials/{credentialId}` revokes an
-active credential and returns HTTP 204. A revoked credential immediately
-receives HTTP 401. Credential management returns HTTP 503
+`projectId` and `environmentId` default to the authenticated principal's scope
+for compatibility with 0.2 clients. Current MCP clients require both fields.
+The environment and project must be active. Previously unseen service IDs are
+registered automatically for one compatibility release; new clients should
+call `register_service` explicitly.
+
+`GET /v1/service-credentials?projectId=...&environmentId=...&serviceId=...`
+returns metadata only. It never returns a secret or secret hash.
+`DELETE /v1/service-credentials/{credentialId}?projectId=...&environmentId=...`
+revokes an active credential and returns HTTP 204. A revoked credential
+immediately receives HTTP 401. Credential management returns HTTP 503
 `credential_store_unavailable` when PostgreSQL is not configured.
 
-### 5.7 Audit events
+### 5.8 Audit events
 
 `GET /v1/audit-events?limit=50&before={timestamp}` requires `admin` and
 PostgreSQL. `limit` is bounded to `1..100`; `before` is an optional RFC 3339
@@ -605,7 +636,7 @@ owner can alter the trigger or drop the table. `audit_store_unavailable` is
 returned when PostgreSQL audit storage is unavailable. MCP exposes the same
 admin-only data through `list_audit_events`.
 
-### 5.8 MCP set-probe commit metadata
+### 5.9 MCP set-probe commit metadata
 
 The `set_snapshot_probe`, `set_log_probe`, `set_counter_probe`, and
 `set_metric_probe` MCP tools require `commit_hash`, using snake_case at the MCP

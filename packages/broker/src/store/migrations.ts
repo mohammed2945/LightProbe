@@ -1,4 +1,4 @@
-export const POSTGRES_SCHEMA_VERSION = 7;
+export const POSTGRES_SCHEMA_VERSION = 8;
 
 export const DEFAULT_TENANT_ID = "internal";
 export const DEFAULT_PROJECT_ID = "default";
@@ -33,6 +33,23 @@ export const POSTGRES_MIGRATION_SQL = `
     primary key (tenant_id, project_id, environment_id),
     foreign key (tenant_id, project_id)
       references projects(tenant_id, project_id) on delete cascade
+  );
+
+  alter table projects
+    add column if not exists archived_at timestamptz;
+  alter table environments
+    add column if not exists archived_at timestamptz;
+
+  create table if not exists registered_services (
+    tenant_id text not null,
+    project_id text not null,
+    service_id text not null,
+    display_name text not null,
+    created_at timestamptz not null default now(),
+    archived_at timestamptz,
+    primary key (tenant_id, project_id, service_id),
+    foreign key (tenant_id, project_id)
+      references projects(tenant_id, project_id)
   );
 
   insert into tenants (tenant_id, display_name)
@@ -379,4 +396,23 @@ export const POSTGRES_MIGRATION_SQL = `
     on audit_events (
       tenant_id, project_id, environment_id, occurred_at desc, audit_id desc
     );
+  create index if not exists registered_services_scope_idx
+    on registered_services (tenant_id, project_id, service_id);
+
+  insert into registered_services (
+    tenant_id, project_id, service_id, display_name, created_at
+  )
+  select discovered.tenant_id, discovered.project_id, discovered.service_id,
+    discovered.service_id, min(discovered.discovered_at)
+  from (
+    select tenant_id, project_id, service_id,
+      last_seen as discovered_at
+    from services
+    union all
+    select tenant_id, project_id, service_id,
+      created_at as discovered_at
+    from service_credentials
+  ) discovered
+  group by discovered.tenant_id, discovered.project_id, discovered.service_id
+  on conflict (tenant_id, project_id, service_id) do nothing;
 `;

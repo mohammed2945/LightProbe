@@ -266,25 +266,32 @@ A useful first prompt is:
 ### Create an agent credential
 
 For the pilot, every member of a Clerk organization has the same LiveProbe
-permissions within that organization. Use `create_service_credential` to issue
-a key for the service you want to instrument:
+permissions within that organization. Complete the project catalog before
+deploying the runtime agent:
 
-1. Call `create_service_credential` with the exact `service_id` from
-   `list_services` and a descriptive `label`.
-2. Store the returned `apiKey` in the service's secret manager or deployment
+1. Call `create_project` with a stable lowercase `project_id`.
+2. Call `create_environment` for environments such as `staging` and
+   `production`.
+3. Call `register_service` once for each repository/application. The same
+   service ID is reused when that service is deployed to multiple environments.
+4. Call `create_service_credential` with the project, environment, registered
+   service ID, and a descriptive label.
+5. Store the returned `apiKey` in the service's secret manager or deployment
    environment. The plaintext key is shown only in the create response.
-3. Configure the agent with `LIVEPROBE_API_KEY`, `LIVEPROBE_BROKER_URL`, and
+6. Configure the agent with `LIVEPROBE_API_KEY`, `LIVEPROBE_BROKER_URL`, and
    the required `LIVEPROBE_COMMIT_SHA`.
-4. Use `list_service_credentials` later to review key prefixes and status.
-5. Use `revoke_service_credential` to disable a key that is no longer needed.
+7. Use `list_service_credentials` later to review key prefixes and status.
+8. Use `revoke_service_credential` to disable a key that is no longer needed.
 
-Credential creation and revocation are organization-scoped. Removing a
-person from the Clerk organization removes their human access, but it does not
-automatically revoke existing agent keys; revoke those keys separately.
+Credentials are scoped to one organization, project, environment, and service.
+Archiving a project, environment, or service revokes its affected active
+credentials while retaining probe and audit history. Removing a person from
+the Clerk organization removes their human access, but does not otherwise
+change active agent keys.
 
 ## 4. Use the MCP tools
 
-The server exposes fourteen tools:
+The server exposes twenty-three tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -292,6 +299,9 @@ The server exposes fourteen tools:
 | `list_services` | List agents, commits, heartbeat state, and caveats. |
 | `get_safety_overview` | Show per-service safety state and probe counts. |
 | `list_audit_events` | List control-plane changes in the selected organization. |
+| `list_projects` / `create_project` / `archive_project` | Manage project identities. |
+| `list_environments` / `create_environment` / `archive_environment` | Manage project deployment environments. |
+| `list_registered_services` / `register_service` / `archive_service` | Manage project-level service identities. |
 | `create_service_credential` | Create a per-service agent key; the plaintext key is returned once. |
 | `list_service_credentials` | List credential metadata and revocation state without secrets. |
 | `revoke_service_credential` | Revoke an agent key in your organization. |

@@ -44,6 +44,11 @@ import {
   type ExpressionNode,
   type TemplateSegment,
 } from "./expression.js";
+import type {
+  EnvironmentRecord,
+  ProjectRecord,
+  RegisteredServiceRecord,
+} from "./resource-catalog.js";
 import { PostgresStore } from "./store/postgres.js";
 import {
   resolveSourceLocation,
@@ -99,6 +104,11 @@ export type {
   AuditMetadataValue,
   AuditOutcome,
 } from "./audit.js";
+export type {
+  EnvironmentRecord,
+  ProjectRecord,
+  RegisteredServiceRecord,
+} from "./resource-catalog.js";
 export {
   DEFAULT_ENVIRONMENT_ID,
   DEFAULT_PROJECT_ID,
@@ -120,6 +130,16 @@ const SOURCE_MAP_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 const SOURCE_MAP_COMMITS_PER_SERVICE = 5;
 
 const serviceIdSchema = z.string().trim().min(1).max(200);
+const catalogIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .regex(
+    /^[a-z0-9][a-z0-9._-]*$/,
+    "must start with a lowercase letter or digit and contain only lowercase letters, digits, dots, underscores, or hyphens",
+  );
+const displayNameSchema = z.string().trim().min(1).max(200);
 const probeIdSchema = z
   .string()
   .regex(/^prb_[0-9A-HJKMNP-TV-Z]{26}$/, "invalid probe id");
@@ -598,6 +618,47 @@ export interface BrokerStore {
     scope: ResourceScope,
     labels?: ResourceScopeLabels,
   ): Promise<void>;
+  createProject?(
+    tenantId: string,
+    projectId: string,
+    displayName: string,
+  ): Promise<ProjectRecord | undefined>;
+  listProjects?(
+    tenantId: string,
+    includeArchived?: boolean,
+  ): Promise<ProjectRecord[]>;
+  archiveProject?(tenantId: string, projectId: string): Promise<boolean>;
+  createEnvironment?(
+    scope: ResourceScope,
+    displayName: string,
+  ): Promise<EnvironmentRecord | undefined>;
+  listEnvironments?(
+    tenantId: string,
+    projectId: string,
+    includeArchived?: boolean,
+  ): Promise<EnvironmentRecord[]>;
+  archiveEnvironment?(scope: ResourceScope): Promise<boolean>;
+  createRegisteredService?(
+    tenantId: string,
+    projectId: string,
+    serviceId: string,
+    displayName: string,
+  ): Promise<RegisteredServiceRecord | undefined>;
+  getRegisteredService?(
+    tenantId: string,
+    projectId: string,
+    serviceId: string,
+  ): Promise<RegisteredServiceRecord | undefined>;
+  listRegisteredServices?(
+    tenantId: string,
+    projectId: string,
+    includeArchived?: boolean,
+  ): Promise<RegisteredServiceRecord[]>;
+  archiveRegisteredService?(
+    tenantId: string,
+    projectId: string,
+    serviceId: string,
+  ): Promise<boolean>;
   restore(state: BrokerState): Promise<void>;
   persist(state: BrokerState): Promise<void>;
   persistProbe?(
@@ -729,6 +790,20 @@ function requireProbeManager(request: FastifyRequest): BrokerPrincipal {
 function requireAdmin(request: FastifyRequest): BrokerPrincipal {
   // The pilot has no separate human admin/operator/viewer boundary.
   return requireHumanRead(request);
+}
+
+function selectedResourceScope(
+  principal: BrokerPrincipal,
+  selection: {
+    projectId?: string | undefined;
+    environmentId?: string | undefined;
+  },
+): ResourceScope {
+  return {
+    tenantId: principal.tenantId,
+    projectId: selection.projectId ?? principal.projectId,
+    environmentId: selection.environmentId ?? principal.environmentId,
+  };
 }
 
 function requireServiceAccess(
@@ -2070,6 +2145,45 @@ const dataQuerySchema = z
   })
   .strict();
 const emptyQuerySchema = z.object({}).strict();
+const includeArchivedQuerySchema = z
+  .object({
+    includeArchived: z
+      .enum(["true", "false"])
+      .optional()
+      .transform((value) => value === "true"),
+  })
+  .strict();
+const projectCreateSchema = z
+  .object({
+    projectId: catalogIdSchema,
+    displayName: displayNameSchema,
+  })
+  .strict();
+const projectParamsSchema = z.object({ projectId: catalogIdSchema }).strict();
+const environmentCreateSchema = z
+  .object({
+    environmentId: catalogIdSchema,
+    displayName: displayNameSchema,
+  })
+  .strict();
+const environmentParamsSchema = z
+  .object({
+    projectId: catalogIdSchema,
+    environmentId: catalogIdSchema,
+  })
+  .strict();
+const registeredServiceCreateSchema = z
+  .object({
+    serviceId: serviceIdSchema,
+    displayName: displayNameSchema,
+  })
+  .strict();
+const registeredServiceParamsSchema = z
+  .object({
+    projectId: catalogIdSchema,
+    serviceId: serviceIdSchema,
+  })
+  .strict();
 const sourceMapIdentityShape = {
   serviceId: serviceIdSchema,
   commitSha: commitShaSchema,
@@ -2085,8 +2199,17 @@ const sourceMapUploadSchema = z
   .strict();
 const serviceCredentialCreateSchema = z
   .object({
+    projectId: catalogIdSchema.optional(),
+    environmentId: catalogIdSchema.optional(),
     serviceId: serviceIdSchema,
     label: z.string().trim().min(1).max(200),
+  })
+  .strict();
+const serviceCredentialQuerySchema = z
+  .object({
+    projectId: catalogIdSchema.optional(),
+    environmentId: catalogIdSchema.optional(),
+    serviceId: serviceIdSchema.optional(),
   })
   .strict();
 const serviceCredentialParamsSchema = z
@@ -2107,6 +2230,7 @@ interface AuditMutationContext {
   resourceId?: string | undefined;
   metadata: Record<string, AuditMetadataValue>;
   successStatus: number;
+  scope?: ResourceScope | undefined;
 }
 
 export async function buildBroker(
@@ -2455,11 +2579,12 @@ export async function buildBroker(
     errorCode?: string,
   ): Promise<void> => {
     if (store === false || store.appendAuditEvent === undefined) return;
+    const auditScope = context.scope ?? principal;
     await store.appendAuditEvent({
       auditId: `aud_${randomBytes(16).toString("hex")}`,
-      tenantId: principal.tenantId,
-      projectId: principal.projectId,
-      environmentId: principal.environmentId,
+      tenantId: auditScope.tenantId,
+      projectId: auditScope.projectId,
+      environmentId: auditScope.environmentId,
       occurredAt: new Date(state.now()).toISOString(),
       requestId: String(request.id),
       actorType: principal.type,
@@ -2518,6 +2643,323 @@ export async function buildBroker(
       throw error;
     }
   };
+
+  app.post("/v1/projects", async (request, reply) => {
+    emptyQuerySchema.parse(request.query);
+    const input = projectCreateSchema.parse(request.body);
+    const project = await runAuditedMutation(
+      request,
+      {
+        action: "project.create",
+        resourceType: "project",
+        resourceId: input.projectId,
+        metadata: { projectId: input.projectId },
+        successStatus: 201,
+      },
+      async () => {
+        const principal = requireAdmin(request);
+        if (store === false || store.createProject === undefined) {
+          throw new BrokerHttpError(
+            503,
+            "catalog_store_unavailable",
+            "project management requires the PostgreSQL durable store",
+          );
+        }
+        const created = await store.createProject(
+          principal.tenantId,
+          input.projectId,
+          input.displayName,
+        );
+        if (created === undefined) {
+          throw new BrokerHttpError(
+            404,
+            "tenant_not_found",
+            `tenant ${principal.tenantId} was not found`,
+          );
+        }
+        return created;
+      },
+    );
+    return reply.status(201).send({ project });
+  });
+
+  app.get("/v1/projects", async (request) => {
+    const principal = requireHumanRead(request);
+    const query = includeArchivedQuerySchema.parse(request.query);
+    if (store === false || store.listProjects === undefined) {
+      throw new BrokerHttpError(
+        503,
+        "catalog_store_unavailable",
+        "project management requires the PostgreSQL durable store",
+      );
+    }
+    return {
+      projects: await store.listProjects(
+        principal.tenantId,
+        query.includeArchived,
+      ),
+    };
+  });
+
+  app.delete("/v1/projects/:projectId", async (request, reply) => {
+    emptyQuerySchema.parse(request.query);
+    const { projectId } = projectParamsSchema.parse(request.params);
+    await runAuditedMutation(
+      request,
+      {
+        action: "project.archive",
+        resourceType: "project",
+        resourceId: projectId,
+        metadata: { projectId },
+        successStatus: 204,
+      },
+      async () => {
+        const principal = requireAdmin(request);
+        if (store === false || store.archiveProject === undefined) {
+          throw new BrokerHttpError(
+            503,
+            "catalog_store_unavailable",
+            "project management requires the PostgreSQL durable store",
+          );
+        }
+        if (!(await store.archiveProject(principal.tenantId, projectId))) {
+          throw new BrokerHttpError(
+            404,
+            "not_found",
+            `active project ${projectId} was not found`,
+          );
+        }
+      },
+    );
+    return reply.status(204).send();
+  });
+
+  app.post(
+    "/v1/projects/:projectId/environments",
+    async (request, reply) => {
+      emptyQuerySchema.parse(request.query);
+      const { projectId } = projectParamsSchema.parse(request.params);
+      const input = environmentCreateSchema.parse(request.body);
+      const environment = await runAuditedMutation(
+        request,
+        {
+          action: "environment.create",
+          resourceType: "environment",
+          resourceId: input.environmentId,
+          metadata: {
+            projectId,
+            environmentId: input.environmentId,
+          },
+          successStatus: 201,
+        },
+        async () => {
+          const principal = requireAdmin(request);
+          if (store === false || store.createEnvironment === undefined) {
+            throw new BrokerHttpError(
+              503,
+              "catalog_store_unavailable",
+              "environment management requires the PostgreSQL durable store",
+            );
+          }
+          const created = await store.createEnvironment(
+            {
+              tenantId: principal.tenantId,
+              projectId,
+              environmentId: input.environmentId,
+            },
+            input.displayName,
+          );
+          if (created === undefined) {
+            throw new BrokerHttpError(
+              404,
+              "project_not_found",
+              `active project ${projectId} was not found`,
+            );
+          }
+          return created;
+        },
+      );
+      return reply.status(201).send({ environment });
+    },
+  );
+
+  app.get("/v1/projects/:projectId/environments", async (request) => {
+    const principal = requireHumanRead(request);
+    const { projectId } = projectParamsSchema.parse(request.params);
+    const query = includeArchivedQuerySchema.parse(request.query);
+    if (store === false || store.listEnvironments === undefined) {
+      throw new BrokerHttpError(
+        503,
+        "catalog_store_unavailable",
+        "environment management requires the PostgreSQL durable store",
+      );
+    }
+    return {
+      environments: await store.listEnvironments(
+        principal.tenantId,
+        projectId,
+        query.includeArchived,
+      ),
+    };
+  });
+
+  app.delete(
+    "/v1/projects/:projectId/environments/:environmentId",
+    async (request, reply) => {
+      emptyQuerySchema.parse(request.query);
+      const { projectId, environmentId } = environmentParamsSchema.parse(
+        request.params,
+      );
+      await runAuditedMutation(
+        request,
+        {
+          action: "environment.archive",
+          resourceType: "environment",
+          resourceId: environmentId,
+          metadata: { projectId, environmentId },
+          successStatus: 204,
+        },
+        async () => {
+          const principal = requireAdmin(request);
+          if (store === false || store.archiveEnvironment === undefined) {
+            throw new BrokerHttpError(
+              503,
+              "catalog_store_unavailable",
+              "environment management requires the PostgreSQL durable store",
+            );
+          }
+          const archived = await store.archiveEnvironment({
+            tenantId: principal.tenantId,
+            projectId,
+            environmentId,
+          });
+          if (!archived) {
+            throw new BrokerHttpError(
+              404,
+              "not_found",
+              `active environment ${projectId}/${environmentId} was not found`,
+            );
+          }
+        },
+      );
+      return reply.status(204).send();
+    },
+  );
+
+  app.post(
+    "/v1/projects/:projectId/services",
+    async (request, reply) => {
+      emptyQuerySchema.parse(request.query);
+      const { projectId } = projectParamsSchema.parse(request.params);
+      const input = registeredServiceCreateSchema.parse(request.body);
+      const service = await runAuditedMutation(
+        request,
+        {
+          action: "service.create",
+          resourceType: "service",
+          resourceId: input.serviceId,
+          metadata: { projectId, serviceId: input.serviceId },
+          successStatus: 201,
+        },
+        async () => {
+          const principal = requireAdmin(request);
+          if (
+            store === false ||
+            store.createRegisteredService === undefined
+          ) {
+            throw new BrokerHttpError(
+              503,
+              "catalog_store_unavailable",
+              "service management requires the PostgreSQL durable store",
+            );
+          }
+          const created = await store.createRegisteredService(
+            principal.tenantId,
+            projectId,
+            input.serviceId,
+            input.displayName,
+          );
+          if (created === undefined) {
+            throw new BrokerHttpError(
+              404,
+              "project_not_found",
+              `active project ${projectId} was not found`,
+            );
+          }
+          return created;
+        },
+      );
+      return reply.status(201).send({ service });
+    },
+  );
+
+  app.get(
+    "/v1/projects/:projectId/services",
+    async (request) => {
+      const principal = requireHumanRead(request);
+      const { projectId } = projectParamsSchema.parse(request.params);
+      const query = includeArchivedQuerySchema.parse(request.query);
+      if (store === false || store.listRegisteredServices === undefined) {
+        throw new BrokerHttpError(
+          503,
+          "catalog_store_unavailable",
+          "service management requires the PostgreSQL durable store",
+        );
+      }
+      return {
+        services: await store.listRegisteredServices(
+          principal.tenantId,
+          projectId,
+          query.includeArchived,
+        ),
+      };
+    },
+  );
+
+  app.delete(
+    "/v1/projects/:projectId/services/:serviceId",
+    async (request, reply) => {
+      emptyQuerySchema.parse(request.query);
+      const { projectId, serviceId } =
+        registeredServiceParamsSchema.parse(request.params);
+      await runAuditedMutation(
+        request,
+        {
+          action: "service.archive",
+          resourceType: "service",
+          resourceId: serviceId,
+          metadata: { projectId, serviceId },
+          successStatus: 204,
+        },
+        async () => {
+          const principal = requireAdmin(request);
+          if (
+            store === false ||
+            store.archiveRegisteredService === undefined
+          ) {
+            throw new BrokerHttpError(
+              503,
+              "catalog_store_unavailable",
+              "service management requires the PostgreSQL durable store",
+            );
+          }
+          const archived = await store.archiveRegisteredService(
+            principal.tenantId,
+            projectId,
+            serviceId,
+          );
+          if (!archived) {
+            throw new BrokerHttpError(
+              404,
+              "not_found",
+              `active service ${projectId}/${serviceId} was not found`,
+            );
+          }
+        },
+      );
+      return reply.status(204).send();
+    },
+  );
 
   app.post("/v1/probes", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
@@ -2599,28 +3041,87 @@ export async function buildBroker(
   app.post("/v1/service-credentials", async (request, reply) => {
     emptyQuerySchema.parse(request.query);
     const input = serviceCredentialCreateSchema.parse(request.body);
+    const principal = requireAdmin(request);
+    const scope = selectedResourceScope(principal, input);
     const audit: AuditMutationContext = {
       action: "service_credential.create",
       resourceType: "service_credential",
-      metadata: { serviceId: input.serviceId },
+      metadata: {
+        projectId: scope.projectId,
+        environmentId: scope.environmentId,
+        serviceId: input.serviceId,
+      },
       successStatus: 201,
+      scope,
     };
     const { credential, apiKey } = await runAuditedMutation(
       request,
       audit,
       async () => {
-        const principal = requireAdmin(request);
-        if (store === false || store.createServiceCredential === undefined) {
+        if (
+          store === false ||
+          store.createServiceCredential === undefined
+        ) {
           throw new BrokerHttpError(
             503,
             "credential_store_unavailable",
             "service credentials require the PostgreSQL durable store",
           );
         }
+        if (store.listEnvironments !== undefined) {
+          const environments = await store.listEnvironments(
+            scope.tenantId,
+            scope.projectId,
+          );
+          if (
+            !environments.some(
+              (environment) =>
+                environment.environmentId === scope.environmentId,
+            )
+          ) {
+            throw new BrokerHttpError(
+              404,
+              "environment_not_found",
+              `active environment ${scope.projectId}/${scope.environmentId} was not found`,
+            );
+          }
+        }
+        if (
+          store.getRegisteredService !== undefined &&
+          store.createRegisteredService !== undefined
+        ) {
+          const registered = await store.getRegisteredService(
+            scope.tenantId,
+            scope.projectId,
+            input.serviceId,
+          );
+          if (registered?.archivedAt !== undefined) {
+            throw new BrokerHttpError(
+              409,
+              "service_archived",
+              `service ${scope.projectId}/${input.serviceId} is archived`,
+            );
+          }
+          if (registered === undefined) {
+            const created = await store.createRegisteredService(
+              scope.tenantId,
+              scope.projectId,
+              input.serviceId,
+              input.serviceId,
+            );
+            if (created === undefined) {
+              throw new BrokerHttpError(
+                404,
+                "project_not_found",
+                `active project ${scope.projectId} was not found`,
+              );
+            }
+          }
+        }
         const material = createServiceCredentialMaterial({
           serviceId: input.serviceId,
           label: input.label,
-          scope: principal,
+          scope,
           now: new Date(state.now()),
         });
         const created = await store.createServiceCredential(material.record);
@@ -2636,7 +3137,8 @@ export async function buildBroker(
 
   app.get("/v1/service-credentials", async (request) => {
     const principal = requireAdmin(request);
-    emptyQuerySchema.parse(request.query);
+    const query = serviceCredentialQuerySchema.parse(request.query);
+    const scope = selectedResourceScope(principal, query);
     if (store === false || store.listServiceCredentials === undefined) {
       throw new BrokerHttpError(
         503,
@@ -2645,28 +3147,39 @@ export async function buildBroker(
       );
     }
     return {
-      credentials: await store.listServiceCredentials(principal),
+      credentials: (
+        await store.listServiceCredentials(scope)
+      ).filter(
+        (credential) =>
+          query.serviceId === undefined ||
+          credential.serviceId === query.serviceId,
+      ),
     };
   });
 
   app.delete(
     "/v1/service-credentials/:credentialId",
     async (request, reply) => {
-      emptyQuerySchema.parse(request.query);
+      const query = serviceCredentialQuerySchema.parse(request.query);
       const { credentialId } = serviceCredentialParamsSchema.parse(
         request.params,
       );
+      const principal = requireAdmin(request);
+      const scope = selectedResourceScope(principal, query);
       await runAuditedMutation(
         request,
         {
           action: "service_credential.revoke",
           resourceType: "service_credential",
           resourceId: credentialId,
-          metadata: {},
+          metadata: {
+            projectId: scope.projectId,
+            environmentId: scope.environmentId,
+          },
           successStatus: 204,
+          scope,
         },
         async () => {
-          const principal = requireAdmin(request);
           if (store === false || store.revokeServiceCredential === undefined) {
             throw new BrokerHttpError(
               503,
@@ -2676,7 +3189,7 @@ export async function buildBroker(
           }
           const revoked = await store.revokeServiceCredential(
             credentialId,
-            principal,
+            scope,
           );
           if (!revoked) {
             throw new BrokerHttpError(

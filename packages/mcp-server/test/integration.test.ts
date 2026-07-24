@@ -7,7 +7,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   buildBroker,
+  type EnvironmentRecord,
   type ProbeEvent,
+  type ProjectRecord,
+  type RegisteredServiceRecord,
+  type ServiceCredentialRecord,
 } from "../../broker/src/index.js";
 import { FakeAgent } from "../../broker/src/fake-agent.js";
 import {
@@ -96,13 +100,70 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     };
     const authenticate = async (token: string) =>
       token === "oauth-token" ? principal : undefined;
+    const createdAt = "2026-07-24T08:00:00.000Z";
+    const projects: ProjectRecord[] = [];
+    const environments: EnvironmentRecord[] = [];
+    const registeredServices: RegisteredServiceRecord[] = [];
+    const credentials: ServiceCredentialRecord[] = [];
     const backend = await buildBroker({
       authenticateBearer: authenticate,
       store: {
         async restore() {},
         async persist() {},
+        async createProject(tenantId, projectId, displayName) {
+          const record = { tenantId, projectId, displayName, createdAt };
+          projects.push(record);
+          return record;
+        },
+        async listProjects() {
+          return projects;
+        },
+        async archiveProject() {
+          return true;
+        },
+        async createEnvironment(scope, displayName) {
+          const record = { ...scope, displayName, createdAt };
+          environments.push(record);
+          return record;
+        },
+        async listEnvironments() {
+          return environments;
+        },
+        async archiveEnvironment() {
+          return true;
+        },
+        async createRegisteredService(
+          tenantId,
+          projectId,
+          serviceId,
+          displayName,
+        ) {
+          const record = {
+            tenantId,
+            projectId,
+            serviceId,
+            displayName,
+            createdAt,
+          };
+          registeredServices.push(record);
+          return record;
+        },
+        async getRegisteredService(tenantId, projectId, serviceId) {
+          return registeredServices.find(
+            (service) =>
+              service.tenantId === tenantId &&
+              service.projectId === projectId &&
+              service.serviceId === serviceId,
+          );
+        },
+        async listRegisteredServices() {
+          return registeredServices;
+        },
+        async archiveRegisteredService() {
+          return true;
+        },
         async createServiceCredential(credential) {
-          return {
+          const record = {
             credentialId: credential.credentialId,
             tenantId: credential.tenantId,
             projectId: credential.projectId,
@@ -112,9 +173,16 @@ describe("Phase 1 MCP and fake-agent integration", () => {
             keyPrefix: credential.keyPrefix,
             createdAt: credential.createdAt,
           };
+          credentials.push(record);
+          return record;
         },
-        async listServiceCredentials() {
-          return [];
+        async listServiceCredentials(scope) {
+          return credentials.filter(
+            (credential) =>
+              credential.tenantId === scope.tenantId &&
+              credential.projectId === scope.projectId &&
+              credential.environmentId === scope.environmentId,
+          );
         },
         async revokeServiceCredential() {
           return true;
@@ -159,14 +227,23 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
+        "archive_environment",
+        "archive_project",
+        "archive_service",
+        "create_environment",
+        "create_project",
         "create_service_credential",
         "get_probe_data",
         "get_safety_overview",
         "list_audit_events",
+        "list_environments",
         "list_probes",
+        "list_projects",
+        "list_registered_services",
         "list_service_credentials",
         "list_services",
         "ping_broker",
+        "register_service",
         "remove_probe",
         "revoke_service_credential",
         "set_counter_probe",
@@ -177,10 +254,40 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       const ping = await client.callTool({ name: "ping_broker", arguments: {} });
       expect(ping.isError).not.toBe(true);
       expect(ping.content).toEqual([{ type: "text", text: '{\n  "ok": true\n}' }]);
+      for (const call of [
+        {
+          name: "create_project",
+          arguments: {
+            project_id: "acquireiq",
+            display_name: "AcquireIQ",
+          },
+        },
+        {
+          name: "create_environment",
+          arguments: {
+            project_id: "acquireiq",
+            environment_id: "production",
+            display_name: "Production",
+          },
+        },
+        {
+          name: "register_service",
+          arguments: {
+            project_id: "acquireiq",
+            service_id: "api",
+            display_name: "AcquireIQ API",
+          },
+        },
+      ]) {
+        const result = await client.callTool(call);
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      }
       const issued = await client.callTool({
         name: "create_service_credential",
         arguments: {
-          service_id: "acquireiq",
+          project_id: "acquireiq",
+          environment_id: "production",
+          service_id: "api",
           label: "AcquireIQ KS",
         },
       });
@@ -660,7 +767,7 @@ describe("Phase 1 MCP and fake-agent integration", () => {
     }
   });
 
-  it("publishes exactly the fourteen official MCP tools", async () => {
+  it("publishes the complete official MCP tool set", async () => {
     const { brokerUrl } = await startBroker();
     const server = createMcpServer(new BrokerClient(brokerUrl));
     const client = new Client(
@@ -675,14 +782,23 @@ describe("Phase 1 MCP and fake-agent integration", () => {
       await client.connect(clientTransport);
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
+        "archive_environment",
+        "archive_project",
+        "archive_service",
+        "create_environment",
+        "create_project",
         "create_service_credential",
         "get_probe_data",
         "get_safety_overview",
         "list_audit_events",
+        "list_environments",
         "list_probes",
+        "list_projects",
+        "list_registered_services",
         "list_service_credentials",
         "list_services",
         "ping_broker",
+        "register_service",
         "remove_probe",
         "revoke_service_credential",
         "set_counter_probe",

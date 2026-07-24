@@ -17,7 +17,11 @@ import {
   createServiceCredentialMaterial,
   type AuditEventRecord,
   type BrokerPrincipal,
+  type EnvironmentRecord,
   type ProbeDefinition,
+  type ProjectRecord,
+  type RegisteredServiceRecord,
+  type ServiceCredentialRecord,
 } from "../src/index.js";
 
 const openBrokers: Awaited<ReturnType<typeof buildBroker>>[] = [];
@@ -629,6 +633,174 @@ describe("broker validation and storage", () => {
       headers: { authorization: "Bearer operator-fixture-key" },
     });
     expect(sharedOperator.statusCode).toBe(200);
+  });
+
+  it("manages a scoped project, environment, service, and credential lifecycle", async () => {
+    const now = "2026-07-24T08:00:00.000Z";
+    const projects: ProjectRecord[] = [];
+    const environments: EnvironmentRecord[] = [];
+    const services: RegisteredServiceRecord[] = [];
+    const credentials: ServiceCredentialRecord[] = [];
+    const principal: BrokerPrincipal = {
+      type: "user",
+      role: "admin",
+      principalId: "user_catalog",
+      tenantId: "tenant-catalog",
+      projectId: "default",
+      environmentId: "default",
+    };
+    const broker = await buildBroker({
+      authenticateBearer: async () => principal,
+      store: {
+        async restore() {},
+        async persist() {},
+        async createProject(tenantId, projectId, displayName) {
+          const record = { tenantId, projectId, displayName, createdAt: now };
+          projects.push(record);
+          return record;
+        },
+        async listProjects(tenantId) {
+          return projects.filter((project) => project.tenantId === tenantId);
+        },
+        async archiveProject() {
+          return true;
+        },
+        async createEnvironment(scope, displayName) {
+          const record = { ...scope, displayName, createdAt: now };
+          environments.push(record);
+          return record;
+        },
+        async listEnvironments(tenantId, projectId) {
+          return environments.filter(
+            (environment) =>
+              environment.tenantId === tenantId &&
+              environment.projectId === projectId,
+          );
+        },
+        async archiveEnvironment() {
+          return true;
+        },
+        async createRegisteredService(
+          tenantId,
+          projectId,
+          serviceId,
+          displayName,
+        ) {
+          const record = {
+            tenantId,
+            projectId,
+            serviceId,
+            displayName,
+            createdAt: now,
+          };
+          services.push(record);
+          return record;
+        },
+        async getRegisteredService(tenantId, projectId, serviceId) {
+          return services.find(
+            (service) =>
+              service.tenantId === tenantId &&
+              service.projectId === projectId &&
+              service.serviceId === serviceId,
+          );
+        },
+        async listRegisteredServices(tenantId, projectId) {
+          return services.filter(
+            (service) =>
+              service.tenantId === tenantId &&
+              service.projectId === projectId,
+          );
+        },
+        async archiveRegisteredService() {
+          return true;
+        },
+        async createServiceCredential(credential) {
+          const { secretHash: _secretHash, ...record } = credential;
+          credentials.push(record);
+          return record;
+        },
+        async listServiceCredentials(scope) {
+          return credentials.filter(
+            (credential) =>
+              credential.tenantId === scope.tenantId &&
+              credential.projectId === scope.projectId &&
+              credential.environmentId === scope.environmentId,
+          );
+        },
+        async revokeServiceCredential() {
+          return true;
+        },
+      },
+    });
+    openBrokers.push(broker);
+    const headers = { authorization: "Bearer catalog-user" };
+
+    const project = await broker.inject({
+      method: "POST",
+      url: "/v1/projects",
+      headers,
+      payload: { projectId: "acquireiq", displayName: "AcquireIQ" },
+    });
+    expect(project.statusCode).toBe(201);
+    expect(project.json()).toMatchObject({
+      project: { tenantId: "tenant-catalog", projectId: "acquireiq" },
+    });
+
+    const environment = await broker.inject({
+      method: "POST",
+      url: "/v1/projects/acquireiq/environments",
+      headers,
+      payload: { environmentId: "production", displayName: "Production" },
+    });
+    expect(environment.statusCode).toBe(201);
+
+    const service = await broker.inject({
+      method: "POST",
+      url: "/v1/projects/acquireiq/services",
+      headers,
+      payload: { serviceId: "api", displayName: "AcquireIQ API" },
+    });
+    expect(service.statusCode).toBe(201);
+
+    const credential = await broker.inject({
+      method: "POST",
+      url: "/v1/service-credentials",
+      headers,
+      payload: {
+        projectId: "acquireiq",
+        environmentId: "production",
+        serviceId: "api",
+        label: "Production API",
+      },
+    });
+    expect(credential.statusCode).toBe(201);
+    expect(credential.json()).toMatchObject({
+      credential: {
+        tenantId: "tenant-catalog",
+        projectId: "acquireiq",
+        environmentId: "production",
+        serviceId: "api",
+      },
+      apiKey: expect.stringMatching(/^lp_service_/u),
+    });
+
+    const listed = await broker.inject({
+      method: "GET",
+      url:
+        "/v1/service-credentials?projectId=acquireiq" +
+        "&environmentId=production&serviceId=api",
+      headers,
+    });
+    expect(listed.json()).toMatchObject({
+      credentials: [{ projectId: "acquireiq", environmentId: "production" }],
+    });
+
+    const archived = await broker.inject({
+      method: "DELETE",
+      url: "/v1/projects/acquireiq/services/api",
+      headers,
+    });
+    expect(archived.statusCode).toBe(204);
   });
 
   it("allows all human roles while keeping agent route boundaries", async () => {
@@ -1537,8 +1709,9 @@ async function resetPostgresSchema(databaseUrl: string): Promise<void> {
   await cleanup.connect();
   try {
     await cleanup.query(`
-      drop table if exists audit_events, service_credentials, source_maps, source_map_sets,
-        probe_events, probe_statuses, probes, services, service_versions,
+      drop table if exists audit_events, service_credentials, registered_services,
+        source_maps, source_map_sets, probe_events, probe_statuses, probes,
+        services, service_versions,
         environments, projects, tenants, liveprobe_schema_migrations,
         broker_snapshots cascade
     `);
@@ -1699,6 +1872,7 @@ describe("Postgres persistence", () => {
         "audit_events",
         "environments",
         "projects",
+        "registered_services",
         "service_credentials",
         "service_versions",
         "services",
@@ -1714,6 +1888,7 @@ describe("Postgres persistence", () => {
       "probe_statuses",
       "probes",
       "projects",
+      "registered_services",
       "service_credentials",
       "service_versions",
       "services",
@@ -1857,10 +2032,25 @@ describe("Postgres persistence", () => {
           environment_id: DEFAULT_ENVIRONMENT_ID,
         },
       ]);
+      const registered = await inspection.query<{
+        tenant_id: string;
+        project_id: string;
+        service_id: string;
+      }>(
+        `select tenant_id, project_id, service_id
+         from registered_services where service_id = 'legacy-service'`,
+      );
+      expect(registered.rows).toEqual([
+        {
+          tenant_id: DEFAULT_TENANT_ID,
+          project_id: DEFAULT_PROJECT_ID,
+          service_id: "legacy-service",
+        },
+      ]);
       const versions = await inspection.query<{ version: number }>(
         `select version from liveprobe_schema_migrations order by version`,
       );
-      expect(versions.rows.map(({ version }) => version)).toEqual([4, 7]);
+      expect(versions.rows.map(({ version }) => version)).toEqual([4, 8]);
 
       await inspection.query(`
         insert into tenants (tenant_id, display_name)
@@ -2211,6 +2401,153 @@ describe("Postgres persistence", () => {
       headers: serviceHeaders,
     });
     expect(rejected.statusCode).toBe(401);
+  });
+
+  postgresIt("persists catalog resources and revokes credentials on archive", async () => {
+    const databaseUrl = process.env["TEST_DATABASE_URL"] as string;
+    await resetPostgresSchema(databaseUrl);
+    const operatorKey = "catalog-postgres-operator-key";
+    const broker = await buildBroker({
+      apiKey: operatorKey,
+      store: new PostgresStore(databaseUrl),
+      persistence: false,
+    });
+    openBrokers.push(broker);
+    const headers = { authorization: `Bearer ${operatorKey}` };
+
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/projects",
+          headers,
+          payload: { projectId: "acquireiq", displayName: "AcquireIQ" },
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/projects/acquireiq/environments",
+          headers,
+          payload: {
+            environmentId: "production",
+            displayName: "Production",
+          },
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(
+      (
+        await broker.inject({
+          method: "POST",
+          url: "/v1/projects/acquireiq/services",
+          headers,
+          payload: { serviceId: "api", displayName: "AcquireIQ API" },
+        })
+      ).statusCode,
+    ).toBe(201);
+
+    const issued = await broker.inject({
+      method: "POST",
+      url: "/v1/service-credentials",
+      headers,
+      payload: {
+        projectId: "acquireiq",
+        environmentId: "production",
+        serviceId: "api",
+        label: "Production API",
+      },
+    });
+    expect(issued.statusCode).toBe(201);
+    const firstKey = issued.json<{ apiKey: string }>().apiKey;
+
+    const archivedEnvironment = await broker.inject({
+      method: "DELETE",
+      url: "/v1/projects/acquireiq/environments/production",
+      headers,
+    });
+    expect(archivedEnvironment.statusCode).toBe(204);
+    expect(
+      (
+        await broker.inject({
+          method: "GET",
+          url: "/v1/ping",
+          headers: { authorization: `Bearer ${firstKey}` },
+        })
+      ).statusCode,
+    ).toBe(401);
+
+    const restoredEnvironment = await broker.inject({
+      method: "POST",
+      url: "/v1/projects/acquireiq/environments",
+      headers,
+      payload: { environmentId: "production", displayName: "Production" },
+    });
+    expect(restoredEnvironment.statusCode).toBe(201);
+    const secondCredential = await broker.inject({
+      method: "POST",
+      url: "/v1/service-credentials",
+      headers,
+      payload: {
+        projectId: "acquireiq",
+        environmentId: "production",
+        serviceId: "api",
+        label: "Replacement API",
+      },
+    });
+    expect(secondCredential.statusCode).toBe(201);
+    const secondKey = secondCredential.json<{ apiKey: string }>().apiKey;
+
+    const archivedService = await broker.inject({
+      method: "DELETE",
+      url: "/v1/projects/acquireiq/services/api",
+      headers,
+    });
+    expect(archivedService.statusCode).toBe(204);
+    expect(
+      (
+        await broker.inject({
+          method: "GET",
+          url: "/v1/ping",
+          headers: { authorization: `Bearer ${secondKey}` },
+        })
+      ).statusCode,
+    ).toBe(401);
+
+    const services = await broker.inject({
+      method: "GET",
+      url: "/v1/projects/acquireiq/services?includeArchived=true",
+      headers,
+    });
+    expect(services.json()).toMatchObject({
+      services: [{ serviceId: "api", archivedAt: expect.any(String) }],
+    });
+
+    const inspection = new Client({ connectionString: databaseUrl });
+    await inspection.connect();
+    try {
+      const rows = await inspection.query<{
+        project_id: string;
+        service_id: string;
+        archived_at: Date | null;
+      }>(
+        `select project_id, service_id, archived_at
+         from registered_services
+         where tenant_id = $1 and project_id = $2`,
+        [DEFAULT_TENANT_ID, "acquireiq"],
+      );
+      expect(rows.rows).toMatchObject([
+        {
+          project_id: "acquireiq",
+          service_id: "api",
+          archived_at: expect.any(Date),
+        },
+      ]);
+    } finally {
+      await inspection.end();
+    }
   });
 
   postgresIt("persists tenant-scoped append-only audit events", async () => {

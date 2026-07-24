@@ -66,7 +66,7 @@ read -r -d '' validation_js <<'NODE' || true
   const requiredTables = [
     "audit_events", "environments", "liveprobe_schema_migrations",
     "probe_events", "probe_statuses", "probes", "projects",
-    "service_credentials", "service_versions", "services",
+    "registered_services", "service_credentials", "service_versions", "services",
     "source_map_sets", "source_maps", "tenants",
   ];
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

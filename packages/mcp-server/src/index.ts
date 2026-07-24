@@ -8,6 +8,13 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 
 const serviceIdSchema = z.string().trim().min(1).max(200);
+const catalogIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .regex(/^[a-z0-9][a-z0-9._-]*$/);
+const displayNameSchema = z.string().trim().min(1).max(200);
 const sourceFileSchema = z.string().trim().min(1).max(4_096);
 const commitHashSchema = z
   .string()
@@ -263,15 +270,79 @@ export const ListAuditEventsInputSchema = z
       .describe("Return events strictly before this ISO-8601 timestamp"),
   })
   .strict();
+export const ListProjectsInputSchema = z
+  .object({
+    include_archived: z.boolean().optional().default(false),
+  })
+  .strict();
+export const CreateProjectInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    display_name: displayNameSchema,
+  })
+  .strict();
+export const ArchiveProjectInputSchema = z
+  .object({ project_id: catalogIdSchema })
+  .strict();
+export const ListEnvironmentsInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    include_archived: z.boolean().optional().default(false),
+  })
+  .strict();
+export const CreateEnvironmentInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    environment_id: catalogIdSchema,
+    display_name: displayNameSchema,
+  })
+  .strict();
+export const ArchiveEnvironmentInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    environment_id: catalogIdSchema,
+  })
+  .strict();
+export const ListRegisteredServicesInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    include_archived: z.boolean().optional().default(false),
+  })
+  .strict();
+export const RegisterServiceInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    service_id: serviceIdSchema,
+    display_name: displayNameSchema,
+  })
+  .strict();
+export const ArchiveServiceInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    service_id: serviceIdSchema,
+  })
+  .strict();
 export const CreateServiceCredentialInputSchema = z
   .object({
+    project_id: catalogIdSchema,
+    environment_id: catalogIdSchema,
     service_id: serviceIdSchema.describe("Service ID that will use this key"),
     label: z.string().trim().min(1).max(200).describe("Human-readable key label"),
   })
   .strict();
-export const ListServiceCredentialsInputSchema = z.object({}).strict();
+export const ListServiceCredentialsInputSchema = z
+  .object({
+    project_id: catalogIdSchema,
+    environment_id: catalogIdSchema,
+    service_id: serviceIdSchema.optional(),
+  })
+  .strict();
 export const RevokeServiceCredentialInputSchema = z
-  .object({ credential_id: z.string().regex(/^svc_[0-9a-f]{32}$/) })
+  .object({
+    project_id: catalogIdSchema,
+    environment_id: catalogIdSchema,
+    credential_id: z.string().regex(/^svc_[0-9a-f]{32}$/),
+  })
   .strict();
 export const ListProbesInputSchema = z
   .object({
@@ -462,6 +533,51 @@ const auditEventSchema = z
   .strict();
 const listAuditEventsResponseSchema = z
   .object({ events: z.array(auditEventSchema) })
+  .strict();
+const projectSchema = z
+  .object({
+    tenantId: z.string().min(1),
+    projectId: catalogIdSchema,
+    displayName: z.string().min(1),
+    createdAt: z.string().datetime({ offset: true }),
+    archivedAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict();
+const environmentSchema = z
+  .object({
+    tenantId: z.string().min(1),
+    projectId: catalogIdSchema,
+    environmentId: catalogIdSchema,
+    displayName: z.string().min(1),
+    createdAt: z.string().datetime({ offset: true }),
+    archivedAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict();
+const registeredServiceSchema = z
+  .object({
+    tenantId: z.string().min(1),
+    projectId: catalogIdSchema,
+    serviceId: serviceIdSchema,
+    displayName: z.string().min(1),
+    createdAt: z.string().datetime({ offset: true }),
+    archivedAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict();
+const projectResponseSchema = z.object({ project: projectSchema }).strict();
+const listProjectsResponseSchema = z
+  .object({ projects: z.array(projectSchema) })
+  .strict();
+const environmentResponseSchema = z
+  .object({ environment: environmentSchema })
+  .strict();
+const listEnvironmentsResponseSchema = z
+  .object({ environments: z.array(environmentSchema) })
+  .strict();
+const registeredServiceResponseSchema = z
+  .object({ service: registeredServiceSchema })
+  .strict();
+const listRegisteredServicesResponseSchema = z
+  .object({ services: z.array(registeredServiceSchema) })
   .strict();
 const serviceCredentialSchema = z
   .object({
@@ -678,7 +794,117 @@ export class BrokerClient {
     );
   }
 
+  public async listProjects(
+    includeArchived = false,
+  ): Promise<z.infer<typeof listProjectsResponseSchema>> {
+    const search = includeArchived ? "?includeArchived=true" : "";
+    return this.request(
+      "GET",
+      `/v1/projects${search}`,
+      listProjectsResponseSchema,
+    );
+  }
+
+  public async createProject(input: {
+    projectId: string;
+    displayName: string;
+  }): Promise<z.infer<typeof projectResponseSchema>> {
+    return this.request(
+      "POST",
+      "/v1/projects",
+      projectResponseSchema,
+      input,
+    );
+  }
+
+  public async archiveProject(projectId: string): Promise<void> {
+    await this.requestNoContent(
+      "DELETE",
+      `/v1/projects/${encodeURIComponent(projectId)}`,
+    );
+  }
+
+  public async listEnvironments(
+    projectId: string,
+    includeArchived = false,
+  ): Promise<z.infer<typeof listEnvironmentsResponseSchema>> {
+    const search = includeArchived ? "?includeArchived=true" : "";
+    return this.request(
+      "GET",
+      `/v1/projects/${encodeURIComponent(projectId)}/environments${search}`,
+      listEnvironmentsResponseSchema,
+    );
+  }
+
+  public async createEnvironment(input: {
+    projectId: string;
+    environmentId: string;
+    displayName: string;
+  }): Promise<z.infer<typeof environmentResponseSchema>> {
+    return this.request(
+      "POST",
+      `/v1/projects/${encodeURIComponent(input.projectId)}/environments`,
+      environmentResponseSchema,
+      {
+        environmentId: input.environmentId,
+        displayName: input.displayName,
+      },
+    );
+  }
+
+  public async archiveEnvironment(
+    projectId: string,
+    environmentId: string,
+  ): Promise<void> {
+    await this.requestNoContent(
+      "DELETE",
+      `/v1/projects/${encodeURIComponent(projectId)}/environments/` +
+        encodeURIComponent(environmentId),
+    );
+  }
+
+  public async listRegisteredServices(
+    projectId: string,
+    includeArchived = false,
+  ): Promise<z.infer<typeof listRegisteredServicesResponseSchema>> {
+    const search = includeArchived ? "?includeArchived=true" : "";
+    return this.request(
+      "GET",
+      `/v1/projects/${encodeURIComponent(projectId)}/services${search}`,
+      listRegisteredServicesResponseSchema,
+    );
+  }
+
+  public async registerService(input: {
+    projectId: string;
+    serviceId: string;
+    displayName: string;
+  }): Promise<z.infer<typeof registeredServiceResponseSchema>> {
+    return this.request(
+      "POST",
+      `/v1/projects/${encodeURIComponent(input.projectId)}/services`,
+      registeredServiceResponseSchema,
+      {
+        serviceId: input.serviceId,
+        displayName: input.displayName,
+      },
+    );
+  }
+
+  public async archiveService(
+    projectId: string,
+    serviceId: string,
+  ): Promise<void> {
+    await this.requestNoContent(
+      "DELETE",
+      `/v1/projects/${encodeURIComponent(projectId)}/services/` +
+        encodeURIComponent(serviceId),
+    );
+  }
+
   public async createServiceCredential(input: {
+    projectId: string;
+    environmentId: string;
     serviceId: string;
     label: string;
   }): Promise<z.infer<typeof createServiceCredentialResponseSchema>> {
@@ -690,20 +916,37 @@ export class BrokerClient {
     );
   }
 
-  public async listServiceCredentials(): Promise<
+  public async listServiceCredentials(input: {
+    projectId: string;
+    environmentId: string;
+    serviceId?: string | undefined;
+  }): Promise<
     z.infer<typeof listServiceCredentialsResponseSchema>
   > {
+    const search = new URLSearchParams({
+      projectId: input.projectId,
+      environmentId: input.environmentId,
+    });
+    if (input.serviceId !== undefined) {
+      search.set("serviceId", input.serviceId);
+    }
     return this.request(
       "GET",
-      "/v1/service-credentials",
+      `/v1/service-credentials?${search.toString()}`,
       listServiceCredentialsResponseSchema,
     );
   }
 
-  public async revokeServiceCredential(credentialId: string): Promise<void> {
+  public async revokeServiceCredential(
+    projectId: string,
+    environmentId: string,
+    credentialId: string,
+  ): Promise<void> {
+    const search = new URLSearchParams({ projectId, environmentId });
     await this.requestNoContent(
       "DELETE",
-      `/v1/service-credentials/${encodeURIComponent(credentialId)}`,
+      `/v1/service-credentials/${encodeURIComponent(credentialId)}?` +
+        search.toString(),
     );
   }
 
@@ -835,11 +1078,38 @@ export interface ToolHandlers {
   list_audit_events(
     input?: z.input<typeof ListAuditEventsInputSchema>,
   ): Promise<z.infer<typeof listAuditEventsResponseSchema>>;
+  list_projects(
+    input?: z.input<typeof ListProjectsInputSchema>,
+  ): Promise<z.infer<typeof listProjectsResponseSchema>>;
+  create_project(
+    input: z.input<typeof CreateProjectInputSchema>,
+  ): Promise<z.infer<typeof projectResponseSchema>>;
+  archive_project(
+    input: z.input<typeof ArchiveProjectInputSchema>,
+  ): Promise<{ archived: true; projectId: string }>;
+  list_environments(
+    input: z.input<typeof ListEnvironmentsInputSchema>,
+  ): Promise<z.infer<typeof listEnvironmentsResponseSchema>>;
+  create_environment(
+    input: z.input<typeof CreateEnvironmentInputSchema>,
+  ): Promise<z.infer<typeof environmentResponseSchema>>;
+  archive_environment(
+    input: z.input<typeof ArchiveEnvironmentInputSchema>,
+  ): Promise<{ archived: true; projectId: string; environmentId: string }>;
+  list_registered_services(
+    input: z.input<typeof ListRegisteredServicesInputSchema>,
+  ): Promise<z.infer<typeof listRegisteredServicesResponseSchema>>;
+  register_service(
+    input: z.input<typeof RegisterServiceInputSchema>,
+  ): Promise<z.infer<typeof registeredServiceResponseSchema>>;
+  archive_service(
+    input: z.input<typeof ArchiveServiceInputSchema>,
+  ): Promise<{ archived: true; projectId: string; serviceId: string }>;
   create_service_credential(
     input: z.input<typeof CreateServiceCredentialInputSchema>,
   ): Promise<z.infer<typeof createServiceCredentialResponseSchema>>;
   list_service_credentials(
-    input?: unknown,
+    input: z.input<typeof ListServiceCredentialsInputSchema>,
   ): Promise<z.infer<typeof listServiceCredentialsResponseSchema>>;
   revoke_service_credential(
     input: z.input<typeof RevokeServiceCredentialInputSchema>,
@@ -1032,20 +1302,99 @@ export function createToolHandlers(client: BrokerClient): ToolHandlers {
       const input = ListAuditEventsInputSchema.parse(rawInput);
       return client.listAuditEvents(input);
     },
+    async list_projects(rawInput = {}) {
+      const input = ListProjectsInputSchema.parse(rawInput);
+      return client.listProjects(input.include_archived);
+    },
+    async create_project(rawInput) {
+      const input = CreateProjectInputSchema.parse(rawInput);
+      return client.createProject({
+        projectId: input.project_id,
+        displayName: input.display_name,
+      });
+    },
+    async archive_project(rawInput) {
+      const input = ArchiveProjectInputSchema.parse(rawInput);
+      await client.archiveProject(input.project_id);
+      return { archived: true, projectId: input.project_id };
+    },
+    async list_environments(rawInput) {
+      const input = ListEnvironmentsInputSchema.parse(rawInput);
+      return client.listEnvironments(
+        input.project_id,
+        input.include_archived,
+      );
+    },
+    async create_environment(rawInput) {
+      const input = CreateEnvironmentInputSchema.parse(rawInput);
+      return client.createEnvironment({
+        projectId: input.project_id,
+        environmentId: input.environment_id,
+        displayName: input.display_name,
+      });
+    },
+    async archive_environment(rawInput) {
+      const input = ArchiveEnvironmentInputSchema.parse(rawInput);
+      await client.archiveEnvironment(
+        input.project_id,
+        input.environment_id,
+      );
+      return {
+        archived: true,
+        projectId: input.project_id,
+        environmentId: input.environment_id,
+      };
+    },
+    async list_registered_services(rawInput) {
+      const input = ListRegisteredServicesInputSchema.parse(rawInput);
+      return client.listRegisteredServices(
+        input.project_id,
+        input.include_archived,
+      );
+    },
+    async register_service(rawInput) {
+      const input = RegisterServiceInputSchema.parse(rawInput);
+      return client.registerService({
+        projectId: input.project_id,
+        serviceId: input.service_id,
+        displayName: input.display_name,
+      });
+    },
+    async archive_service(rawInput) {
+      const input = ArchiveServiceInputSchema.parse(rawInput);
+      await client.archiveService(input.project_id, input.service_id);
+      return {
+        archived: true,
+        projectId: input.project_id,
+        serviceId: input.service_id,
+      };
+    },
     async create_service_credential(rawInput) {
       const input = CreateServiceCredentialInputSchema.parse(rawInput);
       return client.createServiceCredential({
+        projectId: input.project_id,
+        environmentId: input.environment_id,
         serviceId: input.service_id,
         label: input.label,
       });
     },
-    async list_service_credentials(rawInput = {}) {
-      ListServiceCredentialsInputSchema.parse(rawInput);
-      return client.listServiceCredentials();
+    async list_service_credentials(rawInput) {
+      const input = ListServiceCredentialsInputSchema.parse(rawInput);
+      return client.listServiceCredentials({
+        projectId: input.project_id,
+        environmentId: input.environment_id,
+        ...(input.service_id === undefined
+          ? {}
+          : { serviceId: input.service_id }),
+      });
     },
     async revoke_service_credential(rawInput) {
       const input = RevokeServiceCredentialInputSchema.parse(rawInput);
-      await client.revokeServiceCredential(input.credential_id);
+      await client.revokeServiceCredential(
+        input.project_id,
+        input.environment_id,
+        input.credential_id,
+      );
       return { revoked: true, credentialId: input.credential_id };
     },
     async list_probes(rawInput) {
@@ -1286,11 +1635,111 @@ export function createMcpServer(
     async (input) => executeTool(() => handlers.list_audit_events(input)),
   );
   server.registerTool(
+    "list_projects",
+    {
+      title: "List projects",
+      description:
+        "List the current organization's LiveProbe projects, optionally including archived projects.",
+      inputSchema: ListProjectsInputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (input) => executeTool(() => handlers.list_projects(input)),
+  );
+  server.registerTool(
+    "create_project",
+    {
+      title: "Create project",
+      description:
+        "Create or restore a project using a stable lowercase ID and a human-readable display name.",
+      inputSchema: CreateProjectInputSchema,
+      annotations: { destructiveHint: false },
+    },
+    async (input) => executeTool(() => handlers.create_project(input)),
+  );
+  server.registerTool(
+    "archive_project",
+    {
+      title: "Archive project",
+      description:
+        "Archive a project and its environments and revoke their active service credentials while retaining diagnostic and audit history.",
+      inputSchema: ArchiveProjectInputSchema,
+      annotations: { destructiveHint: true },
+    },
+    async (input) => executeTool(() => handlers.archive_project(input)),
+  );
+  server.registerTool(
+    "list_environments",
+    {
+      title: "List environments",
+      description:
+        "List environments such as development, staging, and production for a project.",
+      inputSchema: ListEnvironmentsInputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (input) => executeTool(() => handlers.list_environments(input)),
+  );
+  server.registerTool(
+    "create_environment",
+    {
+      title: "Create environment",
+      description:
+        "Create or restore an environment within an existing project.",
+      inputSchema: CreateEnvironmentInputSchema,
+      annotations: { destructiveHint: false },
+    },
+    async (input) => executeTool(() => handlers.create_environment(input)),
+  );
+  server.registerTool(
+    "archive_environment",
+    {
+      title: "Archive environment",
+      description:
+        "Archive an environment and revoke its active service credentials while retaining diagnostic and audit history.",
+      inputSchema: ArchiveEnvironmentInputSchema,
+      annotations: { destructiveHint: true },
+    },
+    async (input) => executeTool(() => handlers.archive_environment(input)),
+  );
+  server.registerTool(
+    "list_registered_services",
+    {
+      title: "List registered services",
+      description:
+        "List project-level service identities. A registered service can be deployed into multiple environments.",
+      inputSchema: ListRegisteredServicesInputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (input) =>
+      executeTool(() => handlers.list_registered_services(input)),
+  );
+  server.registerTool(
+    "register_service",
+    {
+      title: "Register service",
+      description:
+        "Register or restore one project-level service ID before issuing environment-scoped runtime credentials.",
+      inputSchema: RegisterServiceInputSchema,
+      annotations: { destructiveHint: false },
+    },
+    async (input) => executeTool(() => handlers.register_service(input)),
+  );
+  server.registerTool(
+    "archive_service",
+    {
+      title: "Archive service",
+      description:
+        "Archive a project-level service and revoke its active credentials in every environment while retaining history.",
+      inputSchema: ArchiveServiceInputSchema,
+      annotations: { destructiveHint: true },
+    },
+    async (input) => executeTool(() => handlers.archive_service(input)),
+  );
+  server.registerTool(
     "create_service_credential",
     {
       title: "Create service credential",
       description:
-        "Create a service-scoped API key for your organization. The plaintext key is returned once and cannot be recovered. Store it in the target service's secret manager.",
+        "Create an environment-scoped API key for a registered service. The plaintext key is returned once and cannot be recovered. Store it in the target service's secret manager.",
       inputSchema: CreateServiceCredentialInputSchema,
       annotations: { destructiveHint: false },
     },

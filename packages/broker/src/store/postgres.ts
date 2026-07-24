@@ -17,6 +17,11 @@ import type {
   BrokerState,
   IngestInput,
 } from "../index.js";
+import type {
+  EnvironmentRecord,
+  ProjectRecord,
+  RegisteredServiceRecord,
+} from "../resource-catalog.js";
 import {
   POSTGRES_MIGRATION_SQL,
   POSTGRES_SCHEMA_VERSION,
@@ -117,6 +122,72 @@ interface AuditEventRow extends QueryResultRow {
   status_code: number | null;
   error_code: string | null;
   metadata: Record<string, AuditMetadataValue>;
+}
+
+interface ProjectRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  display_name: string;
+  created_at: Date;
+  archived_at: Date | null;
+}
+
+interface EnvironmentRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  environment_id: string;
+  display_name: string;
+  created_at: Date;
+  archived_at: Date | null;
+}
+
+interface RegisteredServiceRow extends QueryResultRow {
+  tenant_id: string;
+  project_id: string;
+  service_id: string;
+  display_name: string;
+  created_at: Date;
+  archived_at: Date | null;
+}
+
+function projectRecord(row: ProjectRow): ProjectRecord {
+  return {
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    displayName: row.display_name,
+    createdAt: row.created_at.toISOString(),
+    ...(row.archived_at === null
+      ? {}
+      : { archivedAt: row.archived_at.toISOString() }),
+  };
+}
+
+function environmentRecord(row: EnvironmentRow): EnvironmentRecord {
+  return {
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    environmentId: row.environment_id,
+    displayName: row.display_name,
+    createdAt: row.created_at.toISOString(),
+    ...(row.archived_at === null
+      ? {}
+      : { archivedAt: row.archived_at.toISOString() }),
+  };
+}
+
+function registeredServiceRecord(
+  row: RegisteredServiceRow,
+): RegisteredServiceRecord {
+  return {
+    tenantId: row.tenant_id,
+    projectId: row.project_id,
+    serviceId: row.service_id,
+    displayName: row.display_name,
+    createdAt: row.created_at.toISOString(),
+    ...(row.archived_at === null
+      ? {}
+      : { archivedAt: row.archived_at.toISOString() }),
+  };
 }
 
 function serviceCredentialRecord(
@@ -249,6 +320,216 @@ export class PostgresStore {
     });
     this.provisionedScopes.set(key, operation);
     await operation;
+  }
+
+  public async createProject(
+    tenantId: string,
+    projectId: string,
+    displayName: string,
+  ): Promise<ProjectRecord | undefined> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<ProjectRow>(
+      `insert into projects (
+         tenant_id, project_id, display_name
+       )
+       select tenant_id, $2, $3 from tenants where tenant_id = $1
+       on conflict (tenant_id, project_id) do update
+         set display_name = excluded.display_name, archived_at = null
+       returning tenant_id, project_id, display_name, created_at, archived_at`,
+      [tenantId, projectId, displayName],
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : projectRecord(row);
+  }
+
+  public async listProjects(
+    tenantId: string,
+    includeArchived = false,
+  ): Promise<ProjectRecord[]> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<ProjectRow>(
+      `select tenant_id, project_id, display_name, created_at, archived_at
+       from projects
+       where tenant_id = $1 and ($2::boolean or archived_at is null)
+       order by project_id`,
+      [tenantId, includeArchived],
+    );
+    return result.rows.map(projectRecord);
+  }
+
+  public async archiveProject(
+    tenantId: string,
+    projectId: string,
+  ): Promise<boolean> {
+    return this.withTransaction(async (client) => {
+      const archived = await client.query(
+        `update projects set archived_at = now()
+         where tenant_id = $1 and project_id = $2 and archived_at is null
+         returning project_id`,
+        [tenantId, projectId],
+      );
+      if (archived.rowCount !== 1) return false;
+      await client.query(
+        `update environments set archived_at = coalesce(archived_at, now())
+         where tenant_id = $1 and project_id = $2`,
+        [tenantId, projectId],
+      );
+      await client.query(
+        `update registered_services
+         set archived_at = coalesce(archived_at, now())
+         where tenant_id = $1 and project_id = $2`,
+        [tenantId, projectId],
+      );
+      await client.query(
+        `update service_credentials set revoked_at = now()
+         where tenant_id = $1 and project_id = $2 and revoked_at is null`,
+        [tenantId, projectId],
+      );
+      return true;
+    });
+  }
+
+  public async createEnvironment(
+    scope: ResourceScope,
+    displayName: string,
+  ): Promise<EnvironmentRecord | undefined> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<EnvironmentRow>(
+      `insert into environments (
+         tenant_id, project_id, environment_id, display_name
+       )
+       select tenant_id, project_id, $3, $4
+       from projects
+       where tenant_id = $1 and project_id = $2 and archived_at is null
+       on conflict (tenant_id, project_id, environment_id) do update
+         set display_name = excluded.display_name, archived_at = null
+       returning tenant_id, project_id, environment_id, display_name,
+         created_at, archived_at`,
+      [scope.tenantId, scope.projectId, scope.environmentId, displayName],
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : environmentRecord(row);
+  }
+
+  public async listEnvironments(
+    tenantId: string,
+    projectId: string,
+    includeArchived = false,
+  ): Promise<EnvironmentRecord[]> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<EnvironmentRow>(
+      `select tenant_id, project_id, environment_id, display_name,
+         created_at, archived_at
+       from environments
+       where tenant_id = $1 and project_id = $2
+         and ($3::boolean or archived_at is null)
+       order by environment_id`,
+      [tenantId, projectId, includeArchived],
+    );
+    return result.rows.map(environmentRecord);
+  }
+
+  public async archiveEnvironment(scope: ResourceScope): Promise<boolean> {
+    return this.withTransaction(async (client) => {
+      const archived = await client.query(
+        `update environments set archived_at = now()
+         where tenant_id = $1 and project_id = $2 and environment_id = $3
+           and archived_at is null
+         returning environment_id`,
+        [scope.tenantId, scope.projectId, scope.environmentId],
+      );
+      if (archived.rowCount !== 1) return false;
+      await client.query(
+        `update service_credentials set revoked_at = now()
+         where tenant_id = $1 and project_id = $2 and environment_id = $3
+           and revoked_at is null`,
+        [scope.tenantId, scope.projectId, scope.environmentId],
+      );
+      return true;
+    });
+  }
+
+  public async createRegisteredService(
+    tenantId: string,
+    projectId: string,
+    serviceId: string,
+    displayName: string,
+  ): Promise<RegisteredServiceRecord | undefined> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<RegisteredServiceRow>(
+      `insert into registered_services (
+         tenant_id, project_id, service_id, display_name
+       )
+       select tenant_id, project_id, $3, $4
+       from projects
+       where tenant_id = $1 and project_id = $2 and archived_at is null
+       on conflict (tenant_id, project_id, service_id) do update
+         set display_name = excluded.display_name, archived_at = null
+       returning tenant_id, project_id, service_id,
+         display_name, created_at, archived_at`,
+      [tenantId, projectId, serviceId, displayName],
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : registeredServiceRecord(row);
+  }
+
+  public async getRegisteredService(
+    tenantId: string,
+    projectId: string,
+    serviceId: string,
+  ): Promise<RegisteredServiceRecord | undefined> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<RegisteredServiceRow>(
+      `select tenant_id, project_id, service_id,
+         display_name, created_at, archived_at
+       from registered_services
+       where tenant_id = $1 and project_id = $2 and service_id = $3`,
+      [tenantId, projectId, serviceId],
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : registeredServiceRecord(row);
+  }
+
+  public async listRegisteredServices(
+    tenantId: string,
+    projectId: string,
+    includeArchived = false,
+  ): Promise<RegisteredServiceRecord[]> {
+    await this.ensureMigrated();
+    const result = await this.pool.query<RegisteredServiceRow>(
+      `select tenant_id, project_id, service_id,
+         display_name, created_at, archived_at
+       from registered_services
+       where tenant_id = $1 and project_id = $2
+         and ($3::boolean or archived_at is null)
+       order by service_id`,
+      [tenantId, projectId, includeArchived],
+    );
+    return result.rows.map(registeredServiceRecord);
+  }
+
+  public async archiveRegisteredService(
+    tenantId: string,
+    projectId: string,
+    serviceId: string,
+  ): Promise<boolean> {
+    return this.withTransaction(async (client) => {
+      const archived = await client.query(
+        `update registered_services set archived_at = now()
+         where tenant_id = $1 and project_id = $2 and service_id = $3
+           and archived_at is null
+         returning service_id`,
+        [tenantId, projectId, serviceId],
+      );
+      if (archived.rowCount !== 1) return false;
+      await client.query(
+        `update service_credentials set revoked_at = now()
+         where tenant_id = $1 and project_id = $2 and service_id = $3
+           and revoked_at is null`,
+        [tenantId, projectId, serviceId],
+      );
+      return true;
+    });
   }
 
   public async restore(state: BrokerState): Promise<void> {
@@ -979,16 +1260,17 @@ export class PostgresStore {
     );
   }
 
-  private async withTransaction(
-    action: (client: PoolClient) => Promise<void>,
-  ): Promise<void> {
+  private async withTransaction<T>(
+    action: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
     await this.ensureMigrated();
     const client = await this.pool.connect();
     try {
       await client.query("begin");
       await client.query("select pg_advisory_xact_lock($1)", [1_276_638_214]);
-      await action(client);
+      const result = await action(client);
       await client.query("commit");
+      return result;
     } catch (error: unknown) {
       await client.query("rollback").catch(() => undefined);
       throw error;

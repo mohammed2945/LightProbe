@@ -61,9 +61,10 @@ Add this server to your Cursor MCP configuration:
 }
 ```
 
-The package exposes fourteen tools: four probe setters, `list_services`,
+The package exposes twenty-three tools: four probe setters, `list_services`,
 `list_probes`, `get_probe_data`, `remove_probe`, `ping_broker`,
-`get_safety_overview`, `list_audit_events`, and the self-service
+`get_safety_overview`, `list_audit_events`, project/environment/service
+catalog management tools, and the self-service
 `create_service_credential`, `list_service_credentials`, and
 `revoke_service_credential` tools. All Clerk organization members have the
 same pilot permissions within their organization. Tool failures return
