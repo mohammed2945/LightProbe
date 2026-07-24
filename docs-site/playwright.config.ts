@@ -10,7 +10,7 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   webServer: {
-    command: "HOSTNAME=127.0.0.1 PORT=4174 npm run start",
+    command: "HOST=127.0.0.1 PORT=4174 npm run start",
     url: "http://127.0.0.1:4174/docs/quickstart",
     reuseExistingServer: true,
   },
